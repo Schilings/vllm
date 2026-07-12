@@ -7,7 +7,7 @@ description: 深度阅读源码，生成图文并茂的 Markdown 分析报告。
 
 ## Overview
 
-深度分析源码模块，生成图文并茂的中文 Markdown 分析报告。核心特点：**代码探索 → Mermaid 架构图 → 逐层深度解剖 → 完整调用链时序图**。报告要能让"小白"看懂原理，让"老手"快速定位关键路径。
+深度分析源码模块，生成图文并茂的中文 Markdown 分析报告。核心流程：**网上调研学思想 → 源码探索追踪调用链 → 专业 diagrams 架构图 → 逐层深度解剖 → 完整调用链时序图**。报告要能让"小白"看懂原理，让"老手"快速定位关键路径。
 
 ## When To Use
 
@@ -26,7 +26,18 @@ description: 深度阅读源码，生成图文并茂的 Markdown 分析报告。
 
 ## Workflow
 
-按顺序执行 6 个阶段，**不要跳过探索**。
+按顺序执行 7 个阶段，**不要跳过任何阶段**。
+
+### Phase 0: 知识前置学习（必做）
+
+**在阅读源码之前**，先用 `web_search` + `web_fetch` 搜索并阅读相关文章：
+
+1. 搜索模块的设计思想、核心概念、为什么需要这个组件
+2. 阅读社区深度文章（CSDN、掘金、知乎、博客园等），理解"为什么这么设计"
+3. 了解常见方案对比、演进历史、已知问题与 tradeoff
+4. 整理关键知识点，作为后续源码阅读的"地图"
+
+**目标**：先有思想地图，再看代码落地，理解深度远超直接看代码。
 
 ### Phase 1: 全景探索
 
@@ -43,9 +54,13 @@ description: 深度阅读源码，生成图文并茂的 Markdown 分析报告。
 
 输出报告的 **"全景架构概览"** 章节，包含：
 
-1. **Mermaid 架构图**（用 `graph TD` 或 `flowchart` 画模块分层和交互关系）
+1. **Mermaid 图直接嵌入 markdown**（`graph TD`/`flowchart`、`sequenceDiagram`——GitHub/VS Code/多数渲染器原生支持，无需外部文件）
 2. 一句话概括每个模块的职责
 3. 关键数据流的高层描述
+
+> **画图首选 Mermaid**：直接写在 markdown 代码块中（```` ```mermaid ````），渲染零依赖。如需可编辑的 .drawio 文件，再用 draw.io MCP（`open_drawio_xml` / `open_drawio_mermaid`）生成附件。
+
+Mermaid 备用示例（轻量场景）：
 
 ```mermaid
 graph TD
@@ -136,8 +151,13 @@ sequenceDiagram
 
 ## 目录（自动生成锚点链接）
 
+## 0. 前置知识：设计思想与核心概念
+   - 网上调研总结（为什么要这个模块？解决了什么问题？）
+   - 核心设计思想（关键 tradeoff、为什么选这个方案）
+   - 演进历史 / 相关方案对比
+
 ## 1. 全景架构概览
-   - Mermaid 架构图
+   - Mermaid 架构图（graph TD / flowchart）
    - 一句话说明每层职责
 
 ## 2. Layer 1: <名称> 深度解剖
@@ -149,7 +169,7 @@ sequenceDiagram
    ...
 
 ## N. 完整调用链时序图
-   - 端到端 Mermaid sequenceDiagram
+   - 端到端 Mermaid sequenceDiagram（标注步骤编号 ①~N）
 
 ## N+1. 关键数据结构速查表
 
@@ -158,9 +178,38 @@ sequenceDiagram
 
 ---
 
-## Mermaid 画图规范
+## 画图规范
 
-参考 `references/mermaid-guide.md` 获取完整语法参考。要点：
+**生成 PNG 图片，用 `![]()` 嵌入 markdown**（兼容 GitHub、VS Code、PyCharm 等所有渲染器）。
+
+### 画图流程
+
+1. 用 `matplotlib` 编写 Python 脚本绘制架构图/时序图/流程图
+2. 运行脚本生成 `.png` 文件到 `diagrams/` 子目录
+3. 在报告中使用 `![图名](diagrams/xxx.png)` 引用
+
+> 配置中文字体：`plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']`
+
+### Mermaid 参考（轻量速写）
+
+先用 Mermaid 语法构思图的结构，再转换为 matplotlib 绘制：
+
+| 图类型 | 语法 | 用途 |
+|-------|------|------|
+| `graph TD` / `flowchart TB` | `A-->B`, `subgraph` | 模块架构、分层关系 |
+| `sequenceDiagram` | `participant`, `->>`, `-->>`, `Note` | 调用链时序 |
+| `stateDiagram-v2` | `[*]`, `-->` | 状态流转 |
+| `classDiagram` | `class`, `<|--` | 类关系 |
+
+要求:
+- 每个图有标题和编号
+- 节点用中文标注
+- 关键数据流标注方向（`→` `↓` `↑`）
+- 不要过度复杂，一个图说清一件事
+
+### 补充：draw.io MCP（按需）
+
+如需生成可编辑的 .drawio 文件，使用 `open_drawio_xml`（架构图）或 `open_drawio_mermaid`（时序图），工具已在环境配置。
 
 | 图类型 | 用途 | 关键语法 |
 |-------|------|---------|
@@ -179,8 +228,9 @@ sequenceDiagram
 
 ## 铁律（Hard Rules）
 
-1. **调用链必须基于真实代码探索**，调用 `code-explorer` subagent 查清对端文件 + 函数 + 行号
-2. **Mermaid 语法必须正确**，必要时对照 `references/mermaid-guide.md` 校验
-3. **图不要过度复杂**——一个图说清一件事，复杂流程拆成多个子图
-4. **语言用简体中文**
-5. **输出位置**: `.codebuddy/analysis/<topic>.md`
+1. **先调研再读码**：Phase 0（web_search + web_fetch）必须执行，先理解思想再看实现
+2. **调用链必须基于真实代码探索**，调用 `code-explorer` subagent 查清对端文件 + 函数 + 行号
+3. **图直接嵌入 markdown**：架构图/时序图用 Mermaid 代码块，GitHub/VS Code 原生渲染零依赖
+4. **图不要过度复杂**——一个图说清一件事，复杂流程拆成多个子图
+5. **语言用简体中文**
+6. **必须产出报告文件**：最终产物输出到 `.codebuddy/analysis/<topic>.md`
