@@ -28,25 +28,28 @@ logger = init_logger(__name__)
 
 @dataclass
 class KVCacheBlocks:
-    """
-    The allocation result of KVCacheManager, work as the interface between
-    Scheduler and KVCacheManager, to hide KVCacheManager's internal data
-    structure from the Scheduler.
+    """🧩 调度层与 KVCacheManager 之间的接口数据类，隐藏内部 block 结构。
+
+    🧬 设计要点：
+    ┌──────────────────────────────────────────────────────────────────┐
+    │ ╔══════════════════ KVCacheBlocks 数据布局 ═══════════════════╗ │
+    │ ║                                                              ║ │
+    │ ║  blocks[i][j] = i-th KV cache group 的 j-th block            ║ │
+    │ ║                                                              ║ │
+    │ ║  外层 tuple[group][block] — 不按 [block][group] 排的原因:     ║ │
+    │ ║  若将来各 group 有不同 block_size，则 block 数不相等，        ║ │
+    │ ║  按 [block][group] 排会变成参差不齐的、不适合 vectorize 变换  ║ │
+    │ ║                                                              ║ │
+    │ ║  ⚠️ 空序列用空 tuple 表示（非空 list），                       ║ │
+    │ ║     预构造的空 KVCacheBlocks 在 KVCacheManager 中复用避免 GC  ║ │
+    │ ╚══════════════════════════════════════════════════════════════╝ │
+    └──────────────────────────────────────────────────────────────────┘
     """
 
     blocks: tuple[Sequence[KVCacheBlock], ...]
-    """
-    `blocks[i][j]` refers to the i-th kv_cache_group
-    and the j-th block of tokens.We don't use block of
-    tokens as the outer dimension because it assumes all
-    kv_cache_groups have the same number of blocks, which is true for now but
-    will be broken if we want to give different block_size to different
-    kv_cache_groups in the future.
-
-    Each single type KVCacheBlocks could be represented as:
-    - list[KVCacheBlock] for more than one KVCacheBlock
-    - an empty tuple for requests without KVCacheBlock
-      (a precomputed KVCacheBlocks is in KVCacheManager to avoid GC overhead)
+    """`blocks[i][j]` 即第 i 个 KV cache group 的第 j 个 block。
+    不使用 block 作为外层维度的原因：这假设所有 kv_cache_groups 有相同 block 数，
+    虽然在现阶段成立，但将来允许不同 block_size 时会被打破。
     """
 
     def __add__(self, other: "KVCacheBlocks") -> "KVCacheBlocks":
@@ -112,6 +115,63 @@ class KVCacheBlocks:
 
 
 class KVCacheManager:
+    """🧩 KV 缓存管理门面 — 调度层与 KV 缓存子系统之间的统一入口。
+
+    ╔══════════════════ 🧩 对外接口清单 ═══════════════════╗
+    ║                                                      ║
+    ║  前缀与分配（调度步核心路径）:                         ║
+    ║  📖 get_computed_blocks()   前缀缓存命中查找           ║
+    ║  ✍️ allocate_slots()        为请求分配 KV slot        ║
+    ║  🗑️ free()                  释放请求的所有 block      ║
+    ║                                                      ║
+    ║  辅助接口:                                            ║
+    ║  📖 get_blocks/get_block_ids() 查询已分配 block       ║
+    ║  ✍️ cache_blocks()          将 block 写入前缀缓存哈希  ║
+    ║  🗑️ remove_skipped_blocks() 释放滑动窗口外的 block    ║
+    ║  🗑️ evict_blocks()         主动驱逐前缀缓存           ║
+    ║  🔄 reset_prefix_cache()    重置前缀缓存（RLHF 用）    ║
+    ║  📖 take_events()           拉取 KV 缓存事件           ║
+    ║  📖 new_step_starts()       新调度步通知              ║
+    ╚══════════════════════════════════════════════════════╝
+
+    ╔══════════════ 🔗 宏观交互调用链 ═════════════════════╗
+    ║                                                      ║
+    ║  Scheduler.schedule()                                ║
+    ║  │                                                   ║
+    ║  ├─① get_computed_blocks(request)                    ║
+    ║  │   └→ HybridKVCacheCoordinator.find_longest_cache… ║
+    ║  │      ├─ FullAttentionManager   (左扫前缀)         ║
+    ║  │      └─ SlidingWindowManager   (右扫连续窗口)     ║
+    ║  │        → 取交集 → (KVCacheBlocks, hit_len)        ║
+    ║  │                                                   ║
+    ║  ├─② allocate_slots(request, …)                      ║
+    ║  │   ├─ Stage1: remove_skipped_blocks → 窗口外淘汰   ║
+    ║  │   ├─ Stage2: get_num_blocks_to_allocate 容量检查  ║
+    ║  │   ├─ Stage3: allocate_new_computed_blocks 前缀块  ║
+    ║  │   ├─ Stage4: allocate_new_blocks 新 block 分配    ║
+    ║  │   └─ Stage5: cache_blocks → 写入前缀哈希          ║
+    ║  │                                                   ║
+    ║  └─③ free(finished_requests) 释放完成请求            ║
+    ║                                                      ║
+    ║  ┌── 混合同步屏障 ─────────────────────────────────┐ ║
+    ║  │                                                │ ║
+    ║  │ Full 层需要 seq 全部 block 的 K/V               │ ║
+    ║  │ SWA  层只需要 window_size 内的 block            │ ║
+    ║  │ → 前缀命中取交集保证同一 forward 步的一致性     │ ║
+    ║  │ → allocate_slots 时 Full/SW 分别算所需 block 数 │ ║
+    ║  └────────────────────────────────────────────────┘ ║
+    ╚══════════════════════════════════════════════════════╝
+
+    🧬 设计要点：
+    - 自身不包含业务逻辑，全部委托给 self.coordinator（三选一）:
+      HybridKVCacheCoordinator（≥2 种注意力类型）
+      UnitaryKVCacheCoordinator（1 种注意力类型）
+      KVCacheCoordinatorNoPrefixCache（禁用前缀缓存）
+    - watermark: 为防止新请求频繁被抢占，调度 WAITING/PREEMPTED 请求时
+      保留一部分 free block 作为缓冲
+    - empty_kv_cache_blocks: 预构造的空 KVCacheBlocks，复用避免 GC
+    """
+
     def __init__(
         self,
         kv_cache_config: KVCacheConfig,
@@ -205,16 +265,26 @@ class KVCacheManager:
         return stats
 
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
-        """Get the computed (cached) blocks for the request.
-        Note that the computed blocks must be full.
+        """📖 前缀缓存命中查找 — 调用链第①步。
 
-        Args:
-            request: The request to get the computed blocks.
+        🔗 调用链定位：
+        Scheduler._schedule_request()
+          └─→ KVCacheManager.get_computed_blocks()
+               └─→ HybridKVCacheCoordinator.find_longest_cache_hit()
+                    ├─→ FullAttentionManager  (左扫：逐 block 查哈希表，首次 miss 停止)
+                    └─→ SlidingWindowManager  (右扫：找连续 sliding_window_contiguous_blocks)
+                    → 取交集 return (KVCacheBlocks, num_hit_tokens)
 
-        Returns:
-            A tuple containing:
-                - A list of blocks that are computed for the request.
-                - The number of computed tokens.
+        ⚙️ 行为：
+        - 前缀缓存关闭或请求标记 skip_reading_prefix_cache → 返回 (空, 0)
+        - max_cache_hit_length = request.num_tokens - 1
+          ※ 减 1 因为即使全命中也要重算最后一个 token 拿 logits
+        - 调用 coordinator.find_longest_cache_hit → 拿到各 group 的命中 block 列表和交集长度
+        - 命中 > 0 且开启 kv_cache_events → 发送 BlockStored 事件
+        - 开启 log_stats → 记录前缀缓存统计
+
+        📥 request: 包含 block_hashes（递归哈希链）的请求
+        📤 (KVCacheBlocks, int): 命中的 block 列表 + 命中 token 数
         """
         # We skip finding the prefix cache hit when prefix caching is
         # disabled or the request is marked as skipping kv cache read
@@ -280,88 +350,52 @@ class KVCacheManager:
         reserved_blocks: int = 0,
         has_scheduled_reqs: bool = True,
     ) -> KVCacheBlocks | None:
-        """Add slots for a request with new tokens to append.
+        """✍️ KV slot 分配 — 调用链第②步，调度核心。
 
-        Args:
-            request: The request to allocate slots.
-            num_new_tokens: The number of new tokens to be allocated and computed.
-            num_new_computed_tokens: The number of new computed tokens just
-                hitting the prefix caching, excluding external tokens.
-            new_computed_blocks: The cached blocks for the above new computed
-                tokens, grouped as a tuple by kv cache groups.
-            num_lookahead_tokens: The number of speculative tokens to allocate.
-                This is used by spec decode proposers with kv-cache such
-                as eagle.
-            num_external_computed_tokens: The number of tokens that their
-                KV caches are not cached by vLLM but cached by the connector.
-            delay_cache_blocks: Whether to skip caching the blocks. This is
-                used by P/D when allocating blocks used in a KV transfer
-                which will complete in a future step.
-            num_encoder_tokens: The number of encoder tokens to allocate for
-                cross-attention in encoder-decoder models(e.g., Whisper).
-                For decoder-only models, this should be 0.
-            full_sequence_must_fit: Only allocate blocks if the KV cache has enough
-                free blocks to hold the full sequence, accounting for prefix cache hits
-                and sliding window. Used as an admission gate to prevent over-admitting
-                requests when chunked prefill would otherwise only check the first chunk
-            reserved_blocks: Number of free blocks that must be left available for
-                other in-flight sequences to complete. The actual allocation is only
-                made if it fits within (free blocks - reserved_blocks). Used to gate
-                async KV-connector loads so their initial allocation cannot consume
-                blocks an already in-flight (prefilling) sequence is relying on.
-            has_scheduled_reqs: Whether any requests are already scheduled to run
-                this step, controls whether watermark is applied.
+        🔗 调用链定位：
+        Scheduler._schedule_request()
+          └─→ KVCacheManager.allocate_slots()
+               ├─ Stage1: coordinator.remove_skipped_blocks()
+               │           → SWA 层释放滑动窗口外的旧 block
+               ├─ Stage2: coordinator.get_num_blocks_to_allocate()
+               │           → 各 group 分别计算需要的 block 数（Full 需全序列，
+               │              SWA 只需窗口内）
+               │           → 容量不够返回 None
+               ├─ Stage3: coordinator.allocate_new_computed_blocks()
+               │           → 将前缀缓存命中的 block 追加到 request
+               ├─ Stage4: coordinator.allocate_new_blocks()
+               │           → 从 BlockPool 分配物理 block
+               └─ Stage5: coordinator.cache_blocks()
+                          → 将 block hash 写入前缀缓存哈希表
 
-        Blocks layout:
-        ```
-        ----------------------------------------------------------------------
-        | < comp > | < new_comp > | < ext_comp >  | < new >  | < lookahead > |
-        ----------------------------------------------------------------------
-                                                  |   < to be computed >     |
-        ----------------------------------------------------------------------
-                                  |            < to be allocated >           |
-        ----------------------------------------------------------------------
-                                  | < to be cached (roughly, |
-                                  | details below)>          |
-        ----------------------------------------------------------------------
-        | Prefix-cached tokens from either vLLM   |
-        | or connector. Can be safely removed if  |
-        | they are outside sliding window.        |
-        ----------------------------------------------------------------------
-        |   < cached by vLLM >    | not cached by |
-                                  | vLLM, but     |
-        | ref_cnt  | ref_cnt not  | cached by     |
-        | increased| increased yet| connector     |
-        ----------------------------------------------------------------------
-        ```
+        ⚙️ Block 布局：
+        ┌──────────────────────────────────────────────────────────┐
+        │ < comp > | < new_comp > | < ext_comp > | < new > | lkhd  │
+        └──────────────────────────────────────────────────────────┘
+                              │<─────── 需要分配 ────────>│
+                              │<── 需要写入前缀哈希 ──>│（取 verified 部分）
 
-        Abbrivations:
+        ⚙️ 三阶段分配：
+        - Stage1：释放 comp 中不必要的 block 并检查容量
+        - Stage2：处理前缀 token (comp+new_comp+ext_comp)，释放窗口外 block
+        - Stage3：为新 token (new+lookahead) 分配 block
 
-        ```
-        comp      = request.num_computed_tokens
-        new_comp  = num_new_computed_tokens
-                  = len(new_computed_blocks) * block_size
-        ext_comp  = num_external_computed_tokens, cached by the connector
-        new       = num_new_tokens, including unverified draft tokens
-        lookahead = num_lookahead_tokens
-        ```
+        ⚠️ 混合同步：Full 和 SWA 层各自按自己的 block_size 和 sliding_window
+           计算所需 block 数，coordinator 汇总判断容量是否足够。
 
-        NOTE: for new tokens which include both verified and unverified draft
-        tokens, we only cache the verified tokens (by capping the number at
-        `request.num_tokens`).
-
-        The allocation has three stages:
-        - Free unnecessary blocks in `comp` and check
-           if we have sufficient free blocks (return None if not).
-        - Handle prefix tokens (`comp + new_comp + ext_comp`):
-            - Free unnecessary blocks (e.g. outside sliding window)
-            - Allocate new blocks for `ext_comp` tokens inside
-              sliding window
-        - Allocate new blocks for tokens to be computed (`new + lookahead`)
-
-        Returns:
-            A list of new allocated blocks.
+        📥 num_new_tokens: 新增要计算的 token 数（含 draft token）
+        📥 num_new_computed_tokens: 前缀缓存命中新增的 token 数
+        📥 new_computed_blocks: 前缀缓存命中的 block 列表
+        📥 num_lookahead_tokens: 推测解码 lookahead token 数（EAGLE）
+        📥 num_external_computed_tokens: 外部缓存（P/D 场景）命中 token
+        📥 delay_cache_blocks: True → 跳过缓存写入（P/D 等待远程接收）
+        📥 full_sequence_must_fit: True → 防空转：完整序列放不下就不分配
+        📥 reserved_blocks: 留给其他 in-flight 序列的缓冲 block 数
+        📤 KVCacheBlocks | None: 新分配的 block 列表（None = 分配失败）
         """
+
+        # ① 入口校验：异步 KV 加载时可能没有新 token 要算，但 ext_comp 仍要分配 slot
+        # 如果新 token 和外部缓存 token 都为 0，说明调用有误
         # When loading KV data asynchronously, we may have zero new tokens to
         # compute while still allocating slots for externally computed tokens.
         if num_new_tokens == 0 and num_external_computed_tokens == 0:
@@ -394,6 +428,8 @@ class KVCacheManager:
         ):
             watermark_blocks = self.watermark_blocks
 
+        # ② Stage1: full_sequence_must_fit 的门槛检查（防止 chunked prefill 过度接纳）
+        #   如果完整序列放不下，直接返回 None，不等 chunked 分批才失败
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
@@ -406,7 +442,7 @@ class KVCacheManager:
                 total_computed_tokens=total_computed_tokens,
                 num_local_computed_tokens=num_local_computed_tokens,
                 num_tokens_main_model=full_num_tokens,
-                apply_admission_cap=True,
+                apply_admission_cap=True,  # 启用 SWA/ChunkedLocal 的回收感知容量上限
             )
             required_blocks = num_blocks_to_allocate + watermark_blocks
             if required_blocks > self.block_pool.get_num_free_blocks():
@@ -417,21 +453,20 @@ class KVCacheManager:
             num_tokens_main_model + num_lookahead_tokens, self.max_model_len
         )
 
-        # Free the blocks that are skipped during the attention computation
-        # (e.g., tokens outside the sliding window).
-        # We can do this even if we cannot schedule this request due to
-        # insufficient free blocks.
-        # Should call this function before allocating new blocks to reduce
-        # the number of evicted blocks.
-        # Free on the processed-token basis: in-flight steps' attention windows
-        # still read blocks below the optimistic boundary, and rejected spec
-        # tokens can roll it back.
+        # ③ Stage2: 释放滑动窗口外的旧 block（SWA 层环形复用机制的核心）
+        #   为什么在分配前做？先清出空间 → 减少后续分配的 evict 压力
+        #   为什么用 (total - inflight)？in-flight 步骤的 attention 窗口仍要读旧的 block，
+        #   且被拒绝的 spec token 可能回滚，所以不能释放 inflight 范围内的 block
         self.coordinator.remove_skipped_blocks(
             request.request_id,
             max(0, total_computed_tokens - request.num_in_flight_tokens),
             num_prompt_tokens=request.num_prompt_tokens,
         )
 
+        # ④ Stage2 续: 计算需要分配的 block 数量
+        #   get_num_blocks_to_allocate 会遍历所有 single_type_managers:
+        #     FullAttentionManager:   ceil(num_tokens / block_size)
+        #     SlidingWindowManager:   ceil(min(num_tokens, sliding_window) / block_size)
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
             num_tokens=num_tokens_need_slot,
@@ -443,20 +478,21 @@ class KVCacheManager:
             num_tokens_main_model=num_tokens_main_model,
         )
 
-        # Keep `reserved_blocks` free for other in-flight sequences, and an
-        # additional watermark of headroom for waiting/preempted admissions.
+        # ⑤ 容量检查：free_blocks - reserved >= required + watermark
+        #   reserved_blocks — 留给其他 in-flight 序列完成的缓冲
+        #   watermark_blocks — 防止 WAITING/PREEMPTED 请求因接纳过多而频繁抢占
         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
         required_blocks = num_blocks_to_allocate + watermark_blocks
         if required_blocks > available_blocks:
             # Cannot allocate new blocks
             return None
 
+        # ⑥ Stage3: 将前缀缓存命中的 block 追加到 request 的 block 列表
+        #   为什么先追前缀再分新 block？避免先分新 block 但前缀 block 后又分配不了的尴尬
         if (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks
             or num_external_computed_tokens > 0
         ):
-            # Append the new computed blocks to the request blocks until now to
-            # avoid the case where the new blocks cannot be allocated.
             self.coordinator.allocate_new_computed_blocks(
                 request_id=request.request_id,
                 new_computed_blocks=new_computed_block_list,
@@ -464,6 +500,7 @@ class KVCacheManager:
                 num_external_computed_tokens=num_external_computed_tokens,
             )
 
+        # ⑦ Stage4: 从 BlockPool 分配全新的物理 block
         new_blocks = self.coordinator.allocate_new_blocks(
             request.request_id,
             num_tokens_need_slot,
@@ -471,16 +508,13 @@ class KVCacheManager:
             num_encoder_tokens,
         )
 
-        # P/D: delay caching blocks if we have to recv from
-        # remote. Update state for locally cached blocks.
+        # ⑧ P/D 场景：如果要从远端 recv，延迟缓存写入
         if not self.enable_caching or delay_cache_blocks:
             return self.create_kv_cache_blocks(new_blocks)
 
-        # NOTE(woosuk): We want to commit (cache) up to num_local_computed_tokens
-        # + num_external_computed_tokens + num_new_tokens, but must exclude
-        # "non-committable" tokens (e.g., draft tokens that could be rejected).
-        # Therefore, we cap the number at `request.num_tokens`, ensuring only
-        # "finalized" tokens are cached.
+        # ⑨ Stage5: 将新分配的 block hash 写入前缀缓存哈希表
+        #   取 min(new, request.num_tokens) 而不是直接用 new 的原因：
+        #   new 包含 draft token（可能被拒），只缓存 verified 部分
         num_tokens_to_cache = min(
             total_computed_tokens + num_new_tokens,
             request.num_tokens,
@@ -490,12 +524,14 @@ class KVCacheManager:
         return self.create_kv_cache_blocks(new_blocks)
 
     def free(self, request: Request) -> None:
-        """Free the blocks allocated for the request.
-        We free the blocks in reverse order so that the tail blocks are evicted
-        first when caching is enabled.
+        """🗑️ 释放请求的所有 block — 调用链第③步。
 
-        Args:
-            request: The request to free the blocks.
+        ⚙️ 🔗 Scheduler → KVCacheManager.free() → coordinator.free()
+          → 遍历 single_type_managers → free(request_id)
+            → block_pool.free_block() 逐个释放（ref_count -= 1，归 0 则归还 free pool）
+
+        ⚠️ 释放顺序：逆序释放（tail block 先释放），这样前缀缓存引用的 block 最后释放，
+           确保其他共享这些 block 的请求不会受影响。
         """
         self.coordinator.free(request.request_id)
 

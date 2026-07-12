@@ -624,25 +624,43 @@ class FlexAttentionMetadata:
         return final_mask_mod
 
     def get_mask_mod(self):
-        # Stage-1: initialize the base mask_mod
-        # (causal mask for decoder or bidirectional mask for encoder)
+        """🧩 构建组合 mask — 三层管道式 mask 组合。
+
+        ╔══════════ mask 组合管道 ═══════════════════════════╗
+        ║                                                     ║
+        ║  Stage 1: 基础 mask                                ║
+        ║  ┌ decoder(paged): causal_mask (q_idx >= kv_idx)    ║
+        ║  └ encoder:         bidirectional (always True)     ║
+        ║            │                                        ║
+        ║  Stage 2: AND 组合 (越加越严格)                     ║
+        ║  ┌ + sliding_window: |q - kv| < window              ║
+        ║  ├ + rswa_mask:      in_prefix OR in_window        ║
+        ║  │                    (prefix 全局可见 + 生成 token  ║
+        ║  │                     用滑动窗口)                  ║
+        ║            │                                        ║
+        ║  Stage 3: OR 组合 (越加越宽松)                      ║
+        ║  └ + prefix_lm_mask: 多模态 PrefixLM 双向区域       ║
+        ║                                                     ║
+        ║  最终 mask = causal & sliding_window & rswa          ║
+        ║             | prefix_lm                             ║
+        ╚═════════════════════════════════════════════════════╝
+        """
+        # Stage 1: paged attention → causal mask (带物理→逻辑映射)
         if self.uses_paged_kv:
             mask_mod = self.get_paged_mask_mod()
         else:
             mask_mod = self.get_bidirectional_mask_mod()
-        # stage-2: add external mask_mod for special attention during
-        # forwarding runtime to create the combined mask_mod.
+        # Stage 2: AND 组合额外约束
         if self.sliding_window is not None:
-            # Add sliding window mask for sliding window attention
+            # 滑动窗口: 只允许 |q_idx - kv_idx| < sliding_window 的位置
             sliding_window_mask_mod = self.get_sliding_window_mask_mod()
             mask_mod = and_masks(mask_mod, sliding_window_mask_mod)
         if self.mm_prefix_range:
-            # Add prefix LM mask for vision-language prefix LM attention
+            # PrefixLM: 多模态模型中图片区域双向可见
             prefix_lm_mask_mod = self.get_prefix_lm_mask_mod()
             mask_mod = or_masks(mask_mod, prefix_lm_mask_mod)
         if self.rswa_window is not None and self.rswa_prefix_lens is not None:
-            # Reference Sliding Window Attention: AND with the base causal mask
-            # (prefix stays global, generated tokens use a sliding window).
+            # R-SWA: prefix 全局可见 + 生成 token 用滑动窗口
             mask_mod = and_masks(mask_mod, self.get_rswa_mask_mod())
         return mask_mod
 
@@ -747,10 +765,15 @@ class FlexAttentionMetadata:
             block_starts = self.logical_block_ids * self.block_size
             block_ends = block_starts + self.block_size
 
+            # 裁剪 1: causal — 移除未来的 blocks
             if self.causal:
                 future_blocks = block_starts[None, :] > logical_q_idx[:, None]
                 used_pages.masked_fill_(future_blocks, 0)
 
+            # 裁剪 2: sliding_window — 移除窗口外的 blocks
+            #   示例: sliding_window=4096, block_size=16
+            #   序列 10000 token → 625 blocks，窗口裁剪后只剩 256 blocks
+            #   → 节省 59% kernel 遍历量
             if self.sliding_window:
                 assert self.sliding_window is not None
                 min_kv_idx = torch.clamp(
@@ -1268,17 +1291,40 @@ class FlexAttentionImpl(AttentionImpl):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Forward pass with FLexAttention.
+        """🚀 FlexAttention forward — 混合模型的 per-layer 运行时。
 
-        Args:
-            query: shape = [num_tokens, num_heads, head_size]
-            key: shape = [num_tokens, num_kv_heads, head_size]
-            value: shape = [num_tokens, num_kv_heads, head_size]
-            kv_cache: shape =
-                [num_blocks, num_kv_heads, block_size, 2 * head_size]
-            attn_metadata: Metadata for attention.
-        Returns:
-            shape = [num_tokens, num_heads * head_size]
+        🔗 调用链定位：
+        GPUModelRunner.execute_model()
+          └─ for each attention layer:
+               Attention.forward()
+                 └─ FlexAttentionImpl.forward()  ← 你在这里
+                      ├─ ① per-layer 差异检测（sliding_window/mask/hint）
+                      ├─ ② block_mask 重建（如有变化）
+                      ├─ ③ KV cache 读写 (paged attention)
+                      └─ ④ flex_attention_compiled()
+
+        ╔══════════🖼️ Per-Layer 切换机制 ═══════════════════════╗
+        ║                                                       ║
+        ║  混合模型不同层有不同 attention 类型:                   ║
+        ║                                                       ║
+        ║  Layer 0 (Full):   sliding_window=None                ║
+        ║  Layer 1 (SWA):    sliding_window=4096                ║
+        ║  Layer 2 (SWA):    sliding_window=4096                ║
+        ║                                                       ║
+        ║  flex_attention.py 运行时检测:                         ║
+        ║                                                       ║
+        ║  attn_metadata.sliding_window != self.sliding_window  ║
+        ║    → 切换 sliding_window                              ║
+        ║    → 重建 mask_mod (causal + sliding_window)          ║
+        ║    → 重建 block_mask (裁剪窗口外 KV blocks)           ║
+        ║                                                       ║
+        ║  CUDA Graph 模式下: 第一层构建固定 metadata，           ║
+        ║  后续层如不同则触发动态重建 (torch.compile 自动处理)    ║
+        ╚═══════════════════════════════════════════════════════╝
+
+        📥 query:  [num_tokens, num_heads, head_size]
+        📥 kv_cache: [num_blocks, num_kv_heads, block_size, 2*head_size]
+        📤 output: [num_tokens, num_heads * head_size]
         """
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError(
@@ -1296,18 +1342,23 @@ class FlexAttentionImpl(AttentionImpl):
         num_actual_tokens = attn_metadata.num_actual_tokens
 
         needs_rebuild_block_mask = False
+
+        # ① sliding_window per-layer 切换
+        #   混合模型不同层 sliding_window 不同（如 None vs 4096）
+        #   metadata 中预先设置的 sliding_window 是第一层或 CUDA graph 的预设值
         if attn_metadata.sliding_window != self.sliding_window:
             attn_metadata.sliding_window = self.sliding_window
             if attn_metadata.direct_build:
-                # update mask mod in attention metadata
                 attn_metadata.mask_mod = attn_metadata.get_mask_mod()
             needs_rebuild_block_mask = True
 
+        # ①b multimodal prefix range 变化（如多模态模型的 PrefixLM）
         if self.mm_prefix_range != getattr(attn_metadata, "mm_prefix_range", None):
             self.mm_prefix_range = attn_metadata.mm_prefix_range
             attn_metadata.mask_mod = attn_metadata.get_mask_mod()
             needs_rebuild_block_mask = True
 
+        # ①c layer 级别自定义 mask_mod（如特定层有不同 causal 规则）
         layer_mask_mod = getattr(layer, "logical_mask_mod", None)
         if (
             layer_mask_mod is not None
@@ -1317,6 +1368,7 @@ class FlexAttentionImpl(AttentionImpl):
             attn_metadata.mask_mod = attn_metadata.get_mask_mod()
             needs_rebuild_block_mask = True
 
+        # ①d layer 级别自定义 block_sparsity_hint（裁剪无用 KV blocks）
         layer_hint = getattr(layer, "block_sparsity_hint", None)
         if (
             layer_hint is not None
@@ -1325,6 +1377,9 @@ class FlexAttentionImpl(AttentionImpl):
             attn_metadata.block_sparsity_hint = layer_hint
             needs_rebuild_block_mask = True
 
+        # ② 重建 block_mask: 仅在 mask/components 变化时重新构建
+        #   block_mask 裁剪无用 KV blocks → 减少 kernel 遍历量
+        #   如 SWA 层：block_mask 只包含窗口内的 blocks
         if needs_rebuild_block_mask or attn_metadata.block_mask is None:
             if attn_metadata.direct_build:
                 attn_metadata.block_mask = attn_metadata._build_block_mask_direct()
@@ -1349,11 +1404,14 @@ class FlexAttentionImpl(AttentionImpl):
 
         else:
             assert self.attn_type == AttentionType.DECODER
+            # ③ KV cache 读取: 转置 + 分割 K/V → 展平 block 维度为 token 维度
+            #   kv_cache: [num_blocks, H_kv, block_size, 2*hs]
+            #     → transpose → [num_blocks, block_size, H_kv, 2*hs]
+            #     → split      → key_cache, value_cache: [num_blocks, block_size, H_kv, hs]
+            #     → view       → [total_slots, H_kv, hs] (展平所有 block)
             kv_cache = kv_cache.transpose(1, 2)
             hs = self.head_size
             key_cache, value_cache = kv_cache.split(hs, dim=-1)
-
-            # Flatten (num_blocks, block_size) into a single token dim.
             key_cache = key_cache.view(-1, self.num_kv_heads, self.head_size)
             value_cache = value_cache.view(-1, self.num_kv_heads, self.head_size)
             query, key_tensor, value_tensor = map(
@@ -1363,9 +1421,9 @@ class FlexAttentionImpl(AttentionImpl):
 
             query = query[:, :, :num_actual_tokens, :]
 
-        # Doesn't work for now -> constraint violation
         # torch._dynamo.try_mark_dynamic(query, 2)
 
+        # ④ flex_attention_compiled — torch.compile 加速的 FlexAttention kernel
         assert attn_metadata.block_mask is not None
         block_m, block_n = attn_metadata.block_mask.BLOCK_SIZE
 
@@ -1379,6 +1437,10 @@ class FlexAttentionImpl(AttentionImpl):
             kernel_options["BLOCK_N"] = self.block_n
         if envs.VLLM_BATCH_INVARIANT:
             kernel_options["IS_DIVISIBLE"] = False
+
+        # ★ 核心计算 ★
+        #   mask_mod = causal_mask & sliding_window_mask & rswa_mask | prefix_lm_mask
+        #   block_mask 已裁剪 → 只遍历有效 KV blocks（SWA 层可节省 ~59% 遍历量）
         out = flex_attention_compiled(
             query,
             key_tensor,

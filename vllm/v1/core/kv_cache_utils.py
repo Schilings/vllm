@@ -1138,67 +1138,42 @@ def is_kv_cache_type_attention_free(kv_cache_spec: dict[str, KVCacheSpec]) -> bo
 def _get_kv_cache_groups_uniform_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec]:
-    """
-    Generates the KV cache groups for hybrid models with multiple
-    attention types but still with a uniform page size (physical memory per
-    block per layer) for all layers.
+    """🧩 混合模型 KV Cache 分组 — 按注意力类型将层分组成 kv_cache_groups。
 
-    Detailed explanation about kv cache management of hybrid models:
-    The layers in the models are repeated with some patterns, e.g., a model
-    with 10 full attention layers and 20 sliding window attention layers can be
-    regarded as repeating the pattern (1 * full, 2 * sw) 10 times.
-    The KVCacheManager allocates different block tables for each of the 3 layers
-    in the pattern, and repeats each of them 10 times to generate the
-    block_table for the 30 layers in the model.
-    Therefore, we can group the layers in the model into 3 kv_cache_groups, each
-    of which contains 10 layers in the model.
-    The KVCacheManager allocates the block_table for each group based on its
-    kv_cache spec, and the model runner applies the block table to each layer
-    in the group.
-    For example:
-    1. A model only uses full attention. The pattern is
-    (num_hidden_layers * full), so there is only one group and the block table
-    is shared by all layers. It is already handled by
-    `_get_kv_cache_config_uniform_type`.
-    2. A model with 10 full attention layers and 20 sliding window
-    attention layers. There are 3 layers in the pattern (1 * full, 2 * sw), so
-    there are 3 kv_cache_groups, each of which represents 10 layers.
+    🧬 核心思想：不同注意力类型需要不同数量的 block，但共享统一物理内存池。
 
-    To simplify the implementation, we make the following assumptions:
-    1. Physical memory per block: Must be the same across all KV cache groups.
-    Breaking this assumption is non-trivial due to memory fragmentation concerns
-    when allocating blocks of different sizes.
-    2. Tokens per block (block_size): Currently, we directly use
-    `CacheConfig.block_size` for all layers. It can be extended to vary by KV
-    cache group, but within each KV cache group, all layers must share the same
-    block size.
-    3. Physical memory per token per layer: This property is decided by model
-    config. Currently we only support models that have the same physical memory
-    per token per layer for all layers. Can be relaxed with a simple extension,
-    but still need to keep physical memory per block the same for all groups.
-    4. Number of layers per group: Currently assumed the same for all layers.
-    Can be relaxed with a simple extension, but still need to keep physical
-    memory per block the same for all groups.
-    5. Attention type within groups: All layers in a group must share the same
-    attention type. One exception is that, when
-    `--disable-hybrid-kv-cache-manager` is true, the single group for full
-    attention layers may also include attention layers using sliding window or
-    LLaMA 4 local attention. See `unify_hybrid_kv_cache_specs` for more details.
-    6. Support for multiple attention types: The design for most components is
-    general to an arbitrary number of attention types. But
-    `find_longest_cache_hit` only supports one attention type or two
-    types of full-attention plus exactly one another type. The general
-    implementation of this function is feasible but we don't know how to
-    implement it cleanly yet.
+    ╔══════════🖼️ 分组示例: Gemma3-27b (10 Full + 52 SWA) ═══════════╗
+    ║                                                               ║
+    ║  输入: 62 层，10 个 FullAttention + 52 个 SlidingWindow        ║
+    ║                                                               ║
+    ║  Step 1: 按 spec 类型分组                                     ║
+    ║    Full Group: [full.0, ..., full.9]       (10 layers)        ║
+    ║    SWA  Group: [sw.0,  ..., sw.51]       (52 layers)         ║
+    ║                                                               ║
+    ║  Step 2: 计算 group_size                                      ║
+    ║    min_layers = min(10, 52) = 10                              ║
+    ║    52 < 10*1.5?  NO → group_size = 10                        ║
+    ║                                                               ║
+    ║  Step 3: 交错分配合（确保 PP 正确）                            ║
+    ║    Group 0: full.0..9                    (10 layers)          ║
+    ║    Group 1: sw.0..9                      (10 layers)          ║
+    ║    Group 2: sw.10..19                   (10 layers)          ║
+    ║    Group 3: sw.20..29                   (10 layers)          ║
+    ║    Group 4: sw.30..39                   (10 layers)          ║
+    ║    Group 5: sw.40..49                   (10 layers)          ║
+    ║    Group 6: sw.50..51 + 8 padding        (10 layers)          ║
+    ║                                                               ║
+    ║  结果: 7 个 KV Cache Groups，每组 10 层                       ║
+    ╚═══════════════════════════════════════════════════════════════╝
 
-    As we assume tokens per block, physical memory per token per layer, and
-    number of layers per group are the same now, we can ensure that physical
-    memory per block is the same for all groups.
+    关键假设（简化实现）:
+    1. 所有 group 共享相同 block 内存大小（避免内存碎片）
+    2. block_size 所有层相同（CacheConfig.block_size）
+    3. 每 token 每层的内存开销相同
+    4. 每组内层数相同（通过 padding 实现）
 
-    Args:
-        kv_cache_spec: The KVCacheSpec of each attention layer in the model
-    Returns:
-        The generated KVCacheGroupSpecs
+    📥 kv_cache_spec: {layer_name: KVCacheSpec, ...}
+    📤 list[KVCacheGroupSpec]: 分组后的 KV cache 规格列表
     """
     # Group all layers by kv_cache_spec.
     # E.g., 2 full attention layers and 3 sliding window attention layers,

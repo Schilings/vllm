@@ -86,16 +86,56 @@ def _get_backend_priorities(
     num_heads: int | None = None,
     kv_cache_dtype: CacheDType | None = None,
 ) -> list[AttentionBackendEnum]:
-    """Get backend priorities with lazy import to avoid circular dependency."""
+    """🏭 Attention 后端优先级排序 — 按 GPU 架构 / MLA / KV dtype 返回候选列表。
+
+    🔗 调用链：
+    CudaPlatform.get_attn_backend_cls() → get_valid_backends()
+      └─→ _get_backend_priorities()  ← 你在这里
+           → 返回从高到低优先级列表 → 逐个 validate → 取第一个通过的后端
+
+    ╔══════════ 🖼️ 默认优先级总览 ═══════════════════════════╗
+    ║                                                         ║
+    ║  🔵 Blackwell (SM100) 默认注意力:                        ║
+    ║    FLASHINFER > FLASH_ATTN > TRITON > FLEX > TURBO      ║
+    ║                                                         ║
+    ║  🟠 旧卡 默认注意力:                                     ║
+    ║    FLASH_ATTN > FLASHINFER > TRITON > FLEX > TURBO      ║
+    ║                                                         ║
+    ║  🟢 MLA (DeepSeek V3/V4 等) — Blackwell:               ║
+    ║    FLASHINFER_MLA > TOKENSPEED_MLA > CUTLASS_MLA > …   ║
+    ║    + sparse backends (tail)                             ║
+    ║                                                         ║
+    ║  🔑 关键差异:                                            ║
+    ║  ┌────────────┬──────────────────┬──────────────────┐   ║
+    ║  │            │   Blackwell      │   旧卡           │   ║
+    ║  ├────────────┼──────────────────┼──────────────────┤   ║
+    ║  │ 第 1 优先  │ FLASHINFER       │ FLASH_ATTN       │   ║
+    ║  │ 原因       │ FP8 KV Cache     │ 手写 CUDA kernel │   ║
+    ║  │            │ + TRT-LLM 集成   │ 在旧卡上最成熟   │   ║
+    ║  │ 第 4 兜底  │ FLEX_ATTENTION   │ FLEX_ATTENTION   │   ║
+    ║  │ 触发条件   │ 混合模型 mask    │ 同左             │   ║
+    ║  └────────────┴──────────────────┴──────────────────┘   ║
+    ╚═════════════════════════════════════════════════════════╝
+
+    ⚙️ MLA 分支额外逻辑：
+    - Blackwell (SM100) MLA:
+      FP8 KV cache → FlashInfer_MLA_Sparse 优先（FlashMLA 不支持 FP8）
+      BF16 + 低 head 数(≤16) → FlashInfer 优先（FlashMLA padding 开销大）
+      BF16 + 高 head 数 → FlashMLA 优先
+    - SM120 → TRITON_MLA 优先，FlashInfer MLA Sparse SM120 第二
+
+    📥 device_capability: GPU 计算能力（major.minor）
+    📥 use_mla: True → DeepSeek 等 MLA 架构
+    📤 list[AttentionBackendEnum]: 从高到低优先级列表
+    """
     from vllm.utils.torch_utils import is_quantized_kv_cache
 
     if use_mla:
+        # ==================== MLA 分支: DeepSeek V3/V4 等稀疏注意力 ====================
         if device_capability.major == 10:
-            # Sparse MLA backend priorities
-            # See https://github.com/vllm-project/vllm/issues/35807 for
-            # benchmark results
+            # Blackwell MLA: 稀疏 + 量化 KV cache 场景
             if kv_cache_dtype is not None and is_quantized_kv_cache(kv_cache_dtype):
-                # Prefer FlashInfer for fp8 kv cache
+                # FP8 KV cache: FlashInfer 优先（FlashMLA 不支持 FP8）
                 sparse_backends = [
                     AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
                     AttentionBackendEnum.FLASHMLA_SPARSE,
@@ -141,7 +181,9 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLASHMLA_SPARSE,
             ]
     else:
+        # ==================== 标准注意力分支（非 MLA） ====================
         if device_capability.major == 10:
+            # Blackwell: FlashInfer 第一 → 原生 FP8 KV cache + TRT-LLM 动态 kernel
             return [
                 AttentionBackendEnum.FLASHINFER,
                 AttentionBackendEnum.FLASH_ATTN,
@@ -150,6 +192,7 @@ def _get_backend_priorities(
                 AttentionBackendEnum.TURBOQUANT,
             ]
         else:
+            # 旧卡: FlashAttention 第一 → 手写 CUDA kernel 在旧架构上最成熟
             return [
                 AttentionBackendEnum.FLASH_ATTN,
                 AttentionBackendEnum.FLASHINFER,
@@ -394,10 +437,31 @@ class CudaPlatformBase(Platform):
         attn_selector_config: AttentionSelectorConfig,
         num_heads: int | None = None,
     ) -> str:
+        """🎯 选定 Attention Backend — 两步决策：用户指定 → 自动优先级匹配。
+
+        🔗 调用链：
+        get_attn_backend() → selector._cached_get_attn_backend()
+          → current_platform.get_attn_backend_cls()  ← 你在这里
+            ├── Step 1: --attention-backend 指定了 → 直接 validate 返回
+            └── Step 2: 未指定 → get_valid_backends() 按优先级逐个尝试
+                  → 返回第一个通过 validate 的后端
+
+        ⚙️ 决策流程：
+        ┌──────────────────────────────────────────────────────────┐
+        │ ① 用户指定了 --attention-backend FLASHINFER?             │
+        │    → validate_configuration() 检查兼容                   │
+        │    → 不兼容 → 报错退出                                   │
+        │    → 兼容   → 返回该后端                                 │
+        │                                                          │
+        │ ② 未指定 → _get_backend_priorities() 返回优先级列表      │
+        │    → 逐个 validate → 第一个通过 = 最终后端               │
+        │    → 全部不通过 → 报错                                   │
+        └──────────────────────────────────────────────────────────┘
+        """
         device_capability = cls.get_device_capability()
         assert device_capability is not None
 
-        # First try checking just the selected backend, if there is one.
+        # ① 用户指定了后端 → 直接 validate + 返回
         if selected_backend is not None:
             try:
                 backend_class = _get_attn_backend_class(selected_backend)
@@ -416,8 +480,7 @@ class CudaPlatformBase(Platform):
                 logger.info("Using %s backend.", selected_backend)
                 return _backend_cls_path(backend_class)
 
-        # No selected backend or the selected backend is invalid,
-        # so we try finding a valid backend.
+        # ② 自动选择: 按优先级列表遍历，取第一个通过 validate 的
         valid_backends_priorities, all_invalid_reasons = cls.get_valid_backends(
             device_capability=device_capability,
             attn_selector_config=attn_selector_config,

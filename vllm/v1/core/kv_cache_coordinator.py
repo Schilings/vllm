@@ -517,9 +517,69 @@ class SpecGroup(NamedTuple):
 
 
 class HybridKVCacheCoordinator(KVCacheCoordinator):
-    """
-    KV cache coordinator for hybrid models with multiple KV cache types, and
-    thus multiple kv cache groups.
+    """🧩 混合注意力 KV 缓存协调器 — 协调 Full + SWA 等多种注意力类型的缓存管理。
+
+    ╔══════════════ 🧩 对外接口 ═══════════════════════════════╗
+    ║                                                          ║
+    ║ 📖 find_longest_cache_hit()   │ ★核心★                    ║
+    ║    迭代固定点算法：Full左扫 ∩ SWA右扫 = 交集 hit_length   ║
+    ║                                                          ║
+    ║ 📖 find_longest_cache_hit_per_group()                    ║
+    ║    各组独立查询（不打交集）                               ║
+    ║                                                          ║
+    ║ ✍️ cache_blocks()              前缀缓存写入               ║
+    ║    Full 按 aligned 边界缓存；SWA 按 scheduler_block_size  ║
+    ║                                                          ║
+    ║ 继承父类的基础分配/释放/容量查询接口                       ║
+    ╚══════════════════════════════════════════════════════════╝
+
+    ╔══════════════ 🔗 前缀缓存交集算法 ═══════════════════════╗
+    ║                                                          ║
+    ║  输入: block_hashes (整序列的 hash 链), max_hit_len      ║
+    ║                                                          ║
+    ║  迭代:                                                    ║
+    ║  ┌─────────────────────────────┐                         ║
+    ║  │ curr_hit = max_hit_len      │                         ║
+    ║  │ while True:                 │                         ║
+    ║  │   ┌── Full 左扫 ──────────┐ │                        ║
+    ║  │   │ for i in 0..N:        │ │                        ║
+    ║  │   │   if cached_block[i]: │ │  [✓][✓][✓][✗]…→3      ║
+    ║  │   │     i++ (继续)        │ │  ←第一个 miss 停止     ║
+    ║  │   │   else: break         │ │                        ║
+    ║  │   └──────────────────────┘ │                         ║
+    ║  │     → hit_full = N tokens  │                         ║
+    ║  │                            │                         ║
+    ║  │   ┌── SWA 右扫 ──────────┐ │                         ║
+    ║  │   │ for i in N..0:       │ │                         ║
+    ║  │   │   if 连续命中 cnt++: │ │  [⊗][✓][✓][⊗][✓]→     ║
+    ║  │   │     if cnt>=need: OK │ │  需要连续need个块命中    ║
+    ║  │   │   else: cnt=0 (中断) │ │                         ║
+    ║  │   └──────────────────────┘ │                         ║
+    ║  │     → hit_sw = M tokens    │                         ║
+    ║  │                            │                         ║
+    ║  │   curr_hit = min(hit_full, │  ← 取交集               ║
+    ║  │                     hit_sw)│                         ║
+    ║  │                            │                         ║
+    ║  │   if curr_hit >= hit:     │                          ║
+    ║  │     break (收敛)          │                          ║
+    ║  │   hit = curr_hit          │                          ║
+    ║  └─────────────────────────────┘                         ║
+    ║                                                          ║
+    ║  为什么取交集？一次 forward 所有层同步执行，               ║
+    ║  Full 层可以复用 5 block 但 SWA 层只能复用 2 block，       ║
+    ║  那统一取 2 个 block。                                    ║
+    ╚══════════════════════════════════════════════════════════╝
+
+    🔑 与 UnitaryKVCacheCoordinator 的区别:
+    ┌─────────────────────┬──────────────────┬──────────────────┐
+    │                     │    Unitary       │     Hybrid       │
+    ├─────────────────────┼──────────────────┼──────────────────┤
+    │ KV cache group 数   │ 1                │ ≥2              │
+    │ 前缀缓存算法        │ 单次左扫         │ 迭代固定点交集   │
+    │ attention_groups    │ 无               │ 按 SpecGroup 分组│
+    │ hash vs block size  │ 必须相等          │ 可成倍数关系     │
+    │ SWA 右扫            │ 不适用            │ ★核心特性       │
+    └─────────────────────┴──────────────────┴──────────────────┘
     """
 
     def __init__(
@@ -597,10 +657,15 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         )
 
     def verify_and_split_kv_cache_groups(self) -> None:
+        """🧬 按 spec 类型分组 + 排序，构建 attention_groups 以高效批量查缓存。
+
+        ⚙️ 行为：
+        - 遍历所有 kv_cache_groups，按 spec 类型合并相同类型的 group
+        - 相同 spec 的 group 共享一次前缀缓存查询（batch 处理）
+        - 排序：Full Attention 排第一位（其左扫提供紧密上界，减少后续组遍历）
+        - 传播 EAGLE bit 到对应 manager（每个 attention_group 的 use_eagle）
         """
-        Groups KV cache groups by their spec type for efficient batch processing
-        during cache hit lookup.
-        """
+        self.attention_groups: list[SpecGroup] = []
         self.attention_groups: list[SpecGroup] = []
         for i, g in enumerate(self.kv_cache_config.kv_cache_groups):
             manager_cls = self.single_type_managers[i].__class__
@@ -700,45 +765,38 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups
         hit_length_by_group: list[int] = [0] * num_groups
 
-        # Simple hybrid (1 full attn + 1 other): one iteration suffices.
-        # Full attn is always first if it exists.
+        # 简单混合（1 Full + 1 other）一次迭代即可收敛，无需多轮循环
         is_simple_hybrid = len(self.attention_groups) == 2 and isinstance(
             self.attention_groups[0].spec, FullAttentionSpec
         )
 
-        # Attention-group indices whose EAGLE drop is verified at the current
-        # ``curr_hit_length``. Each eagle group applies the drop at most once
-        # per candidate length (see issue #32802).
+        # EAGLE 在同一个候选长度上最多 drop 一次（避免重复 drop 造成短少）
         eagle_verified: set[int] = set()
 
+        # ★ 迭代固定点循环 ★ — 每次迭代候选长度单调递减，收敛于共同最大值
         while True:
             curr_hit_length = hit_length
 
+            # 遍历 attention_groups（Full 排在第一位）
             for idx, (spec, group_ids, manager_cls, use_eagle) in enumerate(
                 self.attention_groups
             ):
                 first_group_id = group_ids[0]
-                # DCP/PCP shard each block's KV across ranks, so the manager's
-                # effective block size may exceed the spec's.
                 group_block_size = self.single_type_managers[first_group_id].block_size
                 cached_blocks = hit_blocks_by_group[first_group_id]
+
+                # Full Attention 是"向下封闭"的：如果已经查过一次，后续迭代只需 trim 到新长度
                 if isinstance(spec, FullAttentionSpec) and cached_blocks is not None:
-                    # Full attention is downward-closed: we only need to look
-                    # up cached blocks once; on subsequent iterations just trim
-                    # to the (reduced) current hit length.
                     curr_hit_length = min(
                         curr_hit_length, hit_length_by_group[first_group_id]
                     )
-                    continue
+                    continue  # 跳过重新查询 → 直接约束到上次结果
 
+                # EAGLE: 每个候选长度最多 drop 一次
                 drop_eagle_block = use_eagle and idx not in eagle_verified
 
                 _max_length = curr_hit_length
-                # Eagle matches one extra drop unit (one hash unit for
-                # fine-grained managers, else one cache block) and then drops
-                # it, landing back at the candidate length. No margin for
-                # mamba: its finder never drops (draft models have no mamba
-                # layers), so the hit would grow past the candidate.
+                # EAGLE 会额外多查一个 drop unit 然后丢掉，落地回候选长度
                 if drop_eagle_block and not isinstance(spec, MambaSpec):
                     eagle_margin = (
                         self.hash_block_size
@@ -750,6 +808,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     _max_length = min(
                         curr_hit_length + eagle_margin, max_cache_hit_length
                     )
+
+                # ★ 调用各类型 management 的 find_longest_cache_hit ★
+                #   FullAttentionManager: 左扫，逐 block 查哈希
+                #   SlidingWindowManager: 右扫，找连续窗口 block
                 hit_blocks, _new_hit_length = manager_cls.find_longest_cache_hit(
                     block_hashes=block_hashes,
                     max_length=_max_length,
@@ -767,7 +829,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 if drop_eagle_block:
                     eagle_verified.add(idx)
                 elif _new_hit_length < curr_hit_length:
-                    # length shrunk; invalidate previous eagle verifications
+                    # 如果某个 group 缩短了长度，需要重新检查之前的 EAGLE 验证
                     eagle_verified.clear()
                 curr_hit_length = _new_hit_length
                 for group_id, blocks in zip(group_ids, hit_blocks):
@@ -776,13 +838,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
 
                 longest_hit_length = max(longest_hit_length, curr_hit_length)
 
+            # 收敛检测: 本轮长度没缩短 → 固定点到达，退出
             if curr_hit_length >= hit_length:
                 break
             hit_length = curr_hit_length
             if is_simple_hybrid:
-                break
+                break  # 简单混合一轮就够
 
-        # Truncate full attention blocks to final hit_length (if present)
+        # 后处理: 将 Full Attention block 截断到最终 hit_length
         first_group = self.attention_groups[0]
         if isinstance(first_group.spec, FullAttentionSpec):
             group_block_size = self.single_type_managers[
@@ -846,6 +909,15 @@ def get_kv_cache_coordinator(
     hash_block_size: int,
     metrics_collector: KVCacheMetricsCollector | None = None,
 ) -> KVCacheCoordinator:
+    """🏭 KV Cache Coordinator 工厂 — 根据 prefix cache 配置和 group 数量选择实例。
+
+    三种返回:
+    - 无前缀缓存 → KVCacheCoordinatorNoPrefixCache
+    - 1 个 KV cache group → UnitaryKVCacheCoordinator（单一类型，1 次左扫）
+    - ≥2 个 KV cache group → HybridKVCacheCoordinator（混合类型，迭代交集）
+
+    🔗 调用链: KVCacheManager.__init__() → get_kv_cache_coordinator()
+    """
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
             kv_cache_config,

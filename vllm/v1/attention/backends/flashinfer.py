@@ -339,7 +339,41 @@ class BatchDCPPrefillWrapper:
 
 
 class FlashInferBackend(AttentionBackend):
+    """🧩 FlashInfer 注意力后端 — 社区 CUDA kernel 库，Blackwell GPU 上默认最高优先级。
+
+    ╔══════════ 🔑 与 FlashAttention 的关键区别 ═══════════════╗
+    ║                                                           ║
+    ║  ┌──────────────┬──────────────────┬──────────────────┐   ║
+    ║  │              │   FlashAttention  │   FlashInfer    │   ║
+    ║  ├──────────────┼──────────────────┼──────────────────┤   ║
+    ║  │ FP8 KV Cache │ ❌ 不支持         │ ✅ 原生支持      │   ║
+    ║  │ nvfp4        │ ❌               │ ✅               │   ║
+    ║  │ 大 page size │ 最大 64           │ Blackwell 最大 1024│  ║
+    ║  │ TRT-LLM 集成 │ 无               │ ✅ SM100 GQA/MQA  │   ║
+    ║  │ 旧卡默认排序 │ #1               │ #2               │   ║
+    ║  │ Blackwell排序│ #2               │ #1               │   ║
+    ║  └──────────────┴──────────────────┴──────────────────┘   ║
+    ║                                                           ║
+    ║  🎯 Blackwekk 上排第一的原因:                              ║
+    ║  - Blackwell 标配 FP8 KV cache → FlashInfer 唯一支持      ║
+    ║  - TRT-LLM 动态 kernel → GQA 场景大幅提升吞吐             ║
+    ║  - 大 page size(128-1024) → 减少 block table 开销         ║
+    ╚═══════════════════════════════════════════════════════════╝
+
+    🔗 框架调用链：
+    CudaPlatform.get_attn_backend_cls()
+      → get_valid_backends() 按优先级遍历
+        → FlashInferBackend.validate_configuration() 检查兼容性
+          → 通过 → 返回此类
+          → GPUModelRunner.initialize_attn_backend() 创建实例
+            → get_impl_cls() → FlashInferImpl
+            → get_builder_cls() → FlashInferMetadataBuilder
+            → Attention.forward() → FlashInferImpl.forward()
+    """
+
+    # 数据类型支持：FP16/BF16 为基线
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
+    # ★ 关键优势: 支持 FP8/nvfp4 KV cache（FlashAttention 不支持）
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
         "float16",
@@ -352,6 +386,9 @@ class FlashInferBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        # ★ Page size >= 128 由 TRT-LLM 动态 kernel 提供（仅 Blackwell GQA/MQA）
+        # 检测条件: GQA(kv_heads>0, qo/kv>1) + SM100 + TRT-LLM 可用
+        # 不满足则退回 [16,32,64]
         # Page sizes >= 128 only run on the trtllm-gen dynamic kernel (GQA/MQA
         # on Blackwell); advertise them only when usable so selection never
         # picks a large kernel block we cannot serve.
