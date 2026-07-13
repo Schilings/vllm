@@ -160,9 +160,15 @@ class KVCacheCoordinator(ABC):
         Returns:
             The number of blocks to allocate.
         """
+        # 各 group 的 block pool 是物理独立、不共享的，所以总需求就是
+        # 各组需求之和（不是取 max）。Full/SWA/CrossAttention 各占各的 pool。
+        # Each group has its own dedicated block pool, so the total demand
+        # is the sum (not max) of every group's per-manager requirement.
         num_blocks_to_allocate = 0
         for i, manager in enumerate(self.single_type_managers):
             if isinstance(manager, CrossAttentionManager):
+                # CrossAttention 是一次性静态分配：encoder token 数固定，
+                # 不参与前缀缓存，也不需要增量分配。
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
                 num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
