@@ -224,6 +224,7 @@ class SingleTypeKVCacheManager(ABC):
         # We need blocks for the non-skipped suffix. If there are still
         # local-computed blocks inside the window, they contribute to the
         # required capacity; otherwise, skipped blocks dominate.
+        # 除了new_local_computed_blocks,还需要多少新的blocks
         num_new_blocks = max(
             num_required_blocks - max(num_skipped_blocks, num_local_computed_blocks),
             0,
@@ -237,9 +238,11 @@ class SingleTypeKVCacheManager(ABC):
         # If a computed block is an eviction candidate (in the free queue and
         # ref_cnt == 0), it will be removed from the free queue when touched by
         # the allocated request, so we must count it in the free-capacity check.
+        # new_computed_blocks没被skip的后半部分
         num_evictable_blocks = self._get_num_evictable_blocks(
             new_computed_blocks[num_skipped_new_computed_blocks:]
         )
+        #
         return num_new_blocks + num_evictable_blocks
 
     def add_local_computed_blocks(
@@ -779,8 +782,16 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         block_size = kv_cache_spec.block_size
         num_contiguous_blocks = 0
         match_found = False
-        # ★ 从右到左扫描 ★: 从序列尾部向头部扫描，找最长连续命中段
+        # ★ 从右到左扫描 ★: 从序列尾部向头部扫描，找最长连续命中段。
+        # 有两条命中路径：
+        #   ① 长请求 + 尾部连续命中 ≥ sliding_window_contiguous_blocks → 满命中
+        #   ② 短请求 + 命中 < 门槛（如请求 < 窗口大小）       → 部分命中
+        #      短请求本身就不满窗口，命中的前缀 block 照省不误。
         # Search from right to left and early stop when a match is found.
+        # Two paths:
+        #   ① Full match: enough contiguous tail blocks for the full window.
+        #   ② Partial match: short request (< window size) where fewer contiguous
+        #      blocks are hit — still save the prefix blocks that DO hit.
         for i in range(max_num_blocks - 1, -1, -1):
             if cached_block := block_pool.get_cached_block(
                 block_hashes[i], kv_cache_group_ids
@@ -796,7 +807,8 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
                 for computed, cached in zip(computed_blocks, cached_block):
                     computed[i] = cached
                 num_contiguous_blocks += 1
-                # 连续命中达到窗口要求 → 找到！
+                # 路径① 满命中: 尾部连续块 ≥ 窗口所需数 → 窗口内 KV 全缓存。
+                # 例: sw=8, block_size=4, 需要 2 个连续块
                 if num_contiguous_blocks >= sliding_window_contiguous_blocks:
                     # 例: [NULL, NULL, 8, 3, NULL, 9] → [NULL, NULL, 8, 3]
                     # 裁剪尾部多余的非连续块
@@ -810,6 +822,9 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             else:
                 num_contiguous_blocks = 0
         if not match_found:
+            # 路径② 部分命中: 连续命中块少于窗口所需数。
+            # 典型场景: 短请求（请求 token 数 < sliding_window），
+            # 命中的前缀块照省不误，不会因为不满窗口就全丢。
             # The first `num_contiguous_blocks` is a cache hit even if
             # `num_contiguous_blocks < sliding_window_contiguous_blocks`.
             for computed in computed_blocks:
