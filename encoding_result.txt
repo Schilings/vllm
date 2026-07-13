@@ -1,0 +1,6 @@
+Fixed! First 100 chars:
+---
+name: source-analyzer
+description: 深度阅读源码，生成图文并茂的 Markdown 分析报告。结合代码探索、调用链追踪、Mermaid 架构图/时序图/流程图/对比表，按"全景架构→逐层解剖→关键数据结构→完整时序"结构输出。当用户要求"分析XX原理/源码"
+
+Encoding is now UTF-8: True

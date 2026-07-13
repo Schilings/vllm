@@ -1,0 +1,9 @@
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    with open(r'C:\Data\Code\nlp\vllm\.codebuddy\skills\source-analyzer\SKILL.md', 'rb') as f: b = f.read(); print('Total bytes:', len(b)); print('Has UTF-8 BOM:', b[:3] == b'\xef\xbb\xbf'); desc_start = b.find(b'description:'); desc_end = b.find(b'\n', desc_start); print('Description line raw:', b[desc_start:desc_end].hex()); print('Decoded:', b[desc_start:desc_end].decode('utf-8', errors='replace'))
+                                                                                                                                                                                                                                                                                                                                         ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'gbk' codec can't encode character '\ufffd' in position 13: illegal multibyte sequence
+Total bytes: 5085
+Has UTF-8 BOM: False
+Description line raw: 6465736372697074696f6e3a20c9eeb6c8d4c4b6c1d4b4c2eba3acc9fab3c9cdbccec4b2a2c3afb5c4204d61726b646f776e20b7d6cef6b1a8b8e6a1a3bde1bacfb4fac2ebccbdcbf7a1a2b5f7d3c3c1b4d7b7d7d9a1a24d65726d61696420bcdcb9b9cdbc2fcab1d0f2cdbc2fc1f7b3cccdbc2fb6d4b1c8b1eda3acb0b422c8abbeb0bcdcb9b9a1fad6f0b2e3bde2c6caa1fab9d8bcfccafdbeddbde1b9b9a1facdead5fbcab1d0f222bde1b9b9cae4b3f6a1a3b5b1d3c3bba7d2aac7f322b7d6cef65858d4adc0ed2fd4b4c2eb22a1a222bde2c6ca5858bbfad6c622a1a222d0b45858b7d6cef6b1a8b8e622a1a2225858cac7d4f5c3b4cab5cfd6b5c422cab1cab9d3c3a1a30d
+Decoded: 

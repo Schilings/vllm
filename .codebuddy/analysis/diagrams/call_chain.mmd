@@ -1,0 +1,35 @@
+sequenceDiagram
+    autonumber
+    participant API as API Server
+    participant EC as EngineCore
+    participant S as AsyncScheduler
+    participant KV as KVCacheManager
+    participant ME as ModelExecutor
+    participant GPU as GPU
+
+    API->>EC: add_request(req)
+    EC->>S: add_request(req)
+
+    loop EngineCore busy loop
+        Note over S: 1 schedule()
+        S->>S: 遍历 running 请求 计算 num_new_tokens
+        S->>KV: 2 allocate_slots()
+        KV->>KV: remove_skipped_blocks() 淘汰
+        KV->>KV: allocate_new_blocks() 分配
+        KV-->>S: new_blocks / None(抢占)
+        S->>S: 遍历 waiting 请求 满足条件移入 running
+        Note over S: 3 _update_after_schedule() num_output_placeholders += N (假设!)
+
+        S-->>EC: SchedulerOutput
+        EC->>ME: execute_model()
+        ME->>GPU: 4 Forward Pass
+        GPU-->>ME: logits, sampled_tokens
+        ME-->>EC: ModelRunnerOutput
+
+        EC->>S: 5 update_from_output()
+        Note over S: 6 _update_request_with_output() num_output_placeholders -= len(tokens) (修正!)
+        S->>KV: 7 cache_blocks()
+        S->>S: 8 check_stop()
+        S-->>EC: EngineCoreOutputs
+        EC-->>API: 返回生成结果
+    end

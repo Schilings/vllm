@@ -1,0 +1,38 @@
+graph TB
+    subgraph API["API Server 进程"]
+        AL[AsyncLLM / LLMEngine]
+        ZC[ZMQ Client]
+    end
+
+    subgraph EC["EngineCore 进程"]
+        EN["⚙ EngineCore"]
+        subgraph AS["AsyncScheduler"]
+            AS_Core[AsyncScheduler]
+            RQ[RequestQueue]
+            KVM[KVCacheManager]
+            SOUT[SchedulerOutput]
+        end
+    end
+
+    subgraph WK["Worker 进程(es)"]
+        ME[ModelExecutor]
+        GMR[GPUModelRunner]
+        GPU["🖥 GPU"]
+    end
+
+    AL --> ZC
+    ZC == "ZMQ Request" ==> EN
+    EN -->|"schedule()"| AS_Core
+    AS_Core --> SOUT
+    SOUT -.->|"SchedulerOutput"| ME
+    ME --> GMR
+    GMR --> GPU
+    ME -.->|"ModelRunnerOutput"| EN
+    EN -.->|"EngineCoreOutputs"| AL
+
+    style API fill:#dae8fc,stroke:#6c8ebf
+    style EC fill:#d5e8d4,stroke:#82b366
+    style AS fill:#fff2cc,stroke:#d6b656
+    style WK fill:#e1d5e7,stroke:#9673a6
+    style AS_Core fill:#ffe6cc,stroke:#d79b00
+    style GPU fill:#dae8fc,stroke:#6c8ebf

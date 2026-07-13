@@ -1,0 +1,30 @@
+sequenceDiagram
+    autonumber
+    box 同步调度
+        participant SS as SyncScheduler
+        participant GW as Worker GPU
+    end
+    box 异步调度
+        participant AS as AsyncScheduler
+        participant AW as Worker GPU
+    end
+
+    Note over SS,GW: === 同步: step间有隐式同步 ===
+    SS->>GW: S0.schedule() 下发执行
+    GW-->>SS: S0 执行完成
+    SS->>SS: update状态
+    SS->>GW: S1.schedule() 基于准确状态
+    GW-->>SS: S1 返回
+    SS->>SS: update状态
+
+    Note over AS,AW: === 异步: step间无同步,流水化 ===
+    AS->>AW: S0.schedule() 下发执行
+    AS->>AS: output_placeholders += N (假设!)
+    AS->>AW: S1.schedule() 不等S0,基于假设!
+    AS->>AS: 继续累加 placeholder
+    AW-->>AS: S0 结果返回
+    AS->>AS: output_placeholders -= len(tokens) (修正!)
+    AS->>AW: S2.schedule()
+    AW-->>AS: S1 结果返回
+    AS->>AS: 修正 S1 placeholder
+    Note over AS,AW: Scheduler 始终领先 Worker 1~2步
