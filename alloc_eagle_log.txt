@@ -1,0 +1,16 @@
+C:\Data\Code\nlp\vllm\.codebuddy\analysis\diagrams\generate_alloc_eagle.py:73: UserWarning: Glyph 9888 (\N{WARNING SIGN}) missing from font(s) Microsoft YaHei.
+  plt.tight_layout()
+C:\Data\Code\nlp\vllm\.codebuddy\analysis\diagrams\generate_alloc_eagle.py:73: UserWarning: Glyph 65039 (\N{VARIATION SELECTOR-16}) missing from font(s) Microsoft YaHei.
+  plt.tight_layout()
+C:\Data\Code\nlp\vllm\.codebuddy\analysis\diagrams\generate_alloc_eagle.py:74: UserWarning: Glyph 9888 (\N{WARNING SIGN}) missing from font(s) Microsoft YaHei.
+  fig.savefig(os.path.join(OUT, 'alloc_flow.png'), dpi=150, bbox_inches='tight', facecolor='white'); plt.close()
+C:\Data\Code\nlp\vllm\.codebuddy\analysis\diagrams\generate_alloc_eagle.py:74: UserWarning: Glyph 65039 (\N{VARIATION SELECTOR-16}) missing from font(s) Microsoft YaHei.
+  fig.savefig(os.path.join(OUT, 'alloc_flow.png'), dpi=150, bbox_inches='tight', facecolor='white'); plt.close()
+Saved alloc_flow.png
+Saved block_stages.png
+Saved watermark_model.png
+Saved eagle3_arch.png
+Saved eagle3_flow.png
+Saved eagle_vs_others.png
+
+All 6 diagrams generated!
