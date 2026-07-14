@@ -47,7 +47,6 @@ class SingleTypeKVCacheManager(ABC):
     ║  add_local_computed_blocks()    追加前缀缓存命中 block    ║
     ║  allocate_external_computed_blocks() 外部缓存 block      ║
     ║  allocate_new_blocks()          从 BlockPool 分配新 block ║
-    ║  allocate_new_computed_blocks() 前缀 + 外部 统一追加     ║
     ║                                                          ║
     ║  💾 前缀缓存写入:                                        ║
     ║  cache_blocks()                  写入前缀哈希表          ║
@@ -63,8 +62,7 @@ class SingleTypeKVCacheManager(ABC):
     ║  find_longest_cache_hit()       ★抽象★ 各子类实现        ║
     ║                                                          ║
     ║  🔧 清量接口:                                            ║
-    ║  take_new_block_ids()           拉取新 block ID 供清零   ║
-    ║  take_pending_cow_copies()      拉取 CoW 复制对          ║
+    ║  take_new_block_ids()           拉取本次新分配的 block ID║
     ║  new_step_starts()              新调度步通知              ║
     ╚══════════════════════════════════════════════════════════╝
 
@@ -73,7 +71,7 @@ class SingleTypeKVCacheManager(ABC):
     ║  Scheduler._schedule_request()                          ║
     ║  │                                                       ║
     ║  ├─① get_num_blocks_to_allocate()  ← 容量检查            ║
-    ║  │   → 返回所需 block 数（含 CoW 额外块）                ║
+    ║  │   → 返回所需 block 数                                ║
     ║  │                                                       ║
     ║  ├─② remove_skipped_blocks()       ← 窗口外淘汰          ║
     ║  │   ├─ get_num_skipped_tokens()    子类实现              ║
@@ -82,13 +80,11 @@ class SingleTypeKVCacheManager(ABC):
     ║  ├─③ add_local_computed_blocks()   ← 前缀命中追加       ║
     ║  │   ├─ touch() 防止被 evict                            ║
     ║  │   ├─ 跳过窗口外 block → 填充 null_block               ║
-    ║  │   └─ CoW partial hit 记录                            ║
     ║  │                                                       ║
     ║  ├─④ allocate_external_computed_blocks() ← 外部缓存     ║
     ║  │   └─ block_pool.get_new_blocks()                      ║
     ║  │                                                       ║
     ║  ├─⑤ allocate_new_blocks()          ← 新 block 分配      ║
-    ║  │   ├─ CoW partial hit → _apply_cow()                   ║
     ║  │   └─ block_pool.get_new_blocks()                      ║
     ║  │                                                       ║
     ║  └─⑥ cache_blocks()                 ← 写入前缀哈希       ║
@@ -103,8 +99,6 @@ class SingleTypeKVCacheManager(ABC):
     🧬 核心数据结构:
     - req_to_blocks: {req_id → [KVCacheBlock, ...]} track 每个请求的 block
     - num_cached_block: {req_id → int} 已缓存的 block 数（避免重复缓存）
-    - _partial_hit_reqs: {req_id → (block_idx, source_block)} CoW 记录
-    - _pending_cow_copies: [(source, dest), ...] 待执行的 CoW 复制
 
     🔑 关键差别：子类差异主要体现在两个抽象/可覆盖方法:
     ┌──────────────────────┬───────────────┬───────────────┬──────────────┐
@@ -128,14 +122,39 @@ class SingleTypeKVCacheManager(ABC):
         pcp_world_size: int = 1,
         max_admission_blocks_per_request: int | None = None,
     ) -> None:
-        """🔧 Copy-on-Write: 将共享的 prefix 尾巴 block 重定向到私有 block。
+        """Initializes the SingleTypeKVCacheManager.
 
-        ⚙️ 触发条件: 前缀缓存命中在 block 内部（非 block 对齐）
-
-        ⚠️ 两者都保留 ref 直到 worker 完成复制:
-           source_block 保留 hit-ref（不提前释放），
-           cow_block 额外 +1 ref
+        Args:
+            kv_cache_spec: The kv_cache_spec for this manager.
+            block_pool: The block pool.
+            kv_cache_group_id: The id of the kv cache group of this manager.
+            scheduler_block_size: The scheduling granularity (LCM of all group
+                block sizes); a multiple of this manager's ``block_size``.
+            max_admission_blocks_per_request: Recycling-aware per-request
+                block cap used by `get_num_blocks_to_allocate`. Only set for
+                spec types that recycle blocks across chunks (SWA,
+                chunked-local); `None` (the default) means no cap, which is
+                correct for full-attention-style specs that hold every
+                block until the request finishes.
         """
+        self.scheduler_block_size = scheduler_block_size
+        # The block size for this manager; used for actual block allocation.
+        self.block_size = kv_cache_spec.block_size
+        self.dcp_world_size = dcp_world_size
+        self.pcp_world_size = pcp_world_size
+        if dcp_world_size * pcp_world_size > 1:
+            self.block_size *= dcp_world_size * pcp_world_size
+        self.kv_cache_spec = kv_cache_spec
+        self.block_pool = block_pool
+        self.enable_caching = enable_caching
+        self._max_admission_blocks_per_request = max_admission_blocks_per_request
+        self.new_block_ids: list[int] = []
+
+        # Mapping from request ID to blocks to track the blocks allocated
+        # for each request, so that we can free the blocks when the request
+        # is finished.
+        self.req_to_blocks: defaultdict[str, list[KVCacheBlock]] = defaultdict(list)
+
         # {req_id: The number of cached blocks for this given request}
         # This is used to track the number of cached blocks for each request.
         # This is only used to track the RUNNING requests, we do not track the
@@ -165,24 +184,19 @@ class SingleTypeKVCacheManager(ABC):
         apply_admission_cap: bool = False,
     ) -> int:
         """📖 容量预估 — 返回该请求在本 group 还需要分配多少 block。
-
         🔗 Scheduler → KVCacheManager → coordinator → get_num_blocks_to_allocate
           → 遍历 single_type_managers → 汇总各 group 的 block 需求
-
         ⚙️ 三种路径:
         ┌─────────────────────────────────────────────────────────────┐
         │ ① 运行中请求 (已 track): 只需 num_required - num_req       │
         │    (fast-path: 无新前缀命中)                                │
-        │                                                             │
         │ ② 新请求 + 无窗口淘汰:                                      │
         │    num_new = max(required - skipped, 0)                    │
-        │                                                             │
         │ ③ 新请求 + SWA窗口淘汰:                                     │
         │    窗口外的 block 可回收 → 减少需求                         │
         │    num_skipped_tokens = get_num_skipped_tokens()           │
         │    Full: 0           SWA: max(0, n - sw + 1)              │
         │                                                             │
-        │ ⚠️ CoW partial hit → +1 (为 copy-on-write 预留额外 block)  │
         └─────────────────────────────────────────────────────────────┘
 
         📥 apply_admission_cap: True → 启用回收感知上限（SWA/ChunkedLocal,
@@ -215,7 +229,7 @@ class SingleTypeKVCacheManager(ABC):
             # for draft tokens which are later rejected. In this case,
             # num_required_blocks may be smaller than num_req_blocks.
             return max(num_required_blocks - num_req_blocks, 0)
-
+        # 参数total_computed_tokens用于计算需要跳过多少token
         num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)
         num_local_computed_blocks = len(new_computed_blocks) + num_req_blocks
         # Number of whole blocks that are skipped by the attention window.
@@ -349,13 +363,11 @@ class SingleTypeKVCacheManager(ABC):
         """✍️ 分配全新 block — 调用链第⑤步。
 
         ⚙️ 行为:
-        1. CoW partial hit → 用新 block 替换共享 tail（_apply_cow）
-           额外 block 已在 get_num_blocks_to_allocate 中预留
-        2. ceil(num_tokens / block_size) - len(req_blocks) = 还需几个
-        3. block_pool.get_new_blocks() → 新增物理 block
-        4. _record_new_block_ids → 记录到 new_block_ids（供 worker 清零）
+        1. ceil(num_tokens / block_size) - len(req_blocks) = 还需几个
+        2. block_pool.get_new_blocks() → 新增物理 block
+        3. 追加到 new_block_ids（供 take_new_block_ids 拉取）
 
-        📤 list[KVCacheBlock]: 本次新增的 block 列表（含 CoW block）
+        📤 list[KVCacheBlock]: 本次新增的 block 列表
         """
         req_blocks = self.req_to_blocks[request_id]
         num_required_blocks = cdiv(num_tokens, self.block_size)
@@ -939,6 +951,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         Returns:
             The number of tokens that will be skipped for attention computation.
         """
+        # 只要 last token的前 window - 1 个
         return max(0, num_computed_tokens - self.sliding_window + 1)
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:

@@ -160,8 +160,7 @@ class KVCacheCoordinator(ABC):
         Returns:
             The number of blocks to allocate.
         """
-        # 各 group 的 block pool 是物理独立、不共享的，所以总需求就是
-        # 各组需求之和（不是取 max）。Full/SWA/CrossAttention 各占各的 pool。
+
         # Each group has its own dedicated block pool, so the total demand
         # is the sum (not max) of every group's per-manager requirement.
         num_blocks_to_allocate = 0
@@ -180,6 +179,8 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                 )
             else:
+                # 各 group 的 block pool 是物理独立、不共享的，所以总需求就是
+                # 各组需求之和（不是取 max）。Full/SWA/CrossAttention 各占各的 pool。
                 num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
                     request_id,
                     num_tokens,

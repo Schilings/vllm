@@ -356,6 +356,7 @@ class KVCacheManager:
 
         # The number of computed tokens is the number of computed tokens plus
         # the new prefix caching hits
+        # computed总数
         num_local_computed_tokens = (
             request.num_computed_tokens + num_new_computed_tokens
         )
@@ -367,12 +368,18 @@ class KVCacheManager:
         watermark_blocks = 0
         # The watermark is applied to waiting/preempted requests only, and only
         # when there's at least one request already scheduled.
+        # 相当于running队列有请求在decode？
+        # 每次多分配几个watermark_blocks，防止running队列太长，导致running队列中的请求被preempted
         if has_scheduled_reqs and request.status in (
             RequestStatus.WAITING,
             RequestStatus.PREEMPTED,
         ):
             watermark_blocks = self.watermark_blocks
 
+        # full_sequence_must_fit=True 时强制检查剩余显存是否可以容纳整个请求
+        # 在remove_skipped_blocks前，一次性检查整个请求序所需的 block 数够不够分配
+        #   → 计算整个请求序所需的 block 数
+        #   → 不够 → return None（防止分块预填充过度接纳请求）
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
@@ -382,15 +389,21 @@ class KVCacheManager:
                 num_tokens=full_num_tokens,
                 new_computed_blocks=new_computed_block_list,
                 num_encoder_tokens=num_encoder_tokens,
+                # min(local+external,max_model_len)
+                # 用于计算需要跳过多少token
                 total_computed_tokens=total_computed_tokens,
+                # 没用到
                 num_tokens_main_model=full_num_tokens,
+                # 限制每个request最大block数
                 apply_admission_cap=True,
             )
             required_blocks = num_blocks_to_allocate + watermark_blocks
             if required_blocks > self.block_pool.get_num_free_blocks():
                 return None
 
+        # 计算后的总长度，基本要slot
         num_tokens_main_model = total_computed_tokens + num_new_tokens
+        # 多一部分lookahead需要slot
         num_tokens_need_slot = min(
             num_tokens_main_model + num_lookahead_tokens, self.max_model_len
         )
@@ -401,25 +414,35 @@ class KVCacheManager:
         # insufficient free blocks.
         # Should call this function before allocating new blocks to reduce
         # the number of evicted blocks.
+        # 先释放窗口外 block，后面再检查够不够——这个顺序是关键
+        # SWA 层的旧 token 已经滑出窗口了，对应的 block K/V 永远不会再被这个请求访问。这些 block 现在就可以回收，不需要等到请求结束。
+        # 即使最终 block 不够、返回 None 触发 preempt，这步释放也是安全无害的——反正那些窗口外 block 永远用不到了，早点还回去就能早点给别的请求用。
         self.coordinator.remove_skipped_blocks(
             request.request_id,
             total_computed_tokens,
             num_prompt_tokens=request.num_prompt_tokens,
         )
-
+        # 需要新分配的block数，如果new_computed_blocks中有在free queue，也加上，需要touch加个引用
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
             num_tokens=num_tokens_need_slot,
             new_computed_blocks=new_computed_block_list,
             num_encoder_tokens=num_encoder_tokens,
+            # local + external
+            # 参数total_computed_tokens用于计算需要跳过多少token
             total_computed_tokens=num_local_computed_tokens
             + num_external_computed_tokens,
+            # 没用到
             num_tokens_main_model=num_tokens_main_model,
         )
 
         # Keep `reserved_blocks` free for other in-flight sequences, and an
         # additional watermark of headroom for waiting/preempted admissions.
+        # reserved_blocks 来自 P/D 异步 KV 传输场景。
+        # 已经在执行中的 prefill 请求已经"口头预约"了这么多 block，虽然还没真正分配，但随时会来拿。
+        # 如果不把这部分从 free 里扣掉，异步 KV load 的新请求可能会抢走 in-flight prefill 马上要用的 block → 死锁。
         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
+        # 每次分配，多几个watermark_blocks，确保request流畅，而不是频繁被抢占
         required_blocks = num_blocks_to_allocate + watermark_blocks
         if required_blocks > available_blocks:
             # Cannot allocate new blocks

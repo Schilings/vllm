@@ -18,11 +18,11 @@
 ```mermaid
 graph TD
     subgraph "调度层"
-        S[Scheduler<br/>schedule()]
+        S["Scheduler<br/>schedule()"]
     end
     subgraph "KV Cache 管理层"
-        KM[KVCacheManager<br/>allocate_slots()]
-        KC[KVCacheCoordinator<br/>协调多 group]
+        KM["KVCacheManager<br/>allocate_slots()"]
+        KC["KVCacheCoordinator<br/>协调多 group"]
         F[FullAttentionManager]
         SW[SlidingWindowManager]
         M[MambaManager]
