@@ -88,6 +88,7 @@ class KVCacheCoordinator(ABC):
         )
         self.scheduler_block_size = scheduler_block_size
 
+        # 📌
         self.block_pool = BlockPool(
             num_gpu_blocks=kv_cache_config.num_blocks,
             enable_caching=enable_caching,
@@ -104,6 +105,7 @@ class KVCacheCoordinator(ABC):
         if use_eagle and not self.eagle_group_ids:
             self.eagle_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
 
+        # 📌
         self.single_type_managers = tuple(
             get_manager_for_kv_cache_spec(
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
@@ -715,18 +717,18 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 # 这KVCacheSpec组是否要drop最后一个block
                 drop_eagle_block = use_eagle and idx not in eagle_verified
 
-                # 每次都会限制_max_length为上一次hit length
+                # 1️⃣ 每次都会限制_max_length为上一次hit length
                 # 就是只允许hit length缩小，不允许hit length增大
                 _max_length = curr_hit_length
                 if drop_eagle_block:
-                    # EAGLE: 多查一个 block（+block_size），查到后再 pop 掉最后一个。
+                    # ⚠️ EAGLE: 放宽限制，多查一个 block（+block_size），查到后再 pop 掉最后一个。
                     # 因为最后一个 block 需要重算来产生 hidden states 给 draft head。
                     # Eagle needs to match one more block and then pop the last.
                     _max_length = min(
                         curr_hit_length + spec.block_size, max_cache_hit_length
                     )
 
-                # 一种KVCacheSpec对应一种SingleTypeKVCacheManager，
+                # 2️⃣ 一种KVCacheSpec对应一种SingleTypeKVCacheManager，
                 # 对应一种hit_blocks
                 hit_blocks = manager_cls.find_longest_cache_hit(
                     block_hashes=_get_block_hashes(spec),
@@ -748,10 +750,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     # length shrunk; invalidate previous eagle verifications
                     eagle_verified.clear()
 
-                # 每个内循环，curr_hit_length都会改变
+                # 3️⃣ 每个内循环，curr_hit_length都会改变
                 curr_hit_length = _new_hit_length
 
-                # 把hit_blocks按group_id重复引用
+                # 4️⃣ 把hit_blocks按group_id重复引用
                 for group_id, blocks in zip(group_ids, hit_blocks):
                     hit_blocks_by_group[group_id] = blocks
 
@@ -766,9 +768,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             # 记录上一轮的最后一个hit_length
             hit_length = curr_hit_length
 
-            # 简单混合模型（1 Full + 1 其他）：一轮迭代即可收敛，不需要 while 循环。
-            # Full 总是排在 attention_groups 最前面。
-            # 3种的话就不break
+            # 📌 简单混合模型（1 Full + 1 其他）：一轮迭代即可收敛，不需要 while 循环。
+            # 例如Full+SWA，就不用继续迭代出同样的hit_length，真迭代出反而限制了
             if is_simple_hybrid:
                 break
 

@@ -268,6 +268,7 @@ class BlockPool:
             # block_size is a multiple of hash_block_size. This happens when
             # different KV cache groups have different block sizes.
             assert block_size % self.hash_block_size == 0
+            # ⚠️ hash_block_size不一致，取最后一个hash值作为block的hash
             block_hashes = BlockHashListWithBlockSize(
                 request.block_hashes, self.hash_block_size, block_size
             )
@@ -284,6 +285,7 @@ class BlockPool:
             if blk.is_null or (block_mask is not None and not block_mask[i]):
                 continue
             block_hash = new_block_hashes[i]
+            # 每个hash block代表的前缀总长度
             num_hash_tokens = (num_cached_blocks + i + 1) * block_size
 
             # Update and added the full block to the cache.
@@ -293,15 +295,23 @@ class BlockPool:
             if blk.block_hash is not None:
                 # The only valid case where a "new full block" already has a
                 # hash is partial->full promotion of the same cache block.
+                # ⚠️ full block：block 存满了 block_size 个 token，hash 覆盖完整的 block_size 个 token
+                # ⚠️ partial block：prefix 边界落在 block 中间，用一个"部分 hash"也能定位到这个 block（比如 block 存了 token 0-15，但 hash 只覆盖前 8 个 token 也能命中）
                 assert (
                     blk.block_hash_num_tokens is not None
                     and blk.block_hash_num_tokens < num_hash_tokens
                 )
+                # 清理映射【KVCacheBlock -> 多个KVCacheBlock】 【多个KVCacheBlock -> 同个KVCacheBlock】
                 removed_hashes = self._remove_cached_block_hashes(blk)
                 self._emit_block_removed_events(removed_hashes)
+
+            # ⚠️一个 KVCacheBlock 只有一个 BlockHashWithGroupId 属性
+            # ⚠️ 但是一个 KVCacheBlock 却绑定多个 BlockHashWithGroupId
+            # 【KVCacheBlock -> 多个KVCacheBlock】 【多个KVCacheBlock -> 同个KVCacheBlock】
             self._insert_block_hash(
                 block_hash_with_group_id,
                 blk,
+                # 每个hash block代表的前缀总长度
                 num_tokens=num_hash_tokens,
             )
             if new_hashes is not None:
@@ -394,12 +404,25 @@ class BlockPool:
             The hash key with group ID if a partial entry can be registered;
             otherwise ``None`` for null blocks.
         """
+        """
+        1. Prefill 阶段，请求的 prompt 长度不是 block_size 的整数倍
+        最后一个 block 没填满，但它的 KV cache 对后续请求仍然有价值
+        2. Decode 阶段，正在逐步生成 token
+        当前最后一个 block 只写了部分 token，但已经被其他请求的 prefix 匹配上了，需要先注册 partial entry
+        3. Cross-attention / encoder-decoder 场景
+        encoder 输出长度不一定是 block_size 的整数倍
+        
+        没有 partial block 机制的话，最后一个不满的 block 就不能被 prefix cache 命中。
+        有了 partial block，即使前缀边界落在 block 中间，其他请求也能精确命中，不需要重新计算这部分 KV cache。
+        这就是为什么代码里会有 partial→full promotion 的逻辑 —— 当同一个 block 后续被填满时，它的 partial hash 需要升级为 full hash。
+        """
         if block.is_null:
             return None
 
         assert block_size > self.hash_block_size
         assert block_size % self.hash_block_size == 0
         assert num_tokens % block_size != 0
+        # ⚠️ 取出num_tokens对应的最后一个hash block的hash
         block_hash = self._get_partial_block_hash(request, num_tokens)
         num_hash_blocks = num_tokens // self.hash_block_size
         block_hash_with_group_id = make_block_hash_with_group_id(
@@ -416,13 +439,20 @@ class BlockPool:
             and block.block_hash_num_tokens is not None
             and block.block_hash_num_tokens < num_hash_blocks * self.hash_block_size
         ):
+            # 清理映射【KVCacheBlock -> 多个KVCacheBlock】 【多个KVCacheBlock -> 同个KVCacheBlock】
             removed_hashes = self._remove_cached_block_hashes(block)
             self._emit_block_removed_events(removed_hashes)
+
+        # ⚠️一个 KVCacheBlock 只有一个 BlockHashWithGroupId 属性
+        # ⚠️ 但是一个 KVCacheBlock 却绑定多个 BlockHashWithGroupId
+        # 【KVCacheBlock -> 多个KVCacheBlock】 【多个KVCacheBlock -> 同个KVCacheBlock】
         self._insert_block_hash(
             block_hash_with_group_id,
             block,
+            # 每个hash block代表的前缀总长度
             num_tokens=num_hash_blocks * self.hash_block_size,
         )
+
         if self.enable_kv_cache_events and not already_cached:
             parent_hash, block_start = self._get_partial_block_parent_hash_and_start(
                 request, num_tokens
@@ -485,6 +515,7 @@ class BlockPool:
         self,
         block: KVCacheBlock,
     ) -> list[BlockHashWithGroupId]:
+        # 清理映射【KVCacheBlock -> 多个KVCacheBlock】 【多个KVCacheBlock -> 同个KVCacheBlock】
         block_hashes: list[BlockHashWithGroupId] = []
         if block.block_hash is not None:
             block_hashes.append(block.block_hash)
@@ -531,6 +562,10 @@ class BlockPool:
         ):
             return
 
+        # ⚠️一个 KVCacheBlock 只有一个 BlockHashWithGroupId 属性
+        # ⚠️ 但是一个 KVCacheBlock 却绑定多个 BlockHashWithGroupId
+        # KVCacheBlock -> 多个KVCacheBlock
+        # 多个KVCacheBlock -> 同个KVCacheBlock
         if block.block_hash is None:
             block.set_block_hash(block_hash_with_group_id, num_tokens=num_tokens)
         else:
@@ -558,6 +593,7 @@ class BlockPool:
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
             for block in ret:
+                # 清理映射【KVCacheBlock -> 多个KVCacheBlock】 【多个KVCacheBlock -> 同个KVCacheBlock】
                 self._maybe_evict_cached_block(block)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
@@ -585,7 +621,7 @@ class BlockPool:
         # Clean up metrics tracking first to prevent leaks
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
-
+        # 清理映射【KVCacheBlock -> 多个KVCacheBlock】 【多个KVCacheBlock -> 同个KVCacheBlock】
         evicted_hashes = self._remove_cached_block_hashes(block)
         if not evicted_hashes:
             # The block doesn't have hash, eviction is not needed
@@ -631,6 +667,8 @@ class BlockPool:
                     blocks_with_hash.append(block)
 
         # Blocks without hash always get evicted first - prepend them last to the tail
+        # ⚠️ 没有hash缓存的可以早点被取出使用
+        # ⚠️ 有hash缓存的可以晚点被使用，说不定被救活
         self.free_block_queue.prepend_n(blocks_without_hash)
         self.free_block_queue.append_n(blocks_with_hash)
 
@@ -651,6 +689,7 @@ class BlockPool:
                 f"only report block IDs that were allocated by the scheduler."
             )
             block = self.blocks[block_id]
+            # 清理映射【KVCacheBlock -> 多个KVCacheBlock】 【多个KVCacheBlock -> 同个KVCacheBlock】
             self._maybe_evict_cached_block(block)
 
     def reset_prefix_cache(self) -> bool:

@@ -2223,6 +2223,7 @@ class BlockHashListWithBlockSize:
     def _get_value_at(self, idx: int) -> BlockHash:
         # The last hash_block_size hash within the target block already chains
         # over the whole prefix, so it is the target block's hash.
+        # ⚠️ 返回target_block内的最后一个hash block的hash值
         return self.block_hashes[(idx + 1) * self.scale_factor - 1]
 
 

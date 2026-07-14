@@ -180,49 +180,40 @@ sequenceDiagram
 
 ## 画图规范
 
-**生成 PNG 图片，用 `![]()` 嵌入 markdown**（兼容 GitHub、VS Code、PyCharm 等所有渲染器）。
+### 首选：Mermaid 代码块（直接嵌入 markdown）
 
-### 画图流程
+**所有架构图/时序图/流程图/状态图优先使用 Mermaid**，直接写在 ` ```mermaid ` 代码块中。
 
-1. 用 `matplotlib` 编写 Python 脚本绘制架构图/时序图/流程图
-2. 运行脚本生成 `.png` 文件到 `diagrams/` 子目录
-3. 在报告中使用 `![图名](diagrams/xxx.png)` 引用
-
-> 配置中文字体：`plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']`
-
-### Mermaid 参考（轻量速写）
-
-先用 Mermaid 语法构思图的结构，再转换为 matplotlib 绘制：
+渲染支持：
+- **GitHub / GitLab**：原生支持，无需插件
+- **VS Code**：安装 "Markdown Preview Mermaid Support" 插件
+- **PyCharm / IntelliJ**：安装 "Mermaid" 插件（Settings → Plugins → 搜索 Mermaid）
+- **Typora / Obsidian**：原生支持
 
 | 图类型 | 语法 | 用途 |
 |-------|------|------|
 | `graph TD` / `flowchart TB` | `A-->B`, `subgraph` | 模块架构、分层关系 |
-| `sequenceDiagram` | `participant`, `->>`, `-->>`, `Note` | 调用链时序 |
+| `sequenceDiagram` | `participant`, `->>`, `-->>`, `Note over` | 调用链时序 |
 | `stateDiagram-v2` | `[*]`, `-->` | 状态流转 |
 | `classDiagram` | `class`, `<|--` | 类关系 |
 
-要求:
-- 每个图有标题和编号
+Mermaid 画图规范：
+- 每个图有标题和编号（如 `**图1: 全景架构**`）
 - 节点用中文标注
 - 关键数据流标注方向（`→` `↓` `↑`）
-- 不要过度复杂，一个图说清一件事
+- 不要过度复杂，一个图说清一件事；复杂流程拆成多个子图
 
-### 补充：draw.io MCP（按需）
+### 回退方案（仅 Mermaid 无法表达时）
 
-如需生成可编辑的 .drawio 文件，使用 `open_drawio_xml`（架构图）或 `open_drawio_mermaid`（时序图），工具已在环境配置。
+以下场景 Mermaid 力不从心时，使用 `diagrams-generator` skill 或 `mydrawio` skill：
 
-| 图类型 | 用途 | 关键语法 |
-|-------|------|---------|
-| `graph TD` / `flowchart` | 模块架构、分层关系 | `subgraph`, `-->` |
-| `sequenceDiagram` | 调用链时序 | `participant`, `->>`, `-->>` |
-| `stateDiagram-v2` | 状态流转 | `[*]`, `-->` |
-| `classDiagram` | 类关系 | `class`, `<|--` |
+| 场景 | 工具 | 用法 |
+|------|------|------|
+| 精确位置布局的复杂架构图 | `diagrams-generator` skill | `use_skill("diagrams-generator")` |
+| 论文级插画 / 数据图表 | `diagrams-generator` skill | 同上 |
+| 需要 .drawio 可编辑文件 | `mydrawio` skill | `use_skill("mydrawio")` |
 
-要求:
-- 每个图有标题和编号
-- 节点用中文标注
-- 关键数据流标注方向（`→` `↓` `↑`）
-- 不要过度复杂，一个图说清一件事
+回退方案生成的文件放到 `diagrams/` 子目录，报告中使用 `![图名](diagrams/xxx.png)` 或相对路径引用。
 
 ---
 
@@ -230,7 +221,7 @@ sequenceDiagram
 
 1. **先调研再读码**：Phase 0（web_search + web_fetch）必须执行，先理解思想再看实现
 2. **调用链必须基于真实代码探索**，调用 `code-explorer` subagent 查清对端文件 + 函数 + 行号
-3. **图直接嵌入 markdown**：架构图/时序图用 Mermaid 代码块，GitHub/VS Code 原生渲染零依赖
+3. **图优先用 Mermaid 嵌入 markdown**：架构图/时序图/流程图直接写在 ` ```mermaid ` 代码块中。GitHub/VS Code/安装 Mermaid 插件的 PyCharm 原生渲染，零外部依赖。只有 Mermaid 无法表达时（精确位置布局、论文级插画等）才回退到 `diagrams-generator` 或 `mydrawio` skill 生成图片
 4. **图不要过度复杂**——一个图说清一件事，复杂流程拆成多个子图
 5. **语言用简体中文**
 6. **必须产出报告文件**：最终产物输出到 `.codebuddy/analysis/<topic>.md`

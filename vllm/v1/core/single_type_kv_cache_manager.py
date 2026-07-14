@@ -787,6 +787,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         # O(max_num_blocks / sliding_window_contiguous_blocks +
         # sliding_window_contiguous_blocks),
         # which is good for low cache hit rate scenarios.
+        # ⚠️ 主要看传入的max_length
         max_num_blocks = max_length // kv_cache_spec.block_size
         computed_blocks = tuple(
             [block_pool.null_block] * max_num_blocks

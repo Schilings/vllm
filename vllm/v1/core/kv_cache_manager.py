@@ -414,7 +414,7 @@ class KVCacheManager:
         # insufficient free blocks.
         # Should call this function before allocating new blocks to reduce
         # the number of evicted blocks.
-        # 先释放窗口外 block，后面再检查够不够——这个顺序是关键
+        # 1️⃣ 先释放窗口外 block，后面再检查够不够——这个顺序是关键
         # SWA 层的旧 token 已经滑出窗口了，对应的 block K/V 永远不会再被这个请求访问。这些 block 现在就可以回收，不需要等到请求结束。
         # 即使最终 block 不够、返回 None 触发 preempt，这步释放也是安全无害的——反正那些窗口外 block 永远用不到了，早点还回去就能早点给别的请求用。
         self.coordinator.remove_skipped_blocks(
@@ -422,7 +422,7 @@ class KVCacheManager:
             total_computed_tokens,
             num_prompt_tokens=request.num_prompt_tokens,
         )
-        # 需要新分配的block数，如果new_computed_blocks中有在free queue，也加上，需要touch加个引用
+        # 2️⃣ 需要新分配的block数，如果new_computed_blocks中有在free queue，也加上，需要touch加个引用
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
             num_tokens=num_tokens_need_slot,
@@ -448,6 +448,7 @@ class KVCacheManager:
             # Cannot allocate new blocks
             return None
 
+        # 3️⃣
         if (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks
             or num_external_computed_tokens > 0
@@ -461,6 +462,7 @@ class KVCacheManager:
                 num_external_computed_tokens=num_external_computed_tokens,
             )
 
+        # 4️⃣
         new_blocks = self.coordinator.allocate_new_blocks(
             request.request_id,
             num_tokens_need_slot,
@@ -478,6 +480,7 @@ class KVCacheManager:
         # "non-committable" tokens (e.g., draft tokens that could be rejected).
         # Therefore, we cap the number at `request.num_tokens`, ensuring only
         # "finalized" tokens are cached.
+        # 5️⃣
         num_tokens_to_cache = min(
             total_computed_tokens + num_new_tokens,
             request.num_tokens,
