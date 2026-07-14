@@ -673,6 +673,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         longest_hit_length = 0                  # 所有 attention type 中的最长命中
         hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups
 
+        # attention_groups是经过合并的，同样类型的attention group合并成一个
         # 简单混合模型（1 Full + 1 其他）：一轮迭代即可收敛，不需要 while 循环。
         # Full 总是排在 attention_groups 最前面。
         # Simple hybrid (1 full attn + 1 other): one iteration suffices.
@@ -688,17 +689,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # per candidate length (see issue #32802).
         eagle_verified: set[int] = set()
 
-        # 迭代收敛算法：各 attention type 依次检查前缀缓存命中，
-        # 每个 type 只能接受或缩短 curr_hit_length。若长度缩小 → 重新检查所有 type。
-        # 单调递减 + 下界为 0 → 保证收敛。
-        #
-        # 当前支持的混合模型（1 Full + 1 SWA）下，is_simple_hybrid=True，
-        # 底部 749 行一轮就 break。while True 是为未来 3+ type 模型预留的：
-        # 如 Full + SWA + ChunkedLocal，需要多轮迭代才能收敛到交集。
+
         while True:
+            # 首次取MAX
             curr_hit_length = hit_length
 
-            # 遍历每种 attention type 的聚合 group（e.g. Full × 1 + SWA × 6）
+            # attention_groups是经过合并的，同样类型的attention group合并成一个
+            # spec -> KVCacheSpec ， group_ids -> 被合并的组， manager_cls-> 某种SingleTypeKVCacheManager
+            # use_eagle 是是否使用 eagle 算法。
             for idx, (spec, group_ids, manager_cls, use_eagle) in enumerate(
                 self.attention_groups
             ):
@@ -714,8 +712,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     )
                     continue
 
+                # 这KVCacheSpec组是否要drop最后一个block
                 drop_eagle_block = use_eagle and idx not in eagle_verified
 
+                # 每次都会限制_max_length为上一次hit length
+                # 就是只允许hit length缩小，不允许hit length增大
                 _max_length = curr_hit_length
                 if drop_eagle_block:
                     # EAGLE: 多查一个 block（+block_size），查到后再 pop 掉最后一个。
@@ -724,8 +725,12 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     _max_length = min(
                         curr_hit_length + spec.block_size, max_cache_hit_length
                     )
+
+                # 一种KVCacheSpec对应一种SingleTypeKVCacheManager，
+                # 对应一种hit_blocks
                 hit_blocks = manager_cls.find_longest_cache_hit(
                     block_hashes=_get_block_hashes(spec),
+                    # ⚠️ max length一直变！max_length会影响到hit blocks的个数
                     max_length=_max_length,
                     kv_cache_group_ids=group_ids,
                     block_pool=self.block_pool,
@@ -734,28 +739,42 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     alignment_tokens=self.scheduler_block_size,
                 )
                 _new_hit_length = len(hit_blocks[0]) * spec.block_size
+
+                # 哪些KVCacheSpec要drop最后一个block
                 if drop_eagle_block:
                     eagle_verified.add(idx)
                 elif _new_hit_length < curr_hit_length:
                     # 命中长度缩小了 → 之前的 eagle 验证基于旧长度，不再有效。
                     # length shrunk; invalidate previous eagle verifications
                     eagle_verified.clear()
+
+                # 每个内循环，curr_hit_length都会改变
                 curr_hit_length = _new_hit_length
+
+                # 把hit_blocks按group_id重复引用
                 for group_id, blocks in zip(group_ids, hit_blocks):
                     hit_blocks_by_group[group_id] = blocks
 
+                # 多个KVCacheSpec中匹配到的最长的prefix
                 longest_hit_length = max(longest_hit_length, curr_hit_length)
 
-            # 收敛条件: 当前长度 ≥ 本轮初始长度 → 没有 type 缩短它 → 稳定停止
+            # 本轮没有 type 再缩小它了——所有 type 都接受了上一轮的 hit_length，没人再砍
+            # 翻译成人话："这一轮遍历完，没有任何 type 再砍长度了"。每个 type 返回的结果 ≥ 本轮初始值（等于它），说明大家达成一致了。
             if curr_hit_length >= hit_length:
                 break
+
+            # 记录上一轮的最后一个hit_length
             hit_length = curr_hit_length
+
+            # 简单混合模型（1 Full + 1 其他）：一轮迭代即可收敛，不需要 while 循环。
+            # Full 总是排在 attention_groups 最前面。
+            # 3种的话就不break
             if is_simple_hybrid:
                 break
 
+        # Truncate full attention blocks to final hit_length (if present)
         # 最终裁剪：把 Full attention 的超长命中 block 裁到最终 hit_length。
         # Full 的向下封闭性意味着它查到的前缀可能比 SWA 等类型长，需要裁掉多余部分。
-        # Truncate full attention blocks to final hit_length (if present)
         first_group = self.attention_groups[0]
         if isinstance(first_group.spec, FullAttentionSpec):
             num_blocks = hit_length // first_group.spec.block_size
@@ -763,11 +782,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 if (blks := hit_blocks_by_group[group_id]) is not None:
                     del blks[num_blocks:]
 
+        # Uncached shared prefix detection: If any attn. group cached a longer prefix
+        # than the current prefix, it is an uncached common prefix across requests:
         # 未缓存的公共前缀检测：如果某个 attention type 能在更长的前缀上命中，
         # 说明这个前缀属于请求间的公共前缀（common prefix），但当前步没被缓存。
         # 差值 = max(各 type 命中长度) - 最终交集长度，用于 Cascade Attention 决策。
-        # Uncached shared prefix detection: If any attn. group cached a longer prefix
-        # than the current prefix, it is an uncached common prefix across requests:
         self.num_uncached_common_prefix_tokens = longest_hit_length - hit_length
         return tuple(
             blocks if blocks is not None else [] for blocks in hit_blocks_by_group
