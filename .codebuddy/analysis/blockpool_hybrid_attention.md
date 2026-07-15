@@ -598,9 +598,49 @@ if max_num_layers < min_num_layers * 1.5:
     group_size = max_num_layers  # 直接取最大值，padding 更少
 ```
 
-例如 12 SWA + 13 Full：`13 < 12 * 1.5 = 18` → YES → `group_size = 13`。这样 12 SWA 只需 pad 1 层（而非拆成 12+12 再 pad），pading 开销极小。但 10 Full + 21 SWA 不满足（`21 > 15`），只能拆分 + padding。
+**case YES：12 SWA + 13 Full**（代码注释里的典型例子）
 
-**实际例子**：Gemma3-27B 有 10 Full + 52 SWA → 拆分后 6 个 Group，padding 开销可接受。极端不均的模型（如 5 Full + 50 SWA）可能更适合用 `--disable-hybrid-kv-cache-manager` 关闭混合管理，避免大量 padding 浪费。
+```
+min=12, max=13
+13 < 12 × 1.5 = 18?  YES
+→ group_size = max = 13
+
+Full: ceil(13/13) = 1 组 × 13 层, padding = 0
+SWA:  ceil(12/13) = 1 组 × 12 + 1 pad, padding = 1
+总 padding = 1
+
+如果不用优化 (group_size=12)：
+Full: ceil(13/12) = 2 组, 7+6, 需 padding 11 槽位 ❌
+SWA:  ceil(12/12) = 1 组 × 12, 0 padding
+总 padding = 11
+
+优化节省了 10 个 padding 槽位。
+```
+
+**case NO：10 Full + 16 SWA**
+
+```
+min=10, max=16
+16 < 10 × 1.5 = 15?  NO
+→ group_size = min = 10
+
+为什么不用 max？试试看：
+  group_size=10:
+    Full: ceil(10/10)=1组×10, padding=0
+    SWA:  ceil(16/10)=2组, 8+8, 各pad 2 → 总padding=4  ✅
+
+  group_size=16:
+    Full: ceil(10/16)=1组, 10+6pad → padding=6
+    SWA:  ceil(16/16)=1组×16, padding=0 → 总padding=6  ❌
+
+4 < 6，所以 group_size=10 才是最优。1.5 倍阈值正确避免了"用大组反而更差"的情况。
+```
+
+**什么时候 padding 为零？** 两类情况：
+- 大组层数能被 `group_size` 整除（如 5 Full + 50 SWA → 50÷5=10）
+- 每个类型本身层数相等（如 10 Full + 10 SWA）
+
+**实际例子**：Gemma3-27B 有 10 Full + 52 SWA → 拆分后 6 个 Group，padding 开销可接受。
 
 ---
 
