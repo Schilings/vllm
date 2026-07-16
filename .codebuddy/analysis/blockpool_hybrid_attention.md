@@ -8,6 +8,7 @@
 2. [全景架构概览](#2-全景架构概览)
 3. [Layer 1: BlockPool — 全局唯一的物理块池](#3-layer-1-blockpool--全局唯一的物理块池)
 4. [Layer 2: 单 BlockPool 到多 Group 的分配逻辑](#4-layer-2-单-blockpool-到多-group-的分配逻辑)
+   - [4.5 分组全生命周期：kv_cache_groups → attention_groups → find_longest_cache_hit](#45-分组全生命周期kv_cache_groups--attention_groups--find_longest_cache_hit)
 5. [物理 Tensor 布局与 Slot Mapping：逻辑 Block 到 GPU 地址的完整链路](#5-物理-tensor-布局与-slot-mapping逻辑-block-到-gpu-地址的完整链路)
 6. [前缀缓存的多 Group 隔离机制](#6-前缀缓存的多-group-隔离机制)
 7. [Layer 4: GPU Worker 端 — 独立 Block Table](#7-layer-4-gpu-worker-端--独立-block-table)
@@ -309,6 +310,116 @@ class KVCacheBlocks:
     blocks[1] = [KVCacheBlock(5), KVCacheBlock(7)]  ← SWA Group 1
     blocks[2] = [KVCacheBlock(3), KVCacheBlock(9)]  ← SWA Group 2
     """
+```
+
+### 4.5 分组全生命周期：kv_cache_groups → attention_groups → find_longest_cache_hit
+
+> 这一节补充说明分组的两阶段演化过程，以及合并后缓存查询的详细机制。4.1-4.4 介绍了"有什么 Group"，本节说明"Group 是怎么来的、中间又合并了什么、合并后查缓存时各组是否独立"。
+
+#### 4.5.1 第一阶段：`_get_kv_cache_groups_uniform_page_size` 创建 per-slot 分组
+
+**文件**: `vllm/v1/core/kv_cache_utils.py:1108-1227`，入口在 `kv_cache_utils.py:1752`
+
+这是分组的**起点**。它先将各层按 `KVCacheSpec` 类型归类（Full / SWA / ChunkedLocal / ...），再以 `group_size` 为单位把每种类型的层拆成若干子组，交错分配：
+
+```python
+# 10 Full + 20 SWA 层，group_size = min(10, 20) = 10
+# Full: ceil(10/10)=1 组 × 10 层 → 无需拆分
+# SWA:  ceil(20/10)=2 组，layers[i::2] 交错分配
+```
+
+产生 3 个 **per-slot** 的 `kv_cache_groups`（每个持有一个 `SingleTypeKVCacheManager`）：
+
+```
+kv_cache_groups:
+  Group 0 (FullAttentionSpec):  [full.0,  ..., full.9]               → 1 个 manager
+  Group 1 (SlidingWindowSpec):  [sw.0, sw.2, ..., sw.18]             → 1 个 manager
+  Group 2 (SlidingWindowSpec):  [sw.1, sw.3, ..., sw.19]             → 1 个 manager
+```
+
+这 3 个 Group 的 block 需求是**独立累加的**（4.1 节 `Sum, Not Max`），各自从同一 BlockPool 取 block，各自维护独立的 block_table。
+
+#### 4.5.2 第二阶段：`verify_and_split_kv_cache_groups` 按 spec 类型合并
+
+**文件**: `vllm/v1/core/kv_cache_coordinator.py:570-610`
+
+虽然第一阶段生成了 3 个 `kv_cache_groups`，但 Group 1 和 Group 2 的 `KVCacheSpec` **完全相同**（都是 SlidingWindowSpec）。在前缀缓存查找时，如果为每个 group 单独扫描 hash 链，会产生重复开销。`verify_and_split_kv_cache_groups` 将相同 spec 的 group 合并成 `SpecGroup`：
+
+```python
+# 合并后只产生 2 个 attention_groups：
+attention_groups:
+  SpecGroup(spec=FullAttentionSpec,  group_ids=[0])      # 1 个 kv_cache_group
+  SpecGroup(spec=SlidingWindowSpec,  group_ids=[1, 2])   # 2 个同 spec 的合并 ← ★
+```
+
+**合并的目的是减少 hash 链扫描次数，不是共享 block 对象。** 外层只遍历一次 `block_hashes`，内层一次 `get_cached_block` 调用批量查询同一 spec 下的所有 group_id。如果没有合并，SWA 的两个 group 就要各自扫一遍 hash 链，开销翻倍。
+
+#### 4.5.3 第三阶段：合并后的缓存查询 —— 各组仍然拿到不同的物理 block
+
+**文件**: `vllm/v1/core/kv_cache_coordinator.py:640-774`（外层） + `single_type_kv_cache_manager.py:657-686`（内层）
+
+这是关键澄清：合并只是**调用层面**的打包，各组拿到的 block 列表仍然是独立且不同的。
+
+外层 `find_longest_cache_hit` 按 `attention_groups` 遍历（每个 spec 一次）：
+
+```python
+# SWA SpecGroup: group_ids=[1,2]，一次调用覆盖两个 group
+hit_blocks = FullAttentionManager.find_longest_cache_hit(
+    kv_cache_group_ids=[1, 2],
+    block_hashes=...,
+    block_pool=self.block_pool,
+    ...
+)
+```
+
+内层（`single_type_kv_cache_manager.py:657-686`）为每个 group_id 创建**独立的空列表**：
+
+```python
+computed_blocks = tuple([] for _ in range(len(kv_cache_group_ids)))
+# computed_blocks = ([], [])  ← group_id=1 的列表, group_id=2 的列表
+
+for block_hash in block_hashes:
+    # get_cached_block 内部为每个 group_id 使用不同的 hash key：
+    #   make_block_hash_with_group_id(hash, 1) → SHA256 + \x00\x00\x00\x01
+    #   make_block_hash_with_group_id(hash, 2) → SHA256 + \x00\x00\x00\x02
+    cached_block = block_pool.get_cached_block(block_hash, kv_cache_group_ids)
+    # cached_block = [KVCacheBlock(17), KVCacheBlock(42)]  ← 两个不同的 block 对象
+
+    for computed, cached in zip(computed_blocks, cached_block):
+        computed.append(cached)
+        # computed_blocks[0].append(KVCacheBlock(17))  ← gid=1 拿到 Block[17]
+        # computed_blocks[1].append(KVCacheBlock(42))  ← gid=2 拿到 Block[42]
+```
+
+回到 Coordinator 层（line 757-758），各自写入 `hit_blocks_by_group`：
+
+```python
+for group_id, blocks in zip(group_ids, hit_blocks):
+    hit_blocks_by_group[group_id] = blocks
+    # hit_blocks_by_group[1] = [KVCacheBlock(17), ...]  ← group 1 自己的列表
+    # hit_blocks_by_group[2] = [KVCacheBlock(42), ...]  ← group 2 自己的列表
+```
+
+**各组拿到的一定是不同的 block 列表**，因为 `get_cached_block` 为每个 group_id 构造不同的 hash key 查表，查到的是不同物理 block。合并的收益纯粹是：
+
+- ✅ 外层 `block_hashes` 只扫描一次（而非每个 group 各扫一次）
+- ✅ 一次 `get_cached_block` 调用内批量查多个 group_id
+- ❌ 不是共享 block 引用，各组结果完全独立
+
+#### 4.5.4 分组生命周期总结
+
+```mermaid
+flowchart TD
+    A["_get_kv_cache_groups_uniform_page_size<br/>按 group_size 拆分 → per-slot 分组<br/>10 Full + 20 SWA → 3 个 kv_cache_groups"] 
+    A --> B["创建 3 个 SingleTypeKVCacheManager<br/>各持独立 req_to_blocks / block_table"]
+    B --> C["verify_and_split_kv_cache_groups<br/>同 spec 合并 → attention_groups<br/>3 组 → 2 个 SpecGroup"]
+    C --> D["find_longest_cache_hit<br/>按 attention_groups 遍历<br/>1 次 hash 链扫描查 N 个 group_id"]
+    D --> E["各组拿独立 block 列表<br/>gid 前缀隔离保证互不干扰"]
+
+    style A fill:#e1f5fe
+    style C fill:#fff3e0
+    style D fill:#e8f5e9
+    style E fill:#fce4ec
 ```
 
 ---
