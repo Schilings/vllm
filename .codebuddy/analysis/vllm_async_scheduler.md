@@ -13,6 +13,9 @@
 - [2. Layer 1：调度器接口与启用开关](#2-layer-1调度器接口与启用开关)
 - [3. Layer 2：同步 Scheduler 的核心公式](#3-layer-2同步-scheduler-的核心公式)
 - [4. Layer 3：AsyncScheduler 与 Placeholder Token（重点）](#4-layer-3asyncscheduler-与-placeholder-token重点)
+- [4b. 执行层核心：上一步 token id 没回 CPU，decode 输入从哪来](#4b-执行层核心上一步-token-id-没回-cpudecode-输入从哪来)
+- [4c. 提前调度但结果已终止（EOS / finished）怎么办](#4c-提前调度但结果已终止eos--finished-怎么办)
+- [4d. CPU 如何 overlap「发新步」与「收旧步结果」](#4d-cpu-如何-overlap发新步与收旧步结果)
 - [5. Worker 侧：-1 占位如何被填充](#5-worker-侧-1-占位如何被填充)
 - [6. 完整调用链时序图](#6-完整调用链时序图)
 - [7. 同步 vs 异步调度对比](#7-同步-vs-异步调度对比)
@@ -217,6 +220,203 @@ V2 runner + pipeline parallel 下，同一请求的两次 decode 必须间隔 `p
 
 ---
 
+## 4b. 执行层核心：上一步 token id 没回 CPU，decode 输入从哪来
+
+> §4 讲的是 **CPU 调度器如何记账**（占位）。但真正让人困惑的是执行层：decode 是自回归的，step N+1 的输入必须是 step N 采样出的 token——**token id 都还没回来，GPU 怎么算？**
+
+### 4b.1 关键澄清：token 值从没缺席，只是没绕道 CPU
+
+"上一步 token id 没生成" 是**误解**。准确说法是：**采样结果没有回传到 CPU 调度器**。token 值本身在 step N 的 GPU forward + 采样后就存在了，而且**一直留在 GPU 显存里**（`prev_sampled_token_ids`），vLLM **不做 D2H（GPU→CPU）拷贝再传回**。
+
+异步调度把两件事**解耦**：
+
+| 职责 | 谁做 | 需要 token 真值？ |
+| --- | --- | --- |
+| **调度决策**（几个 token、占哪些 position、分哪些 KV block） | CPU 调度器 | ❌ 用 placeholder 记账即可（§4） |
+| **数据衔接**（上一步 token 喂给这一步 forward） | GPU / worker | ✅ 需要，但值就在 GPU 上，原地拷 |
+
+### 4b.2 数据流（带行号）
+
+**① step N 采样后：token 留 GPU，存为 `prev_sampled_token_ids`**
+
+```python
+# gpu_model_runner.py:3710-3713（普通异步路径）
+if self.input_batch.prev_sampled_token_ids is None:
+    assert sampled_token_ids.shape[-1] == 1
+    self.input_batch.prev_sampled_token_ids = sampled_token_ids   # GPU 张量，不下 CPU
+self.input_batch.prev_req_id_to_index = { req_id: i for ... }     # 上一步 batch 各请求行号
+```
+（PP 场景在 `:4772` 广播后赋值；spec decode 在 `:4870` 赋值。）
+
+**② step N+1 准备输入：`_prepare_input_ids`（gpu_model_runner.py:1738）——核心**
+
+```python
+# :1755
+if self.input_batch.prev_sampled_token_ids is None:
+    self.input_ids.copy_to_gpu(...)   # 同步/首步：从 CPU 拷
+    return
+# 否则是异步 decode：这些请求在 input_ids_cpu 里【没有真值】，
+# 需要在 GPU 上从 prev_sampled_token_ids 拷进 input_ids
+```
+
+两条拷贝路径：
+
+```python
+# 快路径（:1827）：batch 未变、无重排 —— 一次 slice 拷贝
+self.input_ids.gpu[:num_common_tokens].copy_(
+    self.input_batch.prev_sampled_token_ids[:num_common_tokens, 0], non_blocking=True)
+
+# 一般路径（:1839）：batch 有增删/重排 —— 按 prev_positions 映射 scatter
+self.input_ids.gpu.scatter_(
+    dim=0, index=sampled_tokens_index_tensor,
+    src=self.input_batch.prev_sampled_token_ids[prev_common_req_indices_tensor, 0])
+```
+
+**③ `prev_positions` 映射（`_compute_prev_positions` :1726）**：把"本步 batch 第 i 行"映射到"上一步 batch 行号"，`-1` = 新请求（新请求有正常 prompt 输入，不走这套）。解决两步之间 batch 顺序变化（请求结束/加入）的对齐问题。
+
+### 4b.3 时序图
+
+```mermaid
+sequenceDiagram
+    participant CPU as Scheduler(CPU)
+    participant IB as GPUInputBatch
+    participant R as GPUModelRunner
+    participant G as GPU 显存
+
+    Note over CPU: step N schedule（占位记账，不知 token 值）
+    CPU->>R: SchedulerOutput(step N)
+    R->>G: forward + sample
+    G-->>IB: prev_sampled_token_ids（留在 GPU!）
+    Note over IB: 记 prev_req_id_to_index（行号映射）
+
+    Note over CPU: step N+1 schedule（不等 GPU 回传）
+    CPU->>R: SchedulerOutput(step N+1)
+    R->>R: _prepare_input_ids(:1738)
+    R->>G: scatter/copy prev_sampled_token_ids → input_ids.gpu
+    Note over G: 上一步 token 在【GPU 内】接力进本步输入
+    R->>G: forward(step N+1)
+```
+
+### 4b.4 一句话总结
+
+> **CPU 用占位"排班"，GPU 用 `prev_sampled_token_ids → input_ids` 的显存内拷贝"接力"真实 token。** 自回归的数据依赖由 worker 的 `_prepare_input_ids` 在 GPU 上保证，CPU 调度器全程没碰过 token 的值。附带好处：省掉 sampled token 的 D2H+H2D 往返，token 在 GPU 上原地衔接，这也是异步调度更快的原因之一。
+
+---
+
+## 4c. 提前调度但结果已终止（EOS / finished）怎么办
+
+> 异步下确实会发生：step N 提前调度了 step N+1，但 step N 的 GPU 结果回来发现是 EOS / 请求已 finished。这一节讲正确性兜底——**结果不会污染输出，有两道保险，GPU 可能多算一帧但被丢弃**。
+
+### 4c.1 防护 1（调度器侧，主保险）：`update_from_output` 跳过已 finished 请求
+
+```python
+# scheduler.py:1634-1643
+request = self.requests.get(req_id)
+if request is None or request.is_finished():
+    # The request is already finished. This can happen if the
+    # request is aborted while the model is executing it (e.g.,
+    # in pipeline parallelism or in async scheduling).
+    continue   # step N+1 的采样结果直接被忽略，不追加到 output
+```
+
+时序（step N 的 output 回来时）：
+1. step N 采样出 EOS → `_update_request_with_output` 把请求标 `FINISHED`，加入 `finished_req_ids`。
+2. 下一个 `schedule()` 该请求已不在 running 队列，**不会再被调度**。
+3. 但 step N+1 的 forward **已在 GPU 上跑完**（当时提前排了班）。等它的 output 回来，`update_from_output` 发现 `request.is_finished()` → 直接 `continue`，那帧采样结果**被丢弃**。
+
+> 代价：GPU 确实"白算"了一帧（step N+1 的 forward），但结果不进序列、不回客户端。这是异步调度极低概率的代价，换来整体更低的调度延迟。
+
+### 4c.2 防护 2（worker 侧，防 token 串味）：`discard_request_mask`
+
+即使 step N+1 被提前排进 batch 并 forward，worker 在采样后会**主动把"不该采样"请求的 token 清零**：
+
+```python
+# gpu_model_runner.py:2054-2059（_prepare_inputs 阶段，forward 之前就标记）
+self.discard_request_mask.np[:num_reqs] = (
+    self.optimistic_seq_lens_cpu[:num_reqs].numpy() < num_tokens_np
+)
+```
+
+语义：`optimistic_seq_lens`（调度时乐观假设会接受那么多 token）< 请求真实长度 → 说明该请求其实该停了，标记 `discard`。采样后：
+
+```python
+# 投机路径 prepare_next_token_ids_padded (llm_base_proposer.py:1064-1071)
+# 被标记的请求不取 sampled token，改用 backup token（= 它最后一个已知 token）
+self.backup_next_token_ids.np[i] = requests[...].get_token_id(
+    gpu_input_batch.num_tokens_no_spec[i] - 1)
+```
+
+同时 `prev_req_id_to_index` 的构建（`gpu_model_runner.py:4776`）会**跳过被 discard 的请求**，彻底切断"被丢弃 token → 下一步 `prev_sampled_token_ids`"的传播链。
+
+### 4c.3 一句话总结
+
+> **EOS 这类"提前调度但应终止"不会出错**：调度器用 `is_finished()` 在 `update_from_output` 里丢掉多余帧；worker 用 `discard_request_mask` 把该停请求的采样结果清零、并切断它到下一步 `prev_sampled_token_ids` 的传播。GPU 可能多算一帧，但结果不进序列、不串 token，正确性由这两层保证。
+
+---
+
+## 4d. CPU 如何 overlap「发新步」与「收旧步结果」
+
+> 异步调度的引擎循环核心：CPU 既要 `schedule` 新步，又要 `update_from_output` 处理上一步结果。这两件事如何 overlap？答案是 **batch queue（批队列）流水线**，而非同一次 step 内串行。
+
+### 4d.1 同步 vs 异步的 step 形态
+
+同步 `step()`（`core.py:479`）严格串行：
+
+```python
+scheduler_output = self.scheduler.schedule(...)            # 发
+future = self.model_executor.execute_model(..., non_block=True)
+model_output = ...                                          # 隐含等回
+engine_core_outputs = self.scheduler.update_from_output(...)# 收
+```
+
+异步走 `step_with_batch_queue`（`core.py:519`），其注释明确三步：
+
+```
+1. 先尝试 schedule 一个新 batch，直接返回（不阻塞等结果）
+2. 仅当队列满 / 没新请求可排，才阻塞等最早的 batch 完成
+3. 拿到结果后才 update_from_output
+```
+
+### 4d.2 关键结构：`batch_queue`（FIFO 双端队列）
+
+每 `schedule` 一个新步，`execute_model(non_block=True)` 返回一个 **Future**（`uniproc_executor.py:26` `AsyncOutputFuture`），连同 `scheduler_output` 一起 `appendleft` 入队：
+
+```python
+# core.py:547-581
+scheduler_output = self.scheduler.schedule(...)
+exec_future = self.model_executor.execute_model(scheduler_output, non_block=True)  # 不阻塞!
+...
+batch_queue.appendleft((future, scheduler_output, exec_future))
+if len(batch_queue) < self.batch_queue_size and has_requests:
+    return None, model_executed   # ← 不阻塞，立刻回来再排下一个新步
+```
+
+只有队列满（`batch_queue_size`）或没新请求时，才 `batch_queue.pop()` 取**最早**的 Future，`future.result()` 阻塞等 GPU 结果，再 `update_from_output`（`core.py:590-607`）。
+
+### 4d.3 流水线时序
+
+```
+时间 →
+GPU:    [step N 算]   [step N+1 算]   [step N+2 算]   ...
+CPU圈1: schedule N+1 ── 入队,return(不阻塞)
+CPU圈2: schedule N+2 ── 入队,return
+CPU圈3: 队列满 → pop N 的 future.result() → update_from_output(N)
+CPU圈4: schedule N+3 ── 入队 ...
+```
+
+"处理上一步结果"（`update_from_output`）与"调度新一步"（`schedule`）**不在同一次 step 调用里串行**，而是被队列错开到不同圈次。GPU 跑 N+1/N+2 时，CPU 正把 N 的结果收回来记账——这就是 overlap。
+
+### 4d.4 两个细节
+
+- **`max_concurrent_batches == batch_queue_size`**：队列容量 = 同时在途 batch 数上限。未满时一直只发不收，满了才被迫阻塞收一个再发。
+- **structured output / draft token 例外**（`core.py:568` `deferred_scheduler_output`）：需等上一步结果才能采样时，当前 `scheduler_output` 暂存为 deferred，等收回上一步结果后再采样——这是 overlap 中少数"必须串行"的情况（采样依赖上一步 token 值）。
+
+### 4d.5 一句话总结
+
+> **overlap 不是"同一时刻 CPU 又发又收"，而是用 batch queue 把"发新步"和"收旧步结果"拆成流水线上的不同圈次**：CPU 发的时候不等（Future 入队即返回），GPU 后台跑；队列满了 CPU 才转去收最早的那个，收完再发。CPU 调度开销与 GPU 计算始终重叠。
+
+---
+
 ## 5. Worker 侧：-1 占位如何被填充
 
 **图3：字面占位 -1 的替换流程**
@@ -324,6 +524,18 @@ sequenceDiagram
 | `_update_request_with_output` | `async_scheduler.py:51` | 结果回来后校正 placeholder / 丢弃帧 |
 | `update_async_spec_token_ids` | `gpu_input_batch.py:1066` | worker 用真实 draft id 替换 -1 |
 | `_update_output_token_ids` | `gpu_input_batch.py:1037` | worker 用采样真值替换 output 里的 -1 |
+| `prev_sampled_token_ids` | `gpu_input_batch.py:296` | 上一步采样 token 的 **GPU 张量**（不下 CPU），供下一步接力 |
+| `prev_req_id_to_index` | `gpu_input_batch.py:297` | req_id → 上一步 batch 行号，供跨步对齐 |
+| `_prepare_input_ids` | `gpu_model_runner.py:1738` | 把上一步 GPU 上的 token 拷进本步 input_ids（异步 decode 核心） |
+| `_compute_prev_positions` | `gpu_model_runner.py:1726` | 本步行 → 上一步行 的映射（-1=新请求） |
+| `update_from_output` 跳过 finished | `scheduler.py:1634` | 已 finished 请求（含异步提前调度产生的多余帧）直接 continue 丢弃 |
+| `discard_request_mask` | `gpu_model_runner.py:2054` | 标记"该停不该采样"的请求，采样后清零其 token |
+| `prepare_next_token_ids_padded` | `llm_base_proposer.py:1064` | 被 discard 请求改用 backup token，不取 sampled |
+| `step_with_batch_queue` | `core.py:519` | 异步引擎循环：batch queue 把"发新步"与"收旧步"错开 |
+| `execute_model(non_block=True)` | `core.py:491` | 返回 Future，CPU 不阻塞等 GPU |
+| `AsyncOutputFuture` | `uniproc_executor.py:26` | Future 包装，`.result()` 才阻塞取 GPU 输出 |
+| `batch_queue.appendleft` | `core.py:575` | 新步 Future 入队；未满即 return（只发不收） |
+| `batch_queue.pop()` + `future.result()` | `core.py:590` | 队列满才阻塞收最早结果 → update_from_output |
 
 ---
 
@@ -353,6 +565,10 @@ async_scheduling: bool | None = None   # None=自动；True=强制开；False=�
 | `vllm/v1/request.py:141` | `num_output_placeholders` 等异步字段定义 |
 | `vllm/v1/worker/gpu_input_batch.py:1037` | output `-1` 占位替换 |
 | `vllm/v1/worker/gpu_input_batch.py:1066` | `update_async_spec_token_ids`（-1→真实 draft） |
+| `vllm/v1/worker/gpu_input_batch.py:296` | `prev_sampled_token_ids` GPU 张量缓存 |
+| `vllm/v1/worker/gpu_model_runner.py:1738` | `_prepare_input_ids`：上一步 token 在 GPU 内接力进 input_ids |
+| `vllm/v1/worker/gpu_model_runner.py:1726` | `_compute_prev_positions`：跨步 batch 行号映射 |
+| `vllm/v1/worker/gpu_model_runner.py:3712` | 采样后把 token 存为 `prev_sampled_token_ids`（留在 GPU） |
 | `vllm/config/scheduler.py:158` | `async_scheduling` 开关 |
 | `vllm/config/scheduler.py:180` | `get_scheduler_cls()` 选择 Scheduler/AsyncScheduler |
 | `vllm/config/vllm.py:992` | `async_scheduling` 自动决策逻辑 |
