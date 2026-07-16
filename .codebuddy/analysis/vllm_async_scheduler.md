@@ -1,379 +1,380 @@
-# vLLM Async Scheduler 深度解剖
+# vLLM 异步调度器（Async Scheduler）深度解剖
 
-> 版本：vLLM V1 (main branch, 2026-07)
-> 核心文件：`vllm/v1/core/sched/`
-
-## 目录
-
-- [0. 前置知识：设计思想与核心概念](#0-前置知识设计思想与核心概念)
-- [1. 全景架构概览](#1-全景架构概览)
-- [2. Layer 1: SchedulerInterface —— 调度器的统一契约](#2-layer-1-schedulerinterface--调度器的统一契约)
-- [3. Layer 2: Scheduler —— 同步调度核心引擎](#3-layer-2-scheduler--同步调度核心引擎)
-- [4. Layer 3: AsyncScheduler —— 异步调度薄层](#4-layer-3-asyncscheduler--异步调度薄层)
-- [5. 完整调用链时序图](#5-完整调用链时序图)
-- [6. 同步 vs 异步调度对比](#6-同步-vs-异步调度对比)
-- [7. 关键数据结构速查表](#7-关键数据结构速查表)
-- [8. FAQ：快速问题解答](#8-faq快速问题解答)
+> 基于 `comments-on-v0.25.1` 分支源码（2026-07-17 快照）
+> 调研范围：`vllm/v1/core/sched/{async_scheduler,scheduler,interface,output}.py`、`vllm/config/{scheduler,vllm}.py`、`vllm/v1/worker/gpu_input_batch.py`、`vllm/v1/request.py`
+> 参考：vLLM Blog / 社区源码解析（知乎《Async Scheduler 实现原理》、官方 async_scheduler API 文档）
 
 ---
 
-## 0. 前置知识：设计思想与核心概念
+## 目录
 
-### 0.1 为什么需要异步调度？
+- [0. 前置知识：为什么需要异步调度](#0-前置知识为什么需要异步调度)
+- [1. 全景架构概览](#1-全景架构概览)
+- [2. Layer 1：调度器接口与启用开关](#2-layer-1调度器接口与启用开关)
+- [3. Layer 2：同步 Scheduler 的核心公式](#3-layer-2同步-scheduler-的核心公式)
+- [4. Layer 3：AsyncScheduler 与 Placeholder Token（重点）](#4-layer-3asyncscheduler-与-placeholder-token重点)
+- [5. Worker 侧：-1 占位如何被填充](#5-worker-侧-1-占位如何被填充)
+- [6. 完整调用链时序图](#6-完整调用链时序图)
+- [7. 同步 vs 异步调度对比](#7-同步-vs-异步调度对比)
+- [8. 关键数据结构速查表](#8-关键数据结构速查表)
+- [9. 启用与配置](#9-启用与配置)
+- [10. 源码文件索引](#10-源码文件索引)
+- [11. 快速问题解答（FAQ）](#11-快速问题解答faq)
 
-传统 vLLM 的**同步调度**模式下，执行流程是严格串行的：
+---
+
+## 0. 前置知识：为什么需要异步调度
+
+### 0.1 同步调度的瓶颈
+
+vLLM 每个调度步（step）对应一次模型 forward。同步模式下，CPU 调度器和 GPU 是**严格串行**的：
 
 ```
-step N: schedule() → execute(GPU) → 等待GPU完成 → update_from_output() 
-step N+1: schedule() → execute(GPU) → ...
+step N:  schedule() → execute(GPU) → 等 GPU 算完 → update_from_output()
+step N+1: schedule() → ...
 ```
 
-每个 step 之间，CPU 调度器必须**等待 GPU 执行完毕**才能发起下一次调度。这意味着 GPU 计算期间 CPU 空闲等待，GPU 利用率有间隙。
+GPU 在算 step N 时，CPU 调度器只能**干等**。GPU 算完、token 采样结果回传 CPU 后，才能开始 step N+1 的 `schedule()`。这段"CPU 空等 GPU"的间隙降低了 GPU 利用率。
 
-**异步调度的核心思想**：在 GPU 还在执行 step N 时，CPU 调度器**不等结果就直接发起 step N+1 的调度**，将 CPU 调度和 GPU 执行流水线化，隐藏 GPU 延迟。
+### 0.2 异步调度的核心思想：重叠批次（Overlapping Batches）
 
-### 0.2 核心矛盾：状态不确定性
+异步调度让 CPU **不等 GPU 算完就提前调度下一步**。即：step N 的 forward 还在 GPU 上跑，CPU 已经算出了 step N+1 的调度决策并下发了。这样 CPU 调度和 GPU 计算在时间上重叠，隐藏了调度延迟。
 
-异步调度的代价是：调度 step N+1 时，step N 的结果还没回来，调度器**不知道 step N 生成了几个 token**。这意味着 `num_computed_tokens`、`output_token_ids` 等关键字段是**不确定的**。
+**代价**：调度 step N+1 时，step N 的采样结果还没回来，调度器**不知道 step N 到底生成了几个 token**。于是它必须"猜"——这就是 **placeholder（占位）** 机制的由来。
 
-解决方案：**假设 → 修正（Assume → Correct）** 模式。
+### 0.3 一句话理解 Placeholder Token
 
-- **调度时**：假设 step N 会生成 N 个 token，提前更新 `num_output_placeholders`（占位符）
-- **结果返回时**：用真实生成的 token 数减去 placeholder，修正状态
+> **Placeholder = 调度器在"真实结果还没回来"时，为即将产生的 token 提前占好的"位置 + KV 槽位"。**
 
-### 0.3 关键设计决策
+它解决的根本矛盾是：**调度决策（需要知道序列里有哪些 token、占哪些位置）必须发生在 GPU 结果回来之前**。既然结果未知，就先占个位、等结果回来再填真值/再校正计数。
 
-| 决策 | 内容 |
-|------|------|
-| **继承而非重写** | `AsyncScheduler` 只重写 3 个方法，其余复用 `Scheduler` 的 128KB 逻辑 |
-| **Placeholder 机制** | `num_output_placeholders` 追踪 in-flight 中的未确认 token |
-| **PP microbatching** | V2 runner 下，同一请求的两次 decode 间隔必须 ≥ `pp_size` 步 |
-| **投机解码加成** | 异步模式下，spec token 先用 `[-1, -1, ...]` 占位，worker 侧实际执行 |
+> ⚠️ **重要澄清（旧报告没讲清的点）**：代码里 "placeholder" 其实指**两件事**，不要混：
+> - **(A) 计数型占位** `num_output_placeholders`：一个整数，表示"我已乐观预留、但还没拿到真实 token 的 output 槽位数"。纯调度记账用。
+> - **(B) 字面型占位** `spec_token_ids = [-1, -1, ...]` 和 `output_token_ids` 里的 `-1`：token 的**真实 id 还没算出来**（尤其投机解码的 draft token），先用 `-1` 字面量顶着，worker 在 forward 前/采样后替换成真值。
+>
+> 两者都叫 placeholder，但 (A) 是"数量未知"的占位，(B) 是"值未知"的占位。下文会分别拆开讲。
 
-### 0.4 业界演进
+### 0.4 演进
 
-- vLLM V0：显式区分 prefill/decode 阶段，调度逻辑分两套
-- vLLM V1：用 `num_tokens - num_computed_tokens` 统一公式，不再显式区分阶段
-- Async scheduling 进一步增强 GPU 利用率，配合 chunked prefill 和 spec decoding
-- 社区反馈：当前实现仍较复杂，有 bug，改进方向是调度器只维护 `num_output_tokens`
+- vLLM V0：显式区分 prefill/decode，两套调度逻辑。
+- vLLM V1：用 `num_tokens - num_computed_tokens` 统一公式，不再区分阶段。
+- Async Scheduling：在 V1 基础上进一步让调度与 GPU 执行重叠，配合 V2 model runner + pipeline parallel 的 microbatching（一次 decode 跨 `pp_size` 步），把 GPU 利用率推满。
 
 ---
 
 ## 1. 全景架构概览
 
-### 架构图
+**图1：异步调度在引擎中的位置**
 
-![系统架构图](diagrams/architecture.png)
+```mermaid
+graph TD
+    subgraph EngineCore["EngineCore busy loop"]
+        SCHED["Scheduler.schedule()<br/>(scheduler.py:399)"]
+        EXEC["GPU execute (forward)"]
+        UPD["update_from_output()<br/>(scheduler.py:1550)"]
+    end
 
-**关键交互**:
-- API Server → ZMQ → EngineCore：发送 add_request
-- EngineCore busy loop：`schedule() → execute() → update_from_output()` 循环
-- **AsyncScheduler 在 schedule() 后不等 GPU，直接发下一次 schedule()**
+    SCHED -->|提交 batch| EXEC
+    EXEC -->|采样结果回传| UPD
+    UPD -->|修正状态| SCHED
+
+    ASYNC["AsyncScheduler (async_scheduler.py:12)<br/>重写 _update_after_schedule / _update_request_with_output"]
+    SCHED -.继承.-> ASYNC
+
+    subgraph Worker["Worker 进程"]
+        IB["GPUInputBatch<br/>(gpu_input_batch.py)"]
+        RUN["GPUModelRunner forward"]
+        IB --> RUN
+    end
+
+    SCHED -->|SchedulerOutput| IB
+    RUN -->|sampled_token_ids| UPD
+```
+
+**关键点**：异步模式下，`schedule()` 提交 batch 后**不等待** `update_from_output()`，立刻又 `schedule()` 下一个 batch。允许多个 batch 同时在途（in-flight），由 `max_concurrent_batches > 1` 控制。
 
 ---
 
-## 2. Layer 1: SchedulerInterface —— 调度器的统一契约
+## 2. Layer 1：调度器接口与启用开关
 
-**文件**: `vllm/v1/core/sched/interface.py`（248 行）
+### 2.1 统一契约 `SchedulerInterface`（`interface.py:36`）
 
-### 2.1 接口定义
+`Scheduler` 和 `AsyncScheduler` 都实现此接口，方法包括 `schedule()`、`update_from_output()`、`add_request()`、`finish_requests()`。
 
-```python
-class SchedulerInterface(ABC):
-    @abstractmethod
-    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput: ...
-    @abstractmethod
-    def update_from_output(self, scheduler_output, model_runner_output) -> dict: ...
-    @abstractmethod
-    def add_request(self, request: Request) -> None: ...
-    @abstractmethod
-    def finish_requests(self, request_ids, finished_status) -> list: ...
-```
+### 2.2 启用开关
 
-这是调度器的**抽象契约**，Scheduler 和 AsyncScheduler 都实现此接口。关键方法注释（`interface.py:52-81`）：
-
-> "The scheduling decision is made at the iteration level. Each scheduling step corresponds to a single forward pass of the model. Essentially, the scheduler produces a dictionary of {req_id: num_tokens} that specifies how many tokens to process for each request."
-
-### 2.2 PauseState
+`SchedulerConfig.async_scheduling`（`config/scheduler.py:158`，默认 `None` = 自动）：
 
 ```python
-class PauseState(enum.IntEnum):
-    UNPAUSED = 0   # 正常调度
-    PAUSED_NEW = 1 # 不调度新请求，running 继续
-    PAUSED_ALL = 2 # 完全暂停
+# config/scheduler.py:180
+def get_scheduler_cls(self):
+    if self.scheduler_cls is None:
+        if self.async_scheduling:
+            from ...async_scheduler import AsyncScheduler
+            return AsyncScheduler          # 异步
+        from ...scheduler import Scheduler
+        return Scheduler                  # 同步
 ```
 
-用于热更新、权重切换等场景。
+`async_scheduling` 为 `None` 时由 `VllmConfig` 自动决定（`config/vllm.py:992-1040`）：若 executor 支持（V2 runner 等）则置 `True`，否则 `False`。`max_concurrent_batches` 在 `async_scheduling=True` 时自动 > 1（`config/vllm.py:492-496`），这是异步能重叠的前提。
 
 ---
 
-## 3. Layer 2: Scheduler —— 同步调度核心引擎
+## 3. Layer 2：同步 Scheduler 的核心公式
 
-**文件**: `vllm/v1/core/sched/scheduler.py`（~128 KB，3000+ 行）
+**图2：计算本步要调度的 token 数**
 
-### 3.1 核心设计
-
-> 不区分 prefill/decode 阶段，用统一公式 `num_tokens_with_spec - num_computed_tokens` 自动适配两者
-
-```python
-# scheduler.py:432-443
-def schedule(self, throttle_prefills=False) -> SchedulerOutput:
-    # 统一公式：
-    # num_tokens_with_spec = len(prompt) + len(output_ids) + len(spec_token_ids)
-    # num_new = num_tokens_with_spec + output_placeholders - num_computed_tokens
-    
-    # prefill 中的请求: output_ids=0 → num_new = 还需预填充的 token 数（可能 > 1）
-    # decode 中的请求: 上一轮的 output token 还没 compute → num_new = 1
+```mermaid
+flowchart TD
+    A["遍历 running 请求"] --> B["num_new = num_tokens_with_spec<br/>- num_computed_tokens"]
+    B --> C{"num_new > 0 ?"}
+    C -->|是| D["allocate_slots 分配 KV block"]
+    C -->|否| E["跳过（已算完）"]
+    D --> F["_update_after_schedule:<br/>num_computed_tokens += num_scheduled"]
 ```
 
-### 3.2 schedule() 流程
+同步模式下（`scheduler.py:502` 的简化版，无 placeholder）：
 
-```python
-# scheduler.py:432
-def schedule(self, throttle_prefills=False):
-    # ① 计算 token_budget
-    token_budget = self.max_num_scheduled_tokens
-    
-    # ② 先调度 running 请求（优先级高于 waiting）
-    for req in self.running:
-        num_new_tokens = min(
-            req.num_tokens_with_spec + req.num_output_placeholders 
-            - req.num_computed_tokens,
-            long_prefill_token_threshold,
-            token_budget
-        )
-        # 分配 KV cache blocks
-        new_blocks = self.kv_cache_manager.allocate_slots(req, num_new_tokens)
-        if new_blocks is None:
-            # 资源不足 → 抢占最低优先级 running 请求
-            preempt()
-    
-    # ③ 再调度 waiting 请求
-    for req in self.waiting:
-        num_new_tokens = min(num_tokens - num_computed_tokens, ...)
-        new_blocks = self.kv_cache_manager.allocate_slots(req, num_new_tokens)
-        if new_blocks is not None:
-            self.running.append(req)  # 移入 running
-        # waiting 请求资源不足 → 跳过（不抢占 running）
-    
-    # ④ 构造 SchedulerOutput
-    return SchedulerOutput(
-        scheduled_new_reqs=...,      # 首次调度的请求
-        scheduled_cached_reqs=...,   # 非首次，只发 diff
-        num_scheduled_tokens=...,
-        ...
-    )
+```
+num_new = num_tokens_with_spec - num_computed_tokens
 ```
 
-### 3.3 请求三态
+- **decode 请求**：`num_computed_tokens` 已等于"已算的 output 数"，差值为 1 → 每步算 1 个新 token。
+- **prefill 请求**：差值 = 剩余 prompt token 数 → 可能很大，被 `long_prefill_token_threshold` / `token_budget` 截断成 chunked prefill。
 
-| 状态 | 存放位置 | 含义 |
-|------|---------|------|
-| RUNNING | `self.running` | 正在被调度的请求 |
-| WAITING | `self.waiting` 尾部 | 新请求或等待资源的请求 |
-| PREEMPTED | `self.waiting` 头部 | 被抢占的 running 请求（优先级最高） |
-
-### 3.4 抢占策略
-
-当 running 请求需要更多 block 但资源不足时：
-- **PRIORITY 策略**：抢占 running 中优先级最低的
-- **FCFS 策略**：抢占 running 末尾的
-- 被抢占请求标记为 PREEMPTED，放入 waiting 队列头部（保持最高优先级）
-
-### 3.5 update_from_output()
-
-```python
-# scheduler.py:1550
-def update_from_output(self, scheduler_output, model_runner_output):
-    # 从 ModelRunnerOutput 中提取：
-    sampled_token_ids = model_runner_output.sampled_token_ids
-    logprobs = model_runner_output.logprobs
-    # ...
-    
-    # 逐请求处理：
-    for req_id in num_scheduled_tokens:
-        new_token_ids = sampled_token_ids[req_id]
-        new_token_ids, stopped = self._update_request_with_output(req, new_token_ids)
-        # 检查 stop 条件（EOS, stop string, max_tokens）
-```
+调度后 `_update_after_schedule`（`scheduler.py:1231`）把 `num_computed_tokens += num_scheduled_token`——因为同步模式下，**调度时 GPU 结果必然会在 update 前算完**，所以"已调度"就等于"将已计算"，可以放心前进。
 
 ---
 
-## 4. Layer 3: AsyncScheduler —— 异步调度薄层
+## 4. Layer 3：AsyncScheduler 与 Placeholder Token（重点）
 
-**文件**: `vllm/v1/core/sched/async_scheduler.py`（**仅 76 行**）
+`AsyncScheduler`（`async_scheduler.py:12`）只重写 **3 个方法**，其余 128KB 调度逻辑全复用父类。它要解决的唯一问题：**调度时 GPU 结果未回来，不能像同步那样直接前进 `num_computed_tokens`**。
 
-### 4.1 核心：只重写 3 个方法
+### 4.1 计数型占位 (A)：`num_output_placeholders`
 
-```python
-class AsyncScheduler(Scheduler):
-    # ① _update_after_schedule() —— 假设生成
-    # ② _update_request_with_output() —— 实际修正
-    # ③ __init__() —— 初始化 placeholder
-```
-
-所有其他调度逻辑（schedule()、抢占、KV cache、encoder、spec decode）全部复用父类。
-
-### 4.2 Placeholder 的 "假设 → 修正" 全流程
-
-```
-Step 0: schedule()
-  → _update_after_schedule():
-      request.num_output_placeholders += num_sampled_tokens + num_spec_tokens
-      # "假设" 生成了这些 token
-
-Step 1: schedule()（不等 Step 0 完成！）
-  → 基于 S0 的假设状态继续调度
-  → _update_after_schedule() 再次累加 placeholder
-
---- Step 0 GPU 执行完毕 ---
-
-update_from_output():
-  → _update_request_with_output():
-      request.num_output_placeholders -= len(new_token_ids)
-      # "修正"：实际生成了多少 token，就减去多少 placeholder
-      assert request.num_output_placeholders >= 0
-```
-
-### 4.3 投机解码下的占位
+`_update_after_schedule`（`async_scheduler.py:19`）在父类前进 `num_computed_tokens` 之后，**再乐观地多预留一批 output token**：
 
 ```python
-# async_scheduler.py:19-44
-def _update_after_schedule(self, scheduler_output):
-    self._spec_token_placeholders = [-1] * num_spec_tokens  # 用 -1 占位
-    for req_id in scheduler_output.num_scheduled_tokens:
-        request.num_output_placeholders += self.num_sampled_tokens_per_step
-        request.spec_token_ids = self._spec_token_placeholders  # [-1, -1, ...]
+# async_scheduler.py:38-41
+cur_num_spec_tokens = len(spec_decode_tokens.get(req_id, ()))
+request.num_output_placeholders += (
+    self.num_sampled_tokens_per_step + cur_num_spec_tokens
+)
 ```
 
-调度时不知道 draft token 的实际 id，用 -1 占位。Worker 侧在执行前替换为真实值，执行后根据 accept/reject 结果修正 placeholder。
+含义：**"我假设这一步会新产生 `num_sampled_tokens_per_step`（decode 通常是 1）+ spec draft token 数 个 output token，先记下来，等真结果回来再扣。"**
 
-### 4.4 PP Microbatching 对齐
+于是异步模式计算本步 token 数时（`scheduler.py:502-506`）公式变成：
+
+```
+num_new = num_tokens_with_spec + num_output_placeholders - num_computed_tokens
+                                    ^^^^^^^^^^^^^^^^^^^^^^^^
+                                    加上"乐观预留"的 token
+```
+
+**为什么加它？** 因为异步下 `num_computed_tokens` 已经"超前"包含了还没确认的 token（父类无条件前进了）。`num_output_placeholders` 正好抵消这部分超前，让 `num_new` 算出来的"本步真正要新算几个"依然正确。
+
+**校正 (A)**：当真实采样结果回来，`_update_request_with_output`（`async_scheduler.py:51`）扣减：
+
+```python
+# async_scheduler.py:67-68
+request.num_output_placeholders -= len(new_token_ids)
+assert request.num_output_placeholders >= 0
+```
+
+> 用具体数字走一遍（decode，每步 1 token，无 spec）：
+> - step N 调度后：`num_computed_tokens` 前进到 10，`num_output_placeholders` = 1（乐观预留 1）。
+> - step N+1 调度时（GPU 还没回传）：`num_new = num_tokens_with_spec(=11) + placeholders(=1) - computed(=10) = 2`？不——实际 `num_tokens_with_spec` 此时已包含那个未确认 token，所以 `num_new = 11+1-10 = 2` 表示"再算 1 个新 token + 确认之前的 1 个"。核心就是：**placeholder 让调度器能"看得到"还没回传的那 1 个 token，从而正确安排后续位置。**
+> - step N 的 GPU 结果回来：真生成了 1 个 token → `num_output_placeholders` 扣回 0。
+
+### 4.2 字面型占位 (B)：`spec_token_ids = [-1, -1, ...]`
+
+```python
+# async_scheduler.py:16, 23-25, 44
+self._spec_token_placeholders = [-1] * self.num_spec_tokens   # 复用只读占位列表
+...
+self._spec_token_placeholders = [-1] * scheduler_output.num_spec_tokens_to_schedule
+...
+request.spec_token_ids = self._spec_token_placeholders   # 挂到 request 上
+```
+
+含义：**投机解码（spec decoding）下，调度 step N+1 时 draft token 的"真实 id"根本还没产生**（要等 step N 的模型 forward 才 draft 出来）。所以先用 `-1` 占着位置，worker 在 forward 前用真实 draft id 替换（`update_async_spec_token_ids`，见 §5）。
+
+注意 `gpu_input_batch.py:503` 的注释也印证：`spec_token_ids are placeholders and will be overwritten in ...`。
+
+### 4.3 PP Microbatching 步距（`async_scheduler.py:46-49`）
 
 ```python
 if self.use_v2_model_runner:
     request.next_decode_eligible_step = self.current_step + self.pp_size
 ```
 
-同一请求两次 decode 之间必须间隔 `pp_size` 步，以匹配 worker 侧的广播 slot 环节奏。
+V2 runner + pipeline parallel 下，同一请求的两次 decode 必须间隔 `pp_size` 步（匹配 worker 侧 sampled-token 广播槽位的环形节奏）。`schedule()` 里 `scheduler.py:487` 会跳过"还没到 eligible step"的请求。
 
-### 4.5 异步 tokens 丢弃
+### 4.4 异步帧丢弃（`async_scheduler.py:54-59`）
+
+`reset_prefix_cache` 强制抢占时，可能有 in-flight 的陈旧异步输出帧。`async_tokens_to_discard` 计数器（`scheduler.py:2290` 在抢占时设为 `num_output_placeholders`）逐帧 drain，每收到一帧输出就丢一帧，直到归零才恢复正常处理。
+
+---
+
+## 5. Worker 侧：-1 占位如何被填充
+
+**图3：字面占位 -1 的替换流程**
+
+```mermaid
+sequenceDiagram
+    participant S as Scheduler
+    participant IB as GPUInputBatch
+    participant R as GPUModelRunner
+    participant RS as Rejection Sampler
+
+    S->>IB: spec_token_ids=[-1,-1] (占位)
+    Note over IB: token_ids_cpu 写入 -1 (gpu_input_batch.py:507)
+    S->>R: forward (step N)
+    R->>RS: draft token ids (step N 真实产生)
+    RS->>IB: update_async_spec_token_ids(真实 draft ids)
+    Note over IB: 用真实 id 替换 -1 (gpu_input_batch.py:1066)
+    IB->>R: 真实 spec_token_ids 参与 reject/penalty
+    R->>IB: sampled_token_ids 回传
+    Note over IB: output_token_ids 末尾 -1 被真值替换<br/>(gpu_input_batch.py:1037-1064)
+```
+
+### 5.1 draft token 的 -1 替换
+
+`update_async_spec_token_ids`（`gpu_input_batch.py:1066`）在 rejection sampler 用 draft token 做 penalty/bad_words 计算前，把 `spec_token_ids` 里的 `-1` 换成上一步真实产生的 draft id。
+
+### 5.2 output token 的 -1 替换
+
+`_update_output_token_ids`（`gpu_input_batch.py:1037-1064`）：若 `output_token_ids` 末尾是 `-1`（说明是异步乐观占位），用 `sampled_token_ids` 的真值从第一个 `-1` 起覆盖：
 
 ```python
-def _update_request_with_output(self, request, new_token_ids):
-    if request.async_tokens_to_discard > 0:
-        request.async_tokens_to_discard -= 1
-        return [], False  # 丢弃这一帧的输出
-    # ... normal processing
+# gpu_input_batch.py:1054-1063
+first_placeholder = len(req_output_token_ids)
+while first_placeholder > 0 and req_output_token_ids[first_placeholder-1] == -1:
+    first_placeholder -= 1
+num_placeholders = len(req_output_token_ids) - first_placeholder
+num_to_replace = min(num_sampled_ids, num_placeholders)
+req_output_token_ids[first_placeholder:] = new_ids   # 真值覆盖 -1
 ```
 
-`reset_prefix_cache` 强制抢占时，可能有 in-flight 的异步输出帧需要丢弃，逐帧 drain 直到计数器归零。
+> 这里还处理了"占位数量可能比实际采样多（乐观）或少（kv-load 失败丢弃）"的情况：`min(num_sampled_ids, num_placeholders)` 取较小值，避免越界。
 
 ---
 
-## 5. 完整调用链时序图
+## 6. 完整调用链时序图
 
-![完整调用链时序图](diagrams/call_chain.png)
+**图4：同步 vs 异步一步对比（含 placeholder 流转）**
 
----
+```mermaid
+sequenceDiagram
+    participant CPU as Scheduler(CPU)
+    participant GPU as GPU(forward)
+    participant MEM as Request 状态
 
-## 6. 同步 vs 异步调度对比
+    Note over CPU,GPU: === 同步模式 ===
+    CPU->>GPU: step N schedule + execute
+    GPU-->>CPU: 采样结果回传
+    CPU->>MEM: update: num_computed += 真值
+    CPU->>GPU: step N+1 (才开始)
 
-### 时序对比图
-
-![同步 vs 异步调度对比](diagrams/sync_vs_async.png)
-
-### 特性对比表
-
-| 维度 | 同步调度 (Scheduler) | 异步调度 (AsyncScheduler) |
-|------|---------------------|--------------------------|
-| **执行流水线** | step N 完成 → 更新状态 → 调度 N+1 | step N 下发后立即调度 N+1 |
-| **GPU 利用率** | step 间有等待间隙 | 调度与执行重叠，利用率更高 |
-| **状态准确性** | `num_computed_tokens` 始终准确 | 部分是假设值（placeholder） |
-| **代码复杂度** | 低（Scheduler 占主导） | 高（需要假设→修正循环） |
-| **额外字段** | 无 | `num_output_placeholders`, `async_tokens_to_discard`, `next_decode_eligible_step` |
-| **投机解码** | draft token 在调度时已知 | draft token 用 [-1] 占位，worker 侧填充 |
-| **适用场景** | 通用、稳定 | 追求极致吞吐，配合 V2 runner + PP |
-
-**核心公式对比**：
-
-```
-同步调度: num_new = num_tokens_with_spec - num_computed_tokens
-异步调度: num_new = num_tokens_with_spec + output_placeholders - num_computed_tokens
-                   ^^^^^^^^^^^^^^^^^^^^^^^^
-                   加上 in-flight 假设 token
+    Note over CPU,GPU: === 异步模式 ===
+    CPU->>GPU: step N schedule + execute
+    CPU->>MEM: _update_after_schedule:<br/>num_computed += N<br/>num_output_placeholders += 1 (乐观)
+    CPU->>GPU: step N+1 schedule (不等 GPU!)
+    Note over MEM: num_new = spec + placeholders - computed
+    GPU-->>CPU: step N 采样结果回传
+    CPU->>MEM: _update_request_with_output:<br/>num_output_placeholders -= 1 (校正)
+    CPU->>GPU: step N+2 schedule
 ```
 
 ---
 
-## 7. 关键数据结构速查表
+## 7. 同步 vs 异步调度对比
 
-| 数据结构 | 所在文件 | 关键字段 | 作用 |
-|---------|---------|---------|------|
-| `SchedulerOutput` | `output.py:183` | `scheduled_new_reqs`, `scheduled_cached_reqs`, `num_scheduled_tokens`, `finished_req_ids` | schedule() 的返回值，包含本轮调度的所有信息 |
-| `NewRequestData` | `output.py:33` | `req_id`, `prompt_token_ids`, `block_ids`, `num_computed_tokens`, `sampling_params` | 首次调度的请求的**全量**信息 |
-| `CachedRequestData` | `output.py:114` | `req_ids`, `new_block_ids`, `num_computed_tokens`, `num_output_tokens` | 非首次调度的请求的**增量**信息（减少通信） |
-| `GrammarOutput` | `output.py:268` | `structured_output_request_ids`, `grammar_bitmask` | 结构化输出的语法约束位掩码 |
-| `SchedulerInterface` | `interface.py:36` | (抽象类) | 调度器统一契约，Scheduler 和 AsyncScheduler 都实现 |
-| `PauseState` | `interface.py:22` | `UNPAUSED=0`, `PAUSED_NEW=1`, `PAUSED_ALL=2` | 调度器暂停状态枚举 |
-| `SchedulingPolicy` | `request_queue.py` | `FCFS`, `PRIORITY` | 请求队列调度策略 |
-| `RequestQueue` | `request_queue.py` | `add_request()`, `pop_next()`, `prepend_request()` | 等待队列抽象（FCFS/优先权） |
-| `KVCacheBlocks` | `kv_cache_manager.py` | `blocks: tuple[Sequence[KVCacheBlock], ...]` | 跨 group 的 KV cache block 分配结果 |
+| 维度 | 同步 (Scheduler) | 异步 (AsyncScheduler) |
+| --- | --- | --- |
+| 执行流水线 | step N 完成 → 更新 → 调度 N+1 | step N 下发后立即调度 N+1 |
+| GPU 利用率 | step 间有 CPU 空等间隙 | 调度与执行重叠，利用率更高 |
+| 状态准确性 | `num_computed_tokens` 始终准确 | 含乐观占位，暂时超前 |
+| 核心额外字段 | 无 | `num_output_placeholders`(A)、`spec_token_ids=[-1]`(B)、`async_tokens_to_discard`、`next_decode_eligible_step` |
+| 投机解码 | draft id 调度时已可知 | draft id 用 `-1` 占位，worker 填充 |
+| 启用条件 | 默认（不支持异步时） | `async_scheduling=True` + `max_concurrent_batches>1`（V2 runner） |
 
-### Request 关键字段（异步特有）
+**核心公式对比：**
 
-| 字段 | 类型 | 含义 |
-|------|------|------|
-| `num_output_placeholders` | `int` | in-flight 中尚未确认的 token 数（异步核心字段） |
-| `async_tokens_to_discard` | `int` | 需要丢弃的异步输出帧数（reset_prefix_cache 后） |
-| `next_decode_eligible_step` | `int` | PP microbatching 下，下次可调度的 step 编号 |
-| `num_computed_tokens` | `int` | 已计算的 token 数（异步下包含 placeholder，不准确！） |
-| `num_tokens_with_spec` | `int` | `len(prompt) + len(output) + len(spec_token_ids)` |
+```
+同步:   num_new = num_tokens_with_spec                  - num_computed_tokens
+异步:   num_new = num_tokens_with_spec + num_output_placeholders - num_computed_tokens
+                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                      抵消 num_computed 的"乐观超前"
+```
 
 ---
 
-## 8. FAQ：快速问题解答
+## 8. 关键数据结构速查表
 
-**Q1: AsyncScheduler 和 Scheduler 的 schedule() 方法有什么不同？**
-
-没有不同。`AsyncScheduler.schedule()` 直接用父类的，区别在调度**之后**：`_update_after_schedule()` 会设置 placeholder。
-
-**Q2: placeholder 会导致状态错误吗？**
-
-会，但会在 `update_from_output()` 时修正。如果修正不及时，可能导致多调一个 step（浪费计算）或少调一个 step（延迟）。社区已发现 3 个相关 bug。
-
-**Q3: 什么时候用 AsyncScheduler 而不是 Scheduler？**
-
-当 `use_v2_model_runner=True` 时自动启用 AsyncScheduler。它需要 V2 runner 的 PP microbatching 支持。
-
-**Q4: num_output_placeholders 可以为负吗？**
-
-不可以。代码中有 `assert num_output_placeholders >= 0`。如果为负说明假设值比实际值小（不太可能，因为假设偏大），或者修正逻辑有 bug。
-
-**Q5: 异步调度和投机解码如何交互？**
-
-投机解码让异步调度更复杂，因为 worker 可能 accept/reject draft tokens。Scheduler 调度时不知道哪些会被接受，所以：
-- spec_token_ids 先用 `[-1, -1, ...]` 占位
-- worker 执行后返回实际 accept/reject 结果
-- `update_from_output()` 根据 accept 数量修正 placeholder
-
-**Q6: 抢占在异步模式下有什么特殊处理？**
-
-被抢占的请求可能有 in-flight 输出帧。通过 `async_tokens_to_discard` 计数器逐帧丢弃，直到 drain 完毕才恢复正常处理。
+| 数据结构 / 字段 | 位置 | 含义 |
+| --- | --- | --- |
+| `AsyncScheduler` | `async_scheduler.py:12` | 异步调度器，继承 `Scheduler`，重写 3 方法 |
+| `num_output_placeholders` (A) | `request.py:141` | 乐观预留但未确认的 output token 计数 |
+| `spec_token_ids = [-1,...]` (B) | `async_scheduler.py:44` | draft token 真实 id 未知时的字面占位 |
+| `async_tokens_to_discard` | `request.py:142` | 需丢弃的陈旧 in-flight 异步帧计数 |
+| `next_decode_eligible_step` | `request.py:146` | V2+PP+async 下下次可 decode 的步号 |
+| `_update_after_schedule` | `async_scheduler.py:19` | 调度后乐观前进 + 加 placeholder |
+| `_update_request_with_output` | `async_scheduler.py:51` | 结果回来后校正 placeholder / 丢弃帧 |
+| `update_async_spec_token_ids` | `gpu_input_batch.py:1066` | worker 用真实 draft id 替换 -1 |
+| `_update_output_token_ids` | `gpu_input_batch.py:1037` | worker 用采样真值替换 output 里的 -1 |
 
 ---
 
-## 文件索引
+## 9. 启用与配置
 
-| 文件 | 大小 | 核心内容 |
-|------|------|---------|
-| `vllm/v1/core/sched/interface.py` | 9.5 KB | `SchedulerInterface`, `PauseState` |
-| `vllm/v1/core/sched/scheduler.py` | 128.7 KB | `Scheduler` — 核心调度逻辑 |
-| `vllm/v1/core/sched/async_scheduler.py` | 3.5 KB | `AsyncScheduler` — 异步调度扩展 |
-| `vllm/v1/core/sched/output.py` | 10.5 KB | `SchedulerOutput`, `NewRequestData`, `CachedRequestData` |
-| `vllm/v1/core/sched/request_queue.py` | 7.0 KB | `RequestQueue`, `SchedulingPolicy` |
-| `vllm/v1/core/sched/utils.py` | 4.2 KB | `check_stop()`, `remove_all()` |
+异步调度默认在支持的执行器（V2 runner）上**自动开启**。如需显式控制：
+
+```python
+# SchedulerConfig (config/scheduler.py:158)
+async_scheduling: bool | None = None   # None=自动；True=强制开；False=关
+```
+
+对应 `max_concurrent_batches`（`config/vllm.py:492`）在 `async_scheduling=True` 时自动 > 1，决定同时在途的 batch 数。也可通过 `scheduler_cls` 自定义调度器类（但必须继承 `AsyncScheduler` 而非 `Scheduler`，否则异步被禁用、性能下降）。
 
 ---
 
-*报告生成时间: 2026-07-13 | 工具: source-analyzer skill + draw.io MCP*
+## 10. 源码文件索引
+
+| 文件 | 职责 |
+| --- | --- |
+| `vllm/v1/core/sched/interface.py:36` | `SchedulerInterface` 统一契约 |
+| `vllm/v1/core/sched/scheduler.py:68` | `Scheduler` 同步核心（~128KB） |
+| `vllm/v1/core/sched/scheduler.py:399` | `schedule()` 主循环 |
+| `vllm/v1/core/sched/scheduler.py:502` | 异步 token 数公式（含 `num_output_placeholders`） |
+| `vllm/v1/core/sched/scheduler.py:1231` | 基类 `_update_after_schedule`（前进 `num_computed_tokens`） |
+| `vllm/v1/core/sched/async_scheduler.py:12` | `AsyncScheduler`（重写 3 方法） |
+| `vllm/v1/request.py:141` | `num_output_placeholders` 等异步字段定义 |
+| `vllm/v1/worker/gpu_input_batch.py:1037` | output `-1` 占位替换 |
+| `vllm/v1/worker/gpu_input_batch.py:1066` | `update_async_spec_token_ids`（-1→真实 draft） |
+| `vllm/config/scheduler.py:158` | `async_scheduling` 开关 |
+| `vllm/config/scheduler.py:180` | `get_scheduler_cls()` 选择 Scheduler/AsyncScheduler |
+| `vllm/config/vllm.py:992` | `async_scheduling` 自动决策逻辑 |
+
+---
+
+## 11. 快速问题解答（FAQ）
+
+**Q1：Placeholder token 到底是什么？一句话。**
+A：调度器在 GPU 真实结果还没回来时，为"即将产生但还不知道数量/值"的 token 提前占好的位置与 KV 槽位。它有两种形式：(A) 计数 `num_output_placeholders`（数量未知）；(B) 字面 `-1`（`spec_token_ids` / `output_token_ids` 里，值未知）。
+
+**Q2：为什么 decode 每步才 1 个 token，还要 placeholder？**
+A：因为异步下调度 N+1 时，N 的采样结果未回传。调度器必须"假设 N 产生了 1 个 token"才能正确安排 N+1 的位置，否则它不知道序列已经到哪了。placeholder 就是那个"假设"。
+
+**Q3：`num_output_placeholders` 会算错吗？**
+A：暂时的"超前"是设计预期。当真实结果回来（`_update_request_with_output`）会扣减，并有 `assert >= 0`。社区早期确实发现过相关边界 bug，但机制本身是正确的"假设→校正"模式。
+
+**Q4：`-1` 字面占位和 KV offloading 的"等待 KV"是一回事吗？**
+A：**不是**。`-1` 占位属于**投机解码 / 异步调度**（token 的 id 或数量未知）。而 KV offloading 的 `WAITING_FOR_REMOTE_KVS` 是另一套机制（KV 块还在从 CPU/磁盘异步加载、未就绪）。两者都涉及"异步等待"，但等待的对象完全不同：一个是 token 值，一个是 KV 数据。
+
+**Q5：AsyncScheduler 和 Scheduler 的 `schedule()` 有什么不同？**
+A：完全一样，`AsyncScheduler` 直接继承父类的 `schedule()`。区别只在调度**之后**：`_update_after_schedule` 多做了乐观占位。所以它被称为"薄层"（仅 76 行）。
+
+**Q6：什么时候会用到 `spec_token_ids=[-1]`？**
+A：仅在**投机解码 + 异步调度**组合下。调度 step N+1 时，N 的 draft token 还没产生，draft id 未知，故用 `-1` 占位；worker 在 forward 前用 N 真实产生的 draft id 替换（`update_async_spec_token_ids`）。

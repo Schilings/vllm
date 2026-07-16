@@ -411,10 +411,14 @@ class Scheduler(SchedulerInterface):
         # and the "jump decoding" optimization in the future.
 
         # -- 本步 tracker 清空 --
-        scheduled_new_reqs: list[Request] = []   # 首次从 waiting 进入的请求
-        scheduled_resumed_reqs: list[Request] = []  # 被抢占后恢复的请求
-        scheduled_running_reqs: list[Request] = []  # running 队列中本步继续执行的请求
-        preempted_reqs: list[Request] = []          # 本步被抢占的请求
+        # 首次从 waiting 进入的请求
+        scheduled_new_reqs: list[Request] = []
+        # 被抢占后恢复的请求
+        scheduled_resumed_reqs: list[Request] = []
+        # running 队列中本步继续执行的请求
+        scheduled_running_reqs: list[Request] = []
+        # 本步被抢占的请求
+        preempted_reqs: list[Request] = []
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
