@@ -81,7 +81,7 @@ graph TD
         OCS["OffloadingConnectorScheduler<br/>(scheduler.py:319)"]
         MGR["OffloadingManager<br/>CPUOffloadingManager / TieringOffloadingManager"]
         OC -->|role=SCHEDULER| OCS
-        OCS -->|spec.get_manager()| MGR
+        OCS -->|spec.get_manager| MGR
     end
 
     subgraph L3["Worker 进程"]
@@ -89,7 +89,7 @@ graph TD
         WKR["CPUOffloadingWorker<br/>(gpu_worker.py:468)"]
         H["SingleDirectionOffloadingHandler<br/>transfer_async (gpu_worker.py:240)"]
         OC -->|role=WORKER| OCW
-        OCW -->|spec.get_worker()| WKR
+        OCW -->|spec.get_worker| WKR
         WKR --> H
     end
 

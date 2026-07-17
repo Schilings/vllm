@@ -186,9 +186,64 @@ assert request.num_output_placeholders >= 0
 ```
 
 > 用具体数字走一遍（decode，每步 1 token，无 spec）：
-> - step N 调度后：`num_computed_tokens` 前进到 10，`num_output_placeholders` = 1（乐观预留 1）。
-> - step N+1 调度时（GPU 还没回传）：`num_new = num_tokens_with_spec(=11) + placeholders(=1) - computed(=10) = 2`？不——实际 `num_tokens_with_spec` 此时已包含那个未确认 token，所以 `num_new = 11+1-10 = 2` 表示"再算 1 个新 token + 确认之前的 1 个"。核心就是：**placeholder 让调度器能"看得到"还没回传的那 1 个 token，从而正确安排后续位置。**
-> - step N 的 GPU 结果回来：真生成了 1 个 token → `num_output_placeholders` 扣回 0。
+> - step N 调度后：`num_computed_tokens` 前进到 10（`_update_after_schedule` 乐观前进，scheduler.py:1244），`num_output_placeholders` = 1（async 乐观预留，async_scheduler.py:39-41），`num_tokens_with_spec` = 10（step N-1 的输出已回传，已 append 到 `_all_token_ids`）。
+> - step N+1 调度时（GPU 还没回传）：`_all_token_ids` 尚未 append step N 采出的 token（输出没回 CPU），所以 `num_tokens_with_spec` 仍是 **10**（不是 11）。`num_new = num_tokens_with_spec(=10) + placeholders(=1) - computed(=10) = 1`。
+>   - **这 1 个 token 就是 step N 那个"未确认"token 的 KV 位置**（position 10）。它的 id 不在 `_all_token_ids` 里，而在 GPU 显存的 `prev_sampled_token_ids` 中——worker 做 embedding 时直接读 GPU 上的 prev_sampled_token_ids，不绕道 CPU（见 §4b）。
+>   - 没有 placeholder 的话 `10 - 10 = 0`，调度器会以为"没事可干"；**+1 的 placeholder 把 `num_new` 从 0 顶到 1，逼调度器排那 1 个未确认位置**。"下一个新 token"要等这一步 forward 之后才产生，此刻根本还排不了。
+> - step N 的 GPU 结果回来：`_update_request_with_output`（async_scheduler.py:62-67）把真 token append 进 `_all_token_ids`，并 `num_output_placeholders -= 1` 扣回 0；此时 `num_tokens_with_spec` 才涨到 11。
+
+### 4.1b step N 的 GPU 结果在哪里处理（与 `schedule()` 完全解耦）
+
+异步调度的核心就是：**GPU 结果的处理（`update_from_output`）和下一步的 `schedule()` 是两条独立路径，谁先谁后不确定。** 上一步的 token 可能要等好几步之后才回传 CPU。
+
+**调用入口**（`vllm/v1/engine/core.py`，两个路径都走 `scheduler.update_from_output`）：
+
+```python
+# core.py:504  —— 普通 step()
+engine_core_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
+# core.py:605  —— step_with_batch_queue()
+engine_core_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
+```
+
+其中 `model_output` 来自 `future.result()`（GPU 计算完成的 future）或 `sample_tokens()` 的采样结果——即 step N 的 GPU 输出。
+
+**`Scheduler.update_from_output` 内部**（`scheduler.py:1566`）：遍历 `scheduler_output.num_scheduled_tokens`，对每个请求最终调用 `_update_request_with_output`（`scheduler.py:1697`）。**这一步才是 `_all_token_ids` 真正增长、让 `num_tokens_with_spec` 从 10 涨到 11 的地方**：
+
+```python
+# scheduler.py:1697
+new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
+```
+
+**`AsyncScheduler._update_request_with_output` 的重写**（`async_scheduler.py:51-75`）做三件事，正好闭环 §4.1 的占位逻辑：
+
+```python
+def _update_request_with_output(self, request, new_token_ids):
+    if request.async_tokens_to_discard > 0:        # 丢弃被抢占的陈旧帧
+        request.async_tokens_to_discard -= 1
+        return [], False
+    # ① 父类：append_output_token_ids → _all_token_ids 增长
+    #    → num_tokens_with_spec 从 10 涨到 11
+    new_token_ids, stopped = super()._update_request_with_output(request, new_token_ids)
+    # ② 扣回占位：num_output_placeholders -= 1（从 1 回到 0）
+    request.num_output_placeholders -= len(new_token_ids)
+    # ③ 把新 token 的 KV 正式写进前缀缓存
+    if status_before_update == RequestStatus.RUNNING:
+        self.kv_cache_manager.cache_blocks(
+            request, request.num_computed_tokens - request.num_output_placeholders
+        )
+```
+
+**关键时序：为什么 step N+1 调度时 `_all_token_ids` 还是 10**
+
+```
+step N:   schedule()  ──┐  (乐观前进 num_computed_tokens=10, 加 placeholder=1)
+                        │  GPU 异步执行（future 挂起，不阻塞）
+step N+1: schedule()  ──┘  (此时 update_from_output 还没跑 → _all_token_ids 仍是 10)
+            ...
+GPU 完成 → update_from_output() 才跑 → append token, num_tokens_with_spec 涨到 11
+```
+
+`schedule()` 完全可能在 `update_from_output()` 之前又被调用多次（尤其 multi-step / PP 微批场景），所以 step N+1 调度瞬间 `_all_token_ids` 仍停在 step N-1 的输出（=10），未确认 token 的 id 只在 GPU 显存 `prev_sampled_token_ids` 里——这正是 §4.1 推演里 `num_tokens_with_spec=10`（而非 11）的根本原因。
 
 ### 4.2 字面型占位 (B)：`spec_token_ids = [-1, -1, ...]`
 
@@ -236,6 +291,15 @@ V2 runner + pipeline parallel 下，同一请求的两次 decode 必须间隔 `p
 | **数据衔接**（上一步 token 喂给这一步 forward） | GPU / worker | ✅ 需要，但值就在 GPU 上，原地拷 |
 
 ### 4b.2 数据流（带行号）
+
+> **先回答你的两个疑问：**
+>
+> **② step N+1 的 `input_batch` 怎么会有上一步的 `prev_sampled_token_ids`？**
+> 因为 `self.input_batch` 是 `GPUModelRunner` 的**持久成员对象（Persistent Batch）**：在 runner `__init__` 时创建**一次**，之后每个 step 只**增量更新它的槽位**（增删请求、改字段），**从不重建实例**。所以"上一步的 batch"和"这一步的 batch"是**同一个 Python 对象**——不存在"上一步的 input_batch 传给这一步"，它压根没换过。
+> 因此 step N 末尾 `self.input_batch.prev_sampled_token_ids = <GPU张量>` 挂上去后，step N+1 读到的就是同一个字段（带 `prev_` 前缀是站在"下一步"视角的命名：对 step N 是"刚采的"，对 step N+1 就是"上一步的"）。
+>
+> **① 采样结果不是放在自己 batch 上吗？**
+> 对，就是放在**自己这个持久 batch** 上——`self.input_batch.prev_sampled_token_ids = sampled_token_ids`（`gpu_model_runner.py:3712`）。它**不做 D2H 拷贝**，GPU 张量原地留着，只是把引用记在 batch 的字段里。名字里的 `prev_` 是给下一步看的，对当前步它就是"刚采的 token"。
 
 **① step N 采样后：token 留 GPU，存为 `prev_sampled_token_ids`**
 
