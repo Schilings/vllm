@@ -235,16 +235,20 @@ class RequestGroupState:
 @dataclass(slots=True)
 class RequestOffloadState:
     config: SchedulerOffloadConfig
+    #
     req: Request
     req_context: ReqContext
     offloading_context: RequestOffloadingContext
+    #
     group_states: tuple[RequestGroupState, ...] = field(init=False)
     # upper bound on tokens to offload for this request; None means no cap
     max_offload_tokens: int | None = None
     # number of hits in the GPU cache
+    # local prefix caching的命中长度
     num_locally_computed_tokens: int = 0
     # In-flight job IDs. Per the connector's invariant, at any given time
     # this contains either a single load job, or one or more store jobs.
+    # 记录请求的当前进行中的传输任务
     transfer_jobs: set[int] = field(default_factory=set)
 
     def __post_init__(self) -> None:
@@ -268,17 +272,34 @@ class RequestOffloadState:
             )
 
     def update_offload_keys(self) -> None:
+        """把请求新增的 block_hashes 增量转成每个 offloaded block 一个 offload key。
+
+        粒度换算：block_hashes 以 hash_block_size 个 token 为一块（细粒度），而一个
+        offloaded block 跨 offloaded_block_size 个 token（粗粒度）。二者关系为
+        hash_block_size_factor = offloaded_block_size // hash_block_size，即 f 个
+        block_hash 合成 1 个 offloaded block，并取其“最后一个”哈希作为该 block 的代表键。
+
+        本方法可被反复调用，只为尚未处理的新 offloaded block 补 key（幂等增量）。
+        """
         for group_config, group_state in zip(
             self.config.kv_group_configs, self.group_states
         ):
+            f = group_config.hash_block_size_factor
+            # 已处理的 offloaded block 数 n = len(offload_keys)。
+            # 起点 f*n + f - 1 = (n+1)*f - 1 恰为 offloaded block n 的最后一个哈希下标；
+            # 之后以 f 为步长跳到每个后续 offloaded block 的末尾哈希，直到 block_hashes 末尾。
+            # 设 f=2，block_hashes = [h0,h1,h2,h3,h4,h5]（6 个哈希 → 3 个 offloaded block）。
+            # 若 offload_keys 已有 1 项（n=1，block 0 已处理）：
+            # start = 2·1+2-1 = 3，step 2 → 下标 3, 5 → 哈希 h3, h5（即 block 1、block 2 的代表哈希）
+            # 追加 make_offload_key(h3, g)、make_offload_key(h5, g)
+            # 之后 offload_keys 长度变为 3，与 6//2 对齐。
             for req_block_hash in islice(
                 self.req.block_hashes,
-                group_config.hash_block_size_factor * len(group_state.offload_keys)
-                + group_config.hash_block_size_factor
-                - 1,
+                f * len(group_state.offload_keys) + f - 1,
                 None,
-                group_config.hash_block_size_factor,
+                f,
             ):
+                # 用「块内容哈希 + group 下标」组成全局唯一 key，供后续 lookup/store。
                 group_state.offload_keys.append(
                     make_offload_key(req_block_hash, group_config.group_idx)
                 )
@@ -323,6 +344,7 @@ class OffloadingConnectorScheduler:
         self,
         spec: OffloadingSpec,
     ):
+        #
         self.config = SchedulerOffloadConfig.from_spec(spec)
         self.manager: OffloadingManager = spec.get_manager()
         self._connector_stats: OffloadingConnectorStats | None = None
@@ -495,6 +517,7 @@ class OffloadingConnectorScheduler:
             looked_up_sliding_window: bool = False
             groups_iter = iter(lookup_groups)
             lookup_groups = ()
+            # 每个group进行prefix caching
             for group_idx in groups_iter:
                 group_config: GroupOffloadConfig = self.config.kv_group_configs[
                     group_idx
@@ -513,6 +536,7 @@ class OffloadingConnectorScheduler:
                 )
 
                 # Constrain to block-aligned boundary for this group
+                # max_hit_size_tokens 需要取 多个groups的最小值
                 max_hit_size_tokens = min(
                     max_hit_size_tokens, len(offload_keys) * offloaded_block_size
                 )
@@ -520,6 +544,7 @@ class OffloadingConnectorScheduler:
                     # we can only load less than a block, better skip
                     return 0
 
+                # sliding window size 向上取整 几个cpu block
                 sliding_window_size_in_blocks = (
                     group_config.sliding_window_size_in_blocks
                 )
@@ -533,6 +558,7 @@ class OffloadingConnectorScheduler:
                         len(offload_keys) * offloaded_block_size,
                     )
 
+                # 需要进行prefix caching匹配的范围
                 num_blocks = min(
                     cdiv(query_max, offloaded_block_size), len(offload_keys)
                 )
@@ -543,6 +569,7 @@ class OffloadingConnectorScheduler:
                 # have backend-confirmed hits
                 num_hit_blocks: int | None
                 if sliding_window_size_in_blocks is None:
+                    # FullAttention越长越好
                     num_hit_blocks = self._maximal_prefix_lookup(
                         offload_keys, req_status.req_context
                     )
@@ -550,6 +577,7 @@ class OffloadingConnectorScheduler:
                     required_window = sliding_window_size_in_blocks
                     if is_eagle_unverified:
                         required_window += 1
+                    # SlidingWindowAttention要么短连续要么达到 sliding_window_size_in_blocks 个cpu block
                     num_hit_blocks = self._sliding_window_lookup(
                         offload_keys,
                         required_window,
@@ -565,11 +593,13 @@ class OffloadingConnectorScheduler:
                         num_hit_blocks -= 1
                         eagle_verified.add(group_idx)
 
+                    # max_hit_size_tokens 需要取 多个groups的最小值
                     max_hit_size_tokens = min(
                         max_hit_size_tokens,
                         offloaded_block_size * (start_block_idx + num_hit_blocks),
                     )
 
+                # max_hit_size_tokens 是 gpu+cpu 的prefix cache总长度
                 new_num_hit_tokens = max_hit_size_tokens - num_computed_tokens
                 if new_num_hit_tokens < offloaded_block_size:
                     # we can only load less than a block, better skip
@@ -635,14 +665,18 @@ class OffloadingConnectorScheduler:
 
     def on_new_request(self, request: Request) -> None:
         """Called when a new request is added to the scheduler."""
+        # Context 1
         req_context = _create_req_context(request)
+        # Context 2
         offloading_context = self.manager.on_new_request(req_context)
+        # State
         req_status = RequestOffloadState(
             config=self.config,
             req=request,
             req_context=req_context,
             offloading_context=offloading_context,
         )
+        # 记录state
         self._req_status[request.request_id] = req_status
 
     def get_num_new_matched_tokens(
@@ -667,10 +701,12 @@ class OffloadingConnectorScheduler:
                 - `True` if tokens will be loaded asynchronously
                   (between scheduler steps).
         """
+        # 准备进行ext prefix caching，先清空
         req_status = self._req_status[request.request_id]
         for group_state in req_status.group_states:
             group_state.block_ids.clear()
 
+        # 该请求有
         if req_status.transfer_jobs:
             logger.debug(
                 "Delaying request %s since it still has in-flight transfers",
@@ -678,16 +714,24 @@ class OffloadingConnectorScheduler:
             )
             return None, False
 
+        # 进行prefix caching，肯定得先有hash值
+        # cpu block size更大，从gpu block size中取出尾部hash代表cpu block的hash
         req_status.update_offload_keys()
+        # 在这之前的local prefix caching命中长度
         req_status.num_locally_computed_tokens = num_computed_tokens
 
         num_hit_tokens: int | None
         if request.skip_reading_prefix_cache:
             num_hit_tokens = 0
         else:
+            # ext prefix cache hit长度
+            # 使用cpu block hash
             num_hit_tokens = self._lookup(req_status)
+
+        # 记录prefix cache总长度（local + external）
         req_status.update_num_hit_blocks(num_computed_tokens + (num_hit_tokens or 0))
 
+        #
         self._touch(req_status)
 
         return num_hit_tokens, bool(num_hit_tokens)
