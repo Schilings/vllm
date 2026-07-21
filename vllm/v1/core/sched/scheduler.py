@@ -2095,6 +2095,7 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            # kv connector hook
             if self.connector is not None:
                 self.connector.on_new_request(request)
             if self.log_stats:

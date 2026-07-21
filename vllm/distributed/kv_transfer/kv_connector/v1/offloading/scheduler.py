@@ -780,7 +780,9 @@ class OffloadingConnectorScheduler:
         num_locally_computed_tokens = req_status.num_locally_computed_tokens
         num_cached_tokens = num_locally_computed_tokens + num_external_tokens
 
+        # 记录当前request哪些block hash，需要从cpu load
         keys_to_load: list[OffloadKey] = []
+        #
         dst_block_ids: list[int] = []
         # per group
         group_sizes: list[int] = []
@@ -790,6 +792,7 @@ class OffloadingConnectorScheduler:
             req_status.group_states,
             blocks.blocks,
         ):
+            # 记录当前调度该request分配的新block id
             self._current_batch_allocated_block_ids.update(
                 block.block_id for block in group_blocks if block.block_id != 0
             )
@@ -797,11 +800,15 @@ class OffloadingConnectorScheduler:
             gpu_block_size = group_config.gpu_block_size
             offloaded_block_size = group_config.offloaded_block_size
             offload_keys = group_state.offload_keys
+
+            # prefix cache要存放在gpu block数，前一半在gpu，后一半需要从cpu load
             num_gpu_blocks = cdiv(num_cached_tokens, gpu_block_size)
 
             assert len(group_blocks) >= num_gpu_blocks
             num_locally_computed_gpu_blocks = num_gpu_blocks
             # Skip null placeholder blocks (used for sliding window or mamba padding).
+            # prefix cache要存放在gpu block数，前一半在gpu，后一半需要从cpu load
+            # 遍历找到前一半在gpu的block边界，前一半在gpu的block数
             for i, block in enumerate(group_blocks[:num_gpu_blocks]):
                 if not block.is_null and block.block_hash is None:
                     num_locally_computed_gpu_blocks = i
@@ -811,6 +818,7 @@ class OffloadingConnectorScheduler:
                 num_locally_computed_tokens
                 <= num_locally_computed_gpu_blocks * gpu_block_size
             )
+            # 后一半需要从cpu load的block数
             num_pending_gpu_blocks = num_gpu_blocks - num_locally_computed_gpu_blocks
 
             if group_config.sliding_window_size_in_blocks is not None:
@@ -820,14 +828,17 @@ class OffloadingConnectorScheduler:
                     * self.config.block_size_factor
                 )
 
+            # cpu block size不一样，看看cache拆分cpu block有多少个
             num_blocks = cdiv(num_cached_tokens, offloaded_block_size)
             assert len(offload_keys) >= num_blocks
             if num_pending_gpu_blocks:
                 start_block_idx = (
                     num_locally_computed_gpu_blocks // self.config.block_size_factor
                 )
+                # 确定需要从cpu load的block hash
                 keys_to_load.extend(offload_keys[start_block_idx:num_blocks])
 
+            # 目标是 后半部分的空的gpu blocks
             dst_block_ids.extend(
                 block.block_id
                 for block in group_blocks[
@@ -843,11 +854,13 @@ class OffloadingConnectorScheduler:
             if req_status.offloading_context.policy == OffloadPolicy.BLOCK_LEVEL:
                 group_state.next_stored_block_idx = num_blocks
 
+        # 来源是 后半部分对应的cpu blocks
         src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
         dst_spec = GPULoadStoreSpec(
             dst_block_ids, group_sizes=group_sizes, block_indices=block_indices
         )
 
+        # 提交传输任务
         load_job_id = self._generate_job_id()
         self._current_batch_load_jobs[load_job_id] = TransferJob(
             req_id=request.request_id,
@@ -855,6 +868,7 @@ class OffloadingConnectorScheduler:
             dst_spec=dst_spec,
         )
         # a load can only be issued when no other jobs are pending.
+        # 同一个Request的传输任务，有且同时只能有一个，不管是是load还是store
         assert not req_status.transfer_jobs
         req_status.transfer_jobs.add(load_job_id)
         self._jobs[load_job_id] = TransferJobStatus(
@@ -864,6 +878,7 @@ class OffloadingConnectorScheduler:
             is_store=False,
         )
 
+        # 记录哪些cpu block正常load中
         if self._blocks_being_loaded is not None:
             self._blocks_being_loaded.update(keys_to_load)
 
