@@ -205,6 +205,7 @@ class SingleDirectionOffloadingHandler:
             assert cpu_tensor.device.type == "cpu"
             _, gpu_page_size = gpu_tensor.shape
             _, cpu_page_size = cpu_tensor.shape
+            # cpu block size一定刚好是 gpu block size的整数倍
             assert cpu_page_size == gpu_page_size * block_size_factor
 
         self.src_tensors: list[torch.Tensor] = (

@@ -1707,33 +1707,55 @@ def get_kv_cache_groups(
     Returns:
         The generated KVCacheGroups
     """
+    # 本函数是一个"分流器"：根据各层 KV cache spec 的混合程度，把模型所有层
+    # 归并成若干个 KVCacheGroupSpec。输入 kv_cache_spec 是 {层名: 该层KVCacheSpec}
+    # 的字典。下面依次判断：关闭hybrid / 无注意力 / 全uniform / 同类型异hidden /
+    # DeepSeekV4 / 通用混合(如 Full+SWA)，逐级收窄到合适的分组策略。
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
+        # 老路径（扁平化）：把所有 SlidingWindowSpec 强制转成 FullAttentionSpec，
+        # 使所有层共用同一张 block table（窗口限制由 attention metadata 兜底）。
         unify_hybrid_kv_cache_specs(kv_cache_spec)
 
     if is_kv_cache_type_attention_free(kv_cache_spec):
+        # 无注意力模型（kv_cache_spec 为空字典）：返回空列表，
+        # 交由 KVCacheManager 特殊处理。
         # This returns an empty list to allow for the KVCacheManager to handle
         # attention free models.
         return []
 
     if is_kv_cache_spec_uniform(kv_cache_spec):
+        # 所有层 spec 完全相同（注意：带/不带 sliding window 的 FullAttentionSpec
+        # 被视为同一类型）。绝大多数模型走这里：所有层放进 1 个 group。
         # KV cache of all layers are the same, which is true for
         # most models. Allocate the same amount of memory for
         # each layer.
         return _get_kv_cache_groups_uniform_spec(kv_cache_spec)
     elif uniform_spec := UniformTypeKVCacheSpecs.from_specs(kv_cache_spec):
+        # 所有层 attention 类型相同（如全是 Full，或全是窗口一致的 SWA），
+        # 只是 hidden size 可能不同。from_specs 仅在类型一致时返回非 None。
+        # 仍合并成 1 个 group，但 group spec 保留逐层差异。
         # All layers need the same number of token slots (e.g., all layers are
         # full attention, or all layers are sliding window attention with the
         # same window size). Put all layers into one group.
         return _get_kv_cache_groups_uniform_type(uniform_spec)
     elif grouped_specs := group_and_unify_kv_cache_specs(kv_cache_spec):
+        # DeepSeekV4 特例：所有层 token 数需求相同，但类型/窗口尺寸各异
+        # （MLA + 多种 SWA）。按 layer-tuple 切分成多个 UniformTypeKVCacheSpecs。
         # DeepseekV4 case: All layers need the same number of token slots,
         # yet some layers are full attention while others are sliding window
         # attention in different sizes. Need to group layers into multiple
         # UniformTypeKVCacheSpecs.
         kv_cache_groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
+        # 为 eagle speculative decoding 标记/对齐 group（DSv4 专用）。
         _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, kv_cache_groups)
         return kv_cache_groups
 
+    # ===== 通用混合注意力分支（如 Full + SWA 类型不同，且非 DSv4）=====
+    # HiddenStateCacheSpec 是投机解码（EAGLE 类 extract_hidden_states）里"借 KV
+    # cache 机制缓存模型 hidden states"的特殊标记层：它不算注意力、没有 K/V 双份
+    # 维度，维度被偷换成 (num_hidden_states, hidden_size)，且 page 语义与普通注意
+    # 力层不同。因此把它先抽出来，避免干扰后续物理 page 大小统一与分组逻辑。
+    # （注册表见 single_type_kv_cache_manager.py：它不参与分组，base_spec 仅是占位）
     # Pull HiddenStateCacheSpec layers out before the general multi-group
     # path so they don't affect page-size unification or grouping.
     hidden_specs = {
@@ -1745,13 +1767,22 @@ def get_kv_cache_groups(
         if not isinstance(v, HiddenStateCacheSpec)
     }
 
+    # KVCacheManager 只能分配"单一大小"的 block，因此必须把所有层的物理 page
+    # 字节数统一。若无法统一（如不能整除且 backend 不支持 padded page）会直接报错。
     # As KVCacheManager can only allocate memory of one size, we need to unify
     # the page size of the layers. For cases cannot be unified, this function
     # will raise an error.
     filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
+    # 按 attention 类型把层切成多个 group（每组独立 block_table，但 page 字节数相同）。
     groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
 
+    # 把前面抽出的 hidden-state 层加回来，并把它们的 block 对齐到公共 page 大小：
+    # 用 common_page / 每层每 token 字节数 反推新的 block_size，使其 page 与
+    # 注意力层保持一致，避免 KVCacheManager 分配出不同大小的 block。
     # Add hidden-state layers back with page aligned to the common page.
+    # 把前面抽出的 hidden-state 层加回来：用公共 page / 该层每 token 字节数反推
+    # block_size，使其 page 与注意力层保持一致（避免 KVCacheManager 分配出不同
+    # 大小的 block），并以 replace 写入 page_size_padded，最后自成一个 group。
     if hidden_specs:
         common_page = get_uniform_page_size([g.kv_cache_spec for g in groups])
         for name, spec in hidden_specs.items():
