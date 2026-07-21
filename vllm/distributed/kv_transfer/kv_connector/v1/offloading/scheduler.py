@@ -417,6 +417,7 @@ class OffloadingConnectorScheduler:
         hit_count = 0
         defer_lookup = False
         for key in keys:
+            # 查看存储的cpu blocks是否含有
             match self.manager.lookup(key, req_context):
                 case LookupResult.HIT:
                     hit_count += 1
@@ -427,8 +428,10 @@ class OffloadingConnectorScheduler:
                     # Don't break: keep scanning to let manager kick off
                     # async lookups (until a miss is detected).
                     defer_lookup = True
+                # 中断
                 case LookupResult.MISS:
                     break
+        # 如果有一块还没传输完成，就返回None，甚至不是返回0
         return hit_count if not defer_lookup else None
 
     def _sliding_window_lookup(
@@ -460,8 +463,13 @@ class OffloadingConnectorScheduler:
                     consecutive_hits = 0
                 case LookupResult.MISS:
                     consecutive_hits = 0
+
+            # 一旦匹配到window大小，可以直接返回
             if consecutive_hits == sliding_window_size:
+                # 返回的是 idx + sliding_window_size 表示前面所有block都被hit了
                 return idx + sliding_window_size if not defer_lookup else None
+
+        # 如果有一块还没传输完成，就返回None，甚至不是返回0
         return consecutive_hits if not defer_lookup else None
 
     def _touch(self, req_status: RequestOffloadState):
@@ -513,10 +521,12 @@ class OffloadingConnectorScheduler:
         # in the current convergence iteration. Reset when a non-eagle group
         # tightens the hit boundary, requiring a fresh pop.
         eagle_verified: set[int] = set()
+        # 循环：找到多个kv group都能接受的最大hit length
         while lookup_groups:
             looked_up_sliding_window: bool = False
             groups_iter = iter(lookup_groups)
             lookup_groups = ()
+            # hybird attention，多个kv group需要prefix caching
             # 每个group进行prefix caching
             for group_idx in groups_iter:
                 group_config: GroupOffloadConfig = self.config.kv_group_configs[
@@ -524,6 +534,7 @@ class OffloadingConnectorScheduler:
                 ]
                 group_state: RequestGroupState = req_status.group_states[group_idx]
                 offloaded_block_size = group_config.offloaded_block_size
+                # 进行prefix caching，肯定得先有hash值 ---> offload_keys
                 offload_keys = group_state.offload_keys
 
                 assert (
@@ -562,7 +573,9 @@ class OffloadingConnectorScheduler:
                 num_blocks = min(
                     cdiv(query_max, offloaded_block_size), len(offload_keys)
                 )
+                # 前面一部分是已经在gpu上存在的了，不需要做cpu的prefix caching
                 start_block_idx = num_computed_tokens // offloaded_block_size
+                # 只对后面部分进行cpu的prefix caching
                 offload_keys = offload_keys[start_block_idx:num_blocks]
 
                 # end index (in the sliced offload_keys) up to which we
@@ -570,14 +583,18 @@ class OffloadingConnectorScheduler:
                 num_hit_blocks: int | None
                 if sliding_window_size_in_blocks is None:
                     # FullAttention越长越好
+                    # 如果有一块还没传输完成，就返回None，甚至不是返回0
                     num_hit_blocks = self._maximal_prefix_lookup(
                         offload_keys, req_status.req_context
                     )
                 else:
+                    # SlidingWindowAttention要么短连续要么达到 sliding_window_size_in_blocks 个cpu block
+                    # 如果有一块还没传输完成，就返回None，甚至不是返回0
+                    # 返回的是 idx + sliding_window_size
+                    # 表示前面offload_keys[:idx + sliding_window_size]所有block都被hit了
                     required_window = sliding_window_size_in_blocks
                     if is_eagle_unverified:
                         required_window += 1
-                    # SlidingWindowAttention要么短连续要么达到 sliding_window_size_in_blocks 个cpu block
                     num_hit_blocks = self._sliding_window_lookup(
                         offload_keys,
                         required_window,
@@ -586,6 +603,7 @@ class OffloadingConnectorScheduler:
                 if num_hit_blocks == 0:
                     return 0
 
+                # 如果有一块还没传输完成，就返回None，甚至不是返回0
                 if num_hit_blocks is None:
                     defer_lookup = True
                 else:
@@ -596,15 +614,20 @@ class OffloadingConnectorScheduler:
                     # max_hit_size_tokens 需要取 多个groups的最小值
                     max_hit_size_tokens = min(
                         max_hit_size_tokens,
+                        # 这里把前面gpu的prefix cache也算上了
                         offloaded_block_size * (start_block_idx + num_hit_blocks),
                     )
 
                 # max_hit_size_tokens 是 gpu+cpu 的prefix cache总长度
+                # 减去gpu的就是cpu的 --> new_num_hit_tokens
                 new_num_hit_tokens = max_hit_size_tokens - num_computed_tokens
+
+                # 一个block都hit不满
                 if new_num_hit_tokens < offloaded_block_size:
                     # we can only load less than a block, better skip
                     return 0
 
+                # 小于上一次hit，说明hit的范围变小了，需要重新进行prefix caching
                 if new_num_hit_tokens < num_hit_tokens:
                     if not group_config.is_eagle_group:
                         eagle_verified.clear()
@@ -629,6 +652,8 @@ class OffloadingConnectorScheduler:
             return None
 
         # possibly delay request if any of the hit blocks is already being loaded
+        # _blocks_being_loaded 跟踪「当前正在从 CPU 加载到 GPU 的 block 集合」，
+        # 防止对同一个 prefix-cached block 发起重复并发加载，导致 CUDA stream 竞态
         if self._blocks_being_loaded:
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
@@ -642,9 +667,15 @@ class OffloadingConnectorScheduler:
                     num_computed_tokens + num_hit_tokens, offloaded_block_size
                 )
                 start_block_idx = num_computed_tokens // offloaded_block_size
+                # 只看hit中的cpu部分的block hash
                 offload_keys = offload_keys[start_block_idx:num_blocks]
+                # 如果是swa，只看hit中的尾部window内的block
                 if sliding_window_size_in_blocks is not None:
                     offload_keys = offload_keys[-sliding_window_size_in_blocks:]
+
+                # 如果任何一个已经在 _blocks_being_loaded 里，就延迟这个请求，返回 None
+                # 说明有某个block正在从cpu加载到gpu，被这个请求hit中了，
+                # 为什么防止重复load，取消这个请求的cpu load
                 if any(key in self._blocks_being_loaded for key in offload_keys):
                     # hit blocks are being loaded, delay request
                     logger.debug(
@@ -661,6 +692,7 @@ class OffloadingConnectorScheduler:
             num_computed_tokens,
         )
 
+        # 最终返回的还是 cpu上命中的token数
         return num_hit_tokens
 
     def on_new_request(self, request: Request) -> None:
@@ -714,7 +746,7 @@ class OffloadingConnectorScheduler:
             )
             return None, False
 
-        # 进行prefix caching，肯定得先有hash值
+        # 进行prefix caching，肯定得先有hash值 ---> offload_keys
         # cpu block size更大，从gpu block size中取出尾部hash代表cpu block的hash
         req_status.update_offload_keys()
         # 在这之前的local prefix caching命中长度
@@ -725,13 +757,14 @@ class OffloadingConnectorScheduler:
             num_hit_tokens = 0
         else:
             # ext prefix cache hit长度
-            # 使用cpu block hash
+            # 使用cpu block hash ---> offload_keys
+            # 类似gpu prefix caching，使用hash在进行混合注意力的前缀匹配
             num_hit_tokens = self._lookup(req_status)
 
         # 记录prefix cache总长度（local + external）
         req_status.update_num_hit_blocks(num_computed_tokens + (num_hit_tokens or 0))
 
-        #
+        # 将命中的cpu block都标记lru最近使用，延迟被删
         self._touch(req_status)
 
         return num_hit_tokens, bool(num_hit_tokens)

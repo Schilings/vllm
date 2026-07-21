@@ -20,6 +20,7 @@ class LRUCachePolicy(CachePolicy):
 
     def __init__(self, cache_capacity: int):
         # Blocks with ref_cnt 0 (not participating in any loads/stores) ordered in LRU
+        # evictable_blocks 是按照 LRU 排序的，所以从头开始遍历, 头是最近未使用的，尾是最近使用的
         self.evictable_blocks: OrderedDict[OffloadKey, None] = OrderedDict()
         self.blocks: dict[OffloadKey, BlockStatus] = {}
 
@@ -41,7 +42,9 @@ class LRUCachePolicy(CachePolicy):
     @override
     def touch(self, keys: Iterable[OffloadKey]) -> None:
         for key in reversed(list(keys)):
+            # evictable_blocks 是按照 LRU 排序的，所以从头开始遍历, 头是最近未使用的，尾是最近使用的
             if key in self.evictable_blocks:
+                # 移到尾部，延缓被删
                 self.evictable_blocks.move_to_end(key)
             # active blocks are untouched as they are non-evictable now. They
             # will eventually reach the end of evictable_blocks when they finish.
@@ -59,6 +62,7 @@ class LRUCachePolicy(CachePolicy):
             return []
 
         candidates: list[tuple[OffloadKey, BlockStatus]] = []
+        # evictable_blocks 是按照 LRU 排序的，所以从头开始遍历
         for key, _ in self.evictable_blocks.items():
             if key in protected:
                 continue
