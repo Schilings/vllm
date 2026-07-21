@@ -498,24 +498,92 @@ if has_kv_transfer_group() and not is_profiling:
 
 调用链：`gpu_model_runner.py:7461` → `OffloadingConnector.register_kv_caches`（`offloading_connector.py:90`）→ `OffloadingConnectorWorker.register_kv_caches`（`worker.py:50`）。
 
-### 5.2 规范化为 `CanonicalKVCaches`（`worker.py:50-273`）
+### 5.2 规范化为 `CanonicalKVCaches`（`worker.py:50-293`）
 
-收到的 `kv_caches` 是 **per-layer 的 `(num_blocks, 2, block_size, H, D)` 张量字典**。offload worker 把它们重新解释为统一的 `(num_blocks, page_size_bytes)` int8 视图：
+收到的 `kv_caches` 是 **per-layer 张量字典**（`layer_name → 该层 GPU 上的 KV 张量`，形状由 attention backend 决定，如 `(num_blocks, block_size, H, D)`）。offload worker 的任务不是搬运，而是把它**重解释成一套"物理张量去重列表 + 逻辑层引用"的统一表示**，供 `CPUOffloadingWorker` 按组定位要传输的字节。
 
-- 对 `AttentionSpec` 层：
-  ```python
-  byte_offset = layer_kv_cache.storage_offset() * elem_size
-  block_stride_bytes = (layer_kv_cache.stride(0) * elem_size
-                        if layer_is_packed[layer_name] else page)
-  tensors_per_block[layer_name] = (
-      torch.tensor([], dtype=torch.int8, device=layer_kv_cache.device)
-      .set_(layer_kv_cache.untyped_storage(), byte_offset,
-            (num_blocks, page), (block_stride_bytes, 1)))
-  ```
-  **仅 view，不拷贝**——复用 GPU 上已有的 KV 显存。
-- **packed 特例**：若某 `kv_cache_tensor` 有 `block_stride` 且被多 layer 共享（如 DSv4），所有层落到 **1 个** `CanonicalKVCacheTensor`，用 `as_strided` 展成 `(num_blocks, block_stride)`。
-- **普通混合路径**：去重出 `block_tensors: list[CanonicalKVCacheTensor]`（每个 = 一个物理连续存储块）与 `block_data_refs`（每层指回哪个 tensor + 真实 page 字节），再聚合成 `group_data_refs`（**每个 KV cache group 由哪些 tensor/layer 组成**）。
-- 最终组装 `CanonicalKVCaches(tensors=block_tensors, group_data_refs=group_data_refs)` → `_init_worker` → `spec.get_worker(...)`。
+**前置：逐层建视图**（`:83-185`）。遍历所有 `kv_cache_group` 的每层：
+- `AttentionSpec` 层：`set_(untyped_storage, byte_offset, (num_blocks, page), (block_stride_bytes, 1))` 仅 view 不拷贝（`:116-149`）。
+- `MambaSpec` 层：从第一个 state 张量把整块 storage 重建成 `(num_blocks, page_size) int8` 视图（`:158-177`）。
+- 三个 per-layer 字典被填充：`tensors_per_block[layer_name]`（视图元组）、`page_size_bytes[layer_name]`（含 padding）、`unpadded_page_size_bytes[layer_name]`（真实字节）。
+
+**随后组装 `CanonicalKVCaches`**——分两条路：
+
+#### 路径 A：packed 快捷路径（DSv4 等，`block_stride>0`，`:187-217`）
+
+若某个 `kv_cache_tensor` 同时有 `block_stride` 且 `shared_by` 非空（多层拼进一块连续存储）：
+```python
+(tensor,) = tensors_per_block[shared_by[0]]      # 取第一个共享层的视图
+block_stride = tensor.stride(0)
+packed_tensor = tensor.as_strided((num_blocks, block_stride),
+                                  (block_stride, 1), storage_offset=0)
+CanonicalKVCaches(
+    [CanonicalKVCacheTensor(packed_tensor, block_stride)],   # 只有 1 个物理张量
+    [[CanonicalKVCacheRef(0, block_stride)]                  # 每个 group 都指向 tensor 0
+     for _ in kv_cache_config.kv_cache_groups],
+)
+```
+所有层 / 所有 group 共用这 **1 个** `CanonicalKVCacheTensor`，直接 `return`。
+
+#### 路径 B：普通布局去重 + 聚合（`:219-293`）
+
+这一步正是 `CanonicalKVCaches(tensors=block_tensors, group_data_refs=group_data_refs)` 的来历。核心是把"每层一个视图"压缩成"**去重后的唯一物理张量列表**"（物理视角）+ "**每层/每组指向哪些张量**"（逻辑视角）。
+
+**Step 1 — 遍历配置里的唯一物理张量**（`:223-238`）：
+```python
+block_tensors: list[CanonicalKVCacheTensor] = []
+block_data_refs: dict[str, list[CanonicalKVCacheRef]] = defaultdict(list)
+for kv_cache_tensor in kv_cache_config.kv_cache_tensors:   # 配置层去重后的物理张量
+    tensor_layer_names = [n for n in kv_cache_tensor.shared_by
+                          if n in tensors_per_block]        # 跳过空 shared_by 的保留槽位
+    if not tensor_layer_names:
+        continue
+```
+`kv_cache_config.kv_cache_tensors` 是**配置层就已经去过重**的物理张量清单（多层共享同一存储则只列一次）。`shared_by` 列出共享它的层；这里再过滤掉"配置预留但模型没有该层"的空槽位。
+
+**Step 2 — 同物理张量上的层必须完全一致**（`:240-250`）：所有共享层的 `data_ptr` / `stride` 必须相同，否则无法安全统一成一个 `CanonicalKVCacheTensor`。
+
+**Step 3 — 登记物理张量与每层的引用**（`:252-273`）：
+```python
+first_layer_name = tensor_layer_names[0]
+for tensor in tensors_per_block[first_layer_name]:
+    block_tensors.append(CanonicalKVCacheTensor(          # 物理张量列表里加一项
+        tensor=tensor, page_size_bytes=page_size_bytes[first_layer_name]))
+    curr_tensor_idx = len(block_tensors) - 1             # 它在列表中的下标
+    for layer_name in tensor_layer_names:                # 所有共享层都指回它
+        block_data_refs[layer_name].append(CanonicalKVCacheRef(
+            tensor_idx=curr_tensor_idx,                  # 指向 block_tensors 的第几项
+            page_size_bytes=unpadded_page_size_bytes[layer_name]))  # 真实(未padding)字节
+```
+于是 `block_tensors` 是**去重后的唯一物理张量列表**（下标即 `tensor_idx`），`block_data_refs[layer_name]` 是"该层由哪些物理张量的哪些真实字节组成"的引用列表（一个层可能跨多个张量 → 多个 ref）。
+
+**Step 4 — 按 group 聚合引用**（`:275-283`）：
+```python
+group_data_refs: list[list[CanonicalKVCacheRef]] = []
+for kv_cache_group in kv_cache_config.kv_cache_groups:
+    group_refs = []
+    for layer_name in kv_cache_group.layer_names:        # 把该 group 各层 ref 依次拼起
+        group_refs += block_data_refs[layer_name]
+    group_data_refs.append(group_refs)
+```
+
+**Step 5 — 组装**（`:288-291`）：
+```python
+CanonicalKVCaches(tensors=block_tensors, group_data_refs=group_data_refs)
+```
+
+**`tensors` vs `group_data_refs` 的关系（务必分清）**：
+
+| 字段 | 维度 | 含义 |
+|---|---|---|
+| `tensors`（=`block_tensors`） | **物理** | 去重后的唯一 GPU 存储块列表，下标 = `tensor_idx` |
+| `group_data_refs` | **逻辑** | 每个 KV cache group 一个 `list[CanonicalKVCacheRef]`；每个 ref 的 `tensor_idx` 指回 `tensors`，`page_size_bytes` 是该层**真实**（未 padding）页字节 |
+
+一句话：`tensors` 回答"GPU 上实际有几块连续显存、各长什么样"，`group_data_refs` 回答"每次 load/store 时，按 group 拆开看，该传哪些块、每块传多少真实字节"。worker 后续（§5.3、§5.5）就是拿着这两个字段，按 group 在 GPU↔CPU 之间逐块搬运。
+
+> 注：`CanonicalKVCacheRef` 记的是**未 padding 的真实页字节**（`unpadded_page_size_bytes`），传输只搬有效数据；而 `CanonicalKVCacheTensor.page_size_bytes` 记的是含 padding 的整页字节，用于确定张量在 storage 里的物理步长。两者之差即 §4.2 的"page vs real_page"。
+
+→ `_init_worker(canonical_kv_caches)` → `spec.get_worker(...)`。
 
 ### 5.3 CPU 侧分配（`CPUOffloadingWorker.__init__`）
 
@@ -538,7 +606,7 @@ else:
 
 ### 5.4 ⚠️ 重要注意：`prefer_cross_layer_blocks`
 
-`OffloadingConnector.prefer_cross_layer_blocks` 返回 `True`（`offloading_connector.py:58`），因此**实际运行默认走 `register_cross_layers_kv_cache` 路径**（`offloading_connector.py:99` → `worker.py:224`）。此时 model runner 会把所有层拼成**单个跨层连续 tensor**（`register_cross_layers_kv_cache` 中 shape 为 `(num_blocks, page_size_bytes × num_layers)`），offload worker 也据此构造单个 `CanonicalKVCacheTensor`。
+`OffloadingConnector.prefer_cross_layer_blocks` 返回 `True`（`offloading_connector.py:58`），因此**实际运行默认走 `register_cross_layers_kv_cache` 路径**（`offloading_connector.py:99` → `worker.py:295`）。此时 model runner 会把所有层拼成**单个跨层连续 tensor**（`register_cross_layers_kv_cache` 中 shape 为 `(num_blocks, page_size_bytes × num_layers)`），offload worker 也据此构造单个 `CanonicalKVCacheTensor`。
 
 > 用户关注的 `register_kv_caches`（per-layer 路径）是在**未启用跨层 block** 时使用的。两条路径的规范化逻辑一致，只是"物理张量数量"不同（跨层 = 1 个，per-layer = 多层）。本报告以 per-layer 路径为主轴讲解，因为它更直观地展示了 Full/SWA 各自 KV 张量的布局。
 
