@@ -754,17 +754,45 @@ mmap 路径额外调用 `pin_mmap_region(mmap_region)` 把整个 mmap 区域注�
 
 这是 OffloadingConnector 的**实际默认路径**。关键代码位于 `kv_connector_model_runner_mixin.py:115-158`。
 
-#### 5.4.1 触发条件：`use_uniform_kv_cache` 的三个检查
+#### 5.4.1 触发条件：`use_uniform_kv_cache` 的四个检查
 
-model runner 在 `initialize_kv_cache_tensors` 中调用 `self.use_uniform_kv_cache(self.attn_groups)`，满足以下**全部条件**才走跨层路径：
+`use_uniform_kv_cache`（`kv_connector_model_runner_mixin.py:115-158`）是跨层路径的**总闸门**。model runner 在 `initialize_kv_cache_tensors` 开头调用它（`gpu_model_runner.py:7339`），满足以下**全部条件**才走跨层路径（任一不满足即回退 per-layer）：
 
-| 条件 | 检查 | 不满足时的含义 |
-|------|------|--------------|
-| ① KV connector 存在且 `prefer_cross_layer_blocks=True` | `has_kv_transfer_group()` 且 `get_kv_transfer_group().prefer_cross_layer_blocks` | 无 offload → 不需要跨层；connector 不支持 → 走 per-layer |
-| ② 只有一个 attention group | `len(attn_groups) == 1 and len(attn_groups[0]) == 1` | 多 group（Full+SWA 混合）→ 各 group 布局不同，无法合并为一个 tensor |
-| ③ backend 支持 block_stride 索引 | `kv_cache_spec.indexes_kv_by_block_stride` | 某些 backend（如 CPU backend、老旧 kernel）不支持 → fallback |
+| # | 条件 | 源码检查 | 不满足时的含义 |
+|---|------|---------|--------------|
+| ① | KV connector 存在 | `has_kv_transfer_group()`（`:146`） | 无 offload → 不需要跨层 |
+| ② | connector 偏好跨层 | `get_kv_transfer_group().prefer_cross_layer_blocks`（`:148`） | 不支持 → 走 per-layer。OffloadingConnector 硬编码 `return True`（`offloading_connector.py:63`） |
+| ③ | 单一 attention group | `len(attn_groups) == 1 and len(attn_groups[0]) == 1`（`:151`） | 多 group（Full+SWA 混合）→ 各 group 布局不同，无法合并为一个 tensor |
+| ④ | spec 是 `AttentionSpec` | `isinstance(kv_cache_spec, AttentionSpec)`（`:154-157`） | Mamba/SSM 等非注意力层 → 回退（即便单 group 也走 per-layer） |
+| ⑤ | backend 按 block_stride 索引 | `kv_cache_spec.indexes_kv_by_block_stride`（`:158`，`backend.py:206`） | backend 不支持（`num_blocks` 不在物理 dim=0）→ fallback |
 
-**条件②是关键**：本文的 Full+SWA 混合注意力模型因为 `len(attn_groups) > 1`，**必然不走跨层路径**——这正是 `register_kv_caches`（per-layer 路径）存在的理由。
+> 注：docstring 把它们概括为"3 个条件"，但代码实际是 **5 个返回点**（含 ④ 的 `isinstance` 与 ⑤ 的 `indexes_kv_by_block_stride`）。**尤其 ④ 是常见坑**：纯 Mamba/混合模型即使只有 1 个 group，也会因 spec 不是 `AttentionSpec` 而 False。
+
+**条件③是关键**：本文的 Full+SWA 混合注意力模型因为 `len(attn_groups) > 1`，**必然不走跨层路径**——这正是 `register_kv_caches`（per-layer 路径）存在的理由。
+
+**闸门之后的分流**（就在 `gpu_model_runner.py:7338-7359`）：
+
+```python
+if self.use_uniform_kv_cache(self.attn_groups):            # 5 个检查全过
+    kv_caches, cross_layers_kv_cache, attn_backend = (
+        self.allocate_uniform_kv_caches(...)              # 所有层合成 1 个张量
+    )
+    self.cross_layers_kv_cache = cross_layers_kv_cache    # ← 记下来
+else:                                                      # 任一不过
+    kv_cache_raw_tensors = self._allocate_kv_cache_tensors(...)
+    kv_caches = self._reshape_kv_cache_tensors(...)       # 逐层字典
+```
+
+而 `cross_layers_kv_cache is not None` 这个值会在 `initialize_kv_cache` 末尾（`:7455`）决定最终调哪个 worker 方法：
+
+```python
+if self.cross_layers_kv_cache is not None:
+    kv_transfer_group.register_cross_layers_kv_cache(...)  # 单张量路径（§5.4.3）
+else:
+    kv_transfer_group.register_kv_caches(kv_caches)         # 逐层字典路径（§5.2）
+```
+
+所以链条是：**`use_uniform_kv_cache` 5 检查 → 决定 `cross_layers_kv_cache` 是否为 None → 进而路由到两个 `register_*` 方法**。开了 offload 不等于一定走跨层——只有"单 group + `AttentionSpec` + backend 支持 block_stride"三者齐备才走 `allocate_uniform_kv_caches`（offload 的**偏好**路径），否则落到逐层 `register_kv_caches`。
 
 #### 5.4.2 跨层 tensor 的外观
 

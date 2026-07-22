@@ -922,6 +922,11 @@ class KVCacheConfig:
     The KV cache configuration of a model.
     """
 
+    # 三套平行结构，靠 layer_names / shared_by / attn_groups 对齐：
+    #   kv_cache_groups  -- 哪些层共用一张 block table
+    #   kv_cache_tensors  -- 实际 GPU buffer 及其共享关系
+    #   attn_groups        -- 运行时 attention backend 实例
+    # kv_caches: dict[layer_name, Tensor] 是最终接线进 forward 的结果。
     num_blocks: int
     """The number of KV cache blocks"""
     kv_cache_tensors: list[KVCacheTensor]

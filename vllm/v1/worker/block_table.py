@@ -60,18 +60,24 @@ class BlockTable:
                     f"kernel_block_size {kernel_block_size} must divide "
                     f"kv_manager_block_size size {block_size} evenly"
                 )
-
+            # 采取kernel的block size
             self.block_size = kernel_block_size
+            # hybrid blocks模式
             self.blocks_per_kv_block = block_size // kernel_block_size
             self.use_hybrid_blocks = True
 
+        # 实际还是按 原block size来？
         self.max_num_blocks_per_req = max_num_blocks_per_req * self.blocks_per_kv_block
 
+        # [ max_num_reqs, max_num_blocks_per_req ]
+        # CPU buffer!
         self.block_table = self._make_buffer(
             self.max_num_reqs, self.max_num_blocks_per_req, dtype=torch.int32
         )
         self.num_blocks_per_row = np.zeros(max_num_reqs, dtype=np.int32)
 
+        # 可复用 [ max_num_batched_tokens, ]
+        # CPU buffer!
         self.slot_mapping = self._make_buffer(
             self.max_num_batched_tokens, dtype=torch.int64
         )

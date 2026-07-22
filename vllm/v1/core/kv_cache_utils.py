@@ -1340,7 +1340,8 @@ def get_kv_cache_config_from_groups(
             kv_cache_groups=kv_cache_groups,
         )
 
-    # Determine how model runners should initialize the KV cache tensors.
+    # 从 groups 构建 KVCacheConfig(num_blocks, kv_cache_tensors)。
+    # 三种布局分支: A) 单 uniform group  B) packed(DSv4)  C) general 混合。
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):

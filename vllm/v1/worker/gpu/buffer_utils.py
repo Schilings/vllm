@@ -42,6 +42,10 @@ def async_copy_to_gpu(
 
 
 class UvaBuffer:
+    """一块 pinned memory，cpu / np / uva 三者是同一块物理内存的三个视图：
+       cpu -- CPU 端 tensor
+       np  -- NumPy view，CPU 侧直接写
+       uva -- GPU 可直读的 view（UVA，不经显式 cudaMemcpy）"""
     def __init__(self, size: int | Sequence[int], dtype: torch.dtype):
         if not is_uva_available():
             raise RuntimeError("UVA is not available")
@@ -51,6 +55,9 @@ class UvaBuffer:
 
 
 class UvaBufferPool:
+    """UvaBuffer 池，round-robin 轮转，支持并发写时不互相覆盖。
+       copy_to_uva: CPU -> pinned（返回 GPU 可直读的 uva view）
+       copy_to_gpu:   CPU -> pinned -> GPU（显式搬上显存）"""
     def __init__(
         self,
         size: int | Sequence[int],
@@ -76,6 +83,7 @@ class UvaBufferPool:
         dst = buf.cpu if isinstance(x, torch.Tensor) else buf.np
         n = len(x)
         dst[:n] = x
+        # 返回 uva view，GPU 可直接读，无需显式 cudaMemcpy
         return buf.uva[:n]
 
     def copy_to_gpu(
@@ -89,6 +97,18 @@ class UvaBufferPool:
 
 
 class UvaBackedTensor:
+    """
+    CPU 侧有一个"源"tensor（self.cpu / self.np），通过 UvaBufferPool
+       把数据搬到 pinned memory 后返回 uva view 给 GPU 使用。
+
+    Unified Virtual Addressing——CUDA 提供的能力：
+        CPU pinned memory 和 GPU 显存共享同一个地址空间，
+        GPU kernel 可以用同一个指针直接读写 CPU 端的 pinned memory，
+        无需显式 cudaMemcpy，硬件通过 PCIe DMA 自动完成搬运。
+
+    UvaBuffer 就是一块CPU 和 GPU 都能直接读写的共享 pinned memory——CPU 端用 NumPy 写，
+    GPU 端用 UVA tensor 读，省掉中间的显式 cudaMemcpy，适合频繁的小数据从 CPU→GPU 传输场景（如 block table 更新、sampling 参数同步）。
+    """
     def __init__(
         self,
         size: int | Sequence[int],
@@ -97,16 +117,19 @@ class UvaBackedTensor:
     ):
         self.dtype = dtype
 
-        # Source of truth
+        # Source of truth: CPU 端的权威数据
         self.cpu = torch.zeros(size, dtype=dtype, device="cpu", pin_memory=False)
         self.np = self.cpu.numpy()
 
         # Buffers for concurrency
         self.pool = UvaBufferPool(size, dtype, max_concurrency)
+
+        # CPU -> UVA(CPU)
         self.gpu = self.pool.copy_to_uva(self.np)
 
     def copy_to_uva(self, n: int | None = None) -> torch.Tensor:
         # CPU-to-CPU copy
+        # CPU -> UVA(CPU) -> GPU
         self.gpu = self.pool.copy_to_uva(self.np[:n] if n is not None else self.np)
         return self.gpu
 
@@ -127,6 +150,7 @@ class StagedWriteTensor:
             raise ValueError(
                 f"Unsupported dtype {dtype}: should be one of {supported_dtypes}"
             )
+        # max_num_reqs
         self.num_rows = size if isinstance(size, int) else size[0]
         self.dtype = dtype
         self.device = device
@@ -134,10 +158,13 @@ class StagedWriteTensor:
 
         if not uva_instead_of_gpu:
             # Create a GPU tensor (default)
+            # size 是完整的，不是只有num_rows
             self.gpu = torch.zeros(size, dtype=dtype, device=device)
         else:
             # For a large but not-frequently-accessed tensor, we can use UVA instead of
             # GPU to save GPU memory
+            # UVA 是什么？范围不频繁的选择UVA？
+            # size 是完整的，不是只有num_rows
             self._uva_buf = UvaBuffer(size, dtype)
             self.gpu = self._uva_buf.uva
 
@@ -146,6 +173,7 @@ class StagedWriteTensor:
         self._staged_write_contents: list[int | float] = []
         self._staged_write_cu_lens: list[int] = []
 
+        # [ max_concurrency, num_rows ]
         new_buffer = partial(UvaBufferPool, max_concurrency=max_concurrency)
 
         self.write_indices = new_buffer(self.num_rows, dtype=torch.int32)
@@ -155,6 +183,12 @@ class StagedWriteTensor:
     def stage_write(
         self, index: int, start: int, x: Iterable[int] | Iterable[float]
     ) -> None:
+        """暂存一次写入到 CPU 列表，不触发 GPU 操作。
+           index: 目标行号（如 request index）
+           start: 行内起始列
+           x:     写入数据
+           多次 stage_write 的数据在 write_contents 里扁平拼接，
+           write_cu_lens 用累积长度标记每条边界。"""
         assert index >= 0
         assert start >= 0
         if not x:
@@ -172,15 +206,24 @@ class StagedWriteTensor:
         self._staged_write_cu_lens.append(len(self._staged_write_contents))
 
     def apply_write(self) -> None:
+        """将 CPU 侧暂存的所有写入一次批量应用到 GPU tensor。
+           每条 staged write 对应一个 kernel program，做：
+             gpu[row][start : start+len(content)] = content
+           例: stage_write(3, 0, [101,202,303]) + stage_write(5, 2, [42,99])
+             → write_indices = [3,5]   write_starts = [0,2]
+               write_contents = [101,202,303,42,99]   write_cu_lens = [3,5]
+             → pid=0: gpu[3][0:3]=[101,202,303]   pid=1: gpu[5][2:4]=[42,99]"""
         n = len(self._staged_write_indices)
         if n == 0:
             return
 
+        # CPU -> CPU(UVA)
         indices_uva = self.write_indices.copy_to_uva(self._staged_write_indices)
         starts_uva = self.write_starts.copy_to_uva(self._staged_write_starts)
         cu_lens_uva = self.write_cu_lens.copy_to_uva(self._staged_write_cu_lens)
 
         # Special handling for write_contents
+        # CPU -> GPU
         write_contents = async_tensor_h2d(
             self._staged_write_contents, device=self.device, dtype=self.dtype
         )
@@ -189,10 +232,10 @@ class StagedWriteTensor:
         _apply_write_kernel[(n,)](
             self.gpu,
             self.gpu.stride(0),
-            indices_uva,
-            starts_uva,
-            write_contents,
-            cu_lens_uva,
+            indices_uva, # UVA
+            starts_uva, # UVA
+            write_contents, # GPU
+            cu_lens_uva, # UVA
             None,
             BLOCK_SIZE=1024,
             MULTI_GROUP=False,

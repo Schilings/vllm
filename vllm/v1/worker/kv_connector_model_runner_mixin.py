@@ -143,18 +143,25 @@ class KVConnectorModelRunnerMixin:
             True if we should use a uniform KV cache layout.
         """
 
+        # (1) 必须有 kv 连接器。
         if not has_kv_transfer_group():
             return False
+        # (2) 连接器偏好跨层布局。
         if not get_kv_transfer_group().prefer_cross_layer_blocks:
             return False
 
+        # (3) 单一 attention group（所有层同 page size）；
+        #     多 group 模型（如 DSv4）此处返回 False。
         if len(attn_groups) != 1 or len(attn_groups[0]) != 1:
             return False
 
         attn_group = attn_groups[0][0]
         kv_cache_spec = attn_group.kv_cache_spec
+        # (4) 必须是 AttentionSpec（Mamba/SSM 不行，即便单 group）。
         if not isinstance(kv_cache_spec, AttentionSpec):
             return False
+        # (5) backend 按 block stride 索引（get_kv_cache_spec 里盖章），
+        #     即 num_blocks 在最外层物理维，保证同 block 跨层数据连续。
         return kv_cache_spec.indexes_kv_by_block_stride
 
     @staticmethod

@@ -210,6 +210,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.pooling_runner: PoolingRunner | None = None
 
         # General request states.
+        # 请求状态表（固定大小，每请求一个固定行）
         self.req_states = RequestState(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
@@ -218,6 +219,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             vocab_size=self.vocab_size,
             device=self.device,
         )
+        # 输入 buffers（预分配）
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
@@ -232,6 +234,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Samplers and decode_query_len created in load_model() after
         # model_state exists (num_new_sampled_tokens_per_step from ModelState).
+        # 各组件延迟初始化
         self.sampler: Sampler | None = None
         self.rejection_sampler: RejectionSampler | None = None
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
@@ -250,6 +253,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.kv_connector: KVConnector = NO_OP_KV_CONNECTOR
 
         # For transferring state from execute_model to subsequent sample_tokens call.
+        # execute_model → sample_tokens 状态传递
         self.execute_model_state: ExecuteModelState | None = None
 
         # Expert parallelism load balancer.
@@ -436,6 +440,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.attn_groups, attn_cg_support, self.kernel_block_sizes = init_attn_backend(
             self.kv_cache_config, self.vllm_config, self.device
         )
+        #
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
             max_num_reqs=self.max_num_reqs,
