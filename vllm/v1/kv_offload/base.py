@@ -421,6 +421,20 @@ class CanonicalKVCacheRef:
     Per-layer (or group of layers) reference to a specific (by index)
     CanonicalKVCacheTensor and records the un-padded page size used by that layer.
     """
+    """
+    KV cache config: 32 layers, 8 KV heads, 128 dim, block_size=16
+    → gpu_page_size_bytes = 2*8*128*16*2 = 65536 bytes (K+V, fp16)
+    → 32 层形状一致 → 去重为 1 个 tensor
+    → tensor.shape = (num_blocks, 65536 * 32)   ← 32 层的数据拼接在 page_size 维度!
+    
+    group_data_refs = [
+      [CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=65536),  # layer 0
+       CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=65536),  # layer 1
+       ...
+       CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=65536)]  # layer 31
+    ]
+
+    """
 
     # Index into the list of CanonicalKVCacheTensor objects
     tensor_idx: int

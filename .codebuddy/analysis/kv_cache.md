@@ -11,9 +11,10 @@
 - [0. 前置知识：设计思想与核心概念](#0-前置知识设计思想与核心概念)
 - [1. 全景架构概览](#1-全景架构概览)
 - [2. Layer 1：Config 构建（kv_cache_utils）](#2-layer-1config-构建kv_cache_utils)
-- [2.8 Packed 布局：到底是什么、什么场景触发](#28-packed-布局到底是什么什么场景触发)
+- [2.8 Packed Config 布局：跨层/DSv4 打包](#28-packed-config-布局跨层dsv4-打包)
 - [3. Layer 2：Scheduler 侧（HybridKVCacheCoordinator）](#3-layer-2scheduler-侧hybridkvcachecoordinator)
 - [4. Layer 3：Model/GPU Worker 分配](#4-layer-3modelgpu-worker-分配)
+	- [4.6 K/V Packed 布局：K 和 V 为何共用一个 Tensor](#46-kv-packed-布局k-和-v-为何共用一个-tensor)
 - [5. Layer 4：Offload 注册与 CPU 分配](#5-layer-4offload-注册与-cpu-分配)
 - [6. 完整调用链时序图](#6-完整调用链时序图)
 - [7. 关键数据结构速查表](#7-关键数据结构速查表)
@@ -347,18 +348,22 @@ def get_num_blocks(vllm_config, num_layers, available_memory, page_size):
 
 ---
 
-### 2.8 Packed 布局：到底是什么、什么场景触发
+### 2.8 Packed Config 布局：跨层/DSv4 打包
 
-> §2.6 分支 C 只点名了 `packed` 和"DSv4"，却没讲清它**物理上是什么、何时触发**。本节补全。
+> **术语澄清**：本文档中有两个不同层面的"packed"概念，请务必区分：
+> - **K/V Packed 布局**（§4.6）：**所有 attention backend 的标准做法**——K 和 V 共享同一个 tensor，在 `dim=1`（大小 2）里用 index 0/1 区分。这是单个 block 内 K 和 V 的排列方式。
+> - **Packed Config 布局**（本节）：**仅 DSv4 / `enable_cross_layers_blocks` 触发**——把多个层的 page 首尾拼接成一个"manager-block"，使物理块从几 KB 放大到 0.5–2 MB 以利于 DMA。这是跨层的排列方式。
+>
+> 本节讲的是后者。§2.6 分支 C 只点名了 `packed` 和"DSv4"，却没讲清它**物理上是什么、何时触发**。本节补全。
 
-**物理形态**：普通布局下，一个物理 block = 某一层的 1 个 page（如 64KB）；packed 布局下，一个物理 block = **同 block-index 的多个层 page 首尾拼接**，因此单个物理 block 跨所有被打包层，`block_stride = total_num_bytes_per_block` 远大于单层 page。`KVCacheTensor.block_stride > 0` 即标记 packed（`kv_cache_interface.py:901`）。
+**物理形态**：普通布局下，一个物理 block = 某一层的 1 个 page（如 64KB）；packed config 下，一个物理 block = **同 block-index 的多个层 page 首尾拼接**，因此单个物理 block 跨所有被打包层，`block_stride = total_num_bytes_per_block` 远大于单层 page。`KVCacheTensor.block_stride > 0` 即标记 packed config（`kv_cache_interface.py:901`）。
 
 `_get_kv_cache_config_packed`（:1277）的做法：
 - `_bucket_layers_by_page_size`（:1230）按 `(page_size, slot_idx)` 把层分组：同一 slot（各组第 i 层）归一组。
 - `total_num_bytes_per_block = Σ ps*len(slots)`：一个物理 block 的总字节 = 所有被打包层 page 之和。
 - `num_blocks = available_memory // total_num_bytes_per_block`（:1293）。
 - 对每个 `(ps, slot)` 发一个 `KVCacheTensor(size=total_size, shared_by=slot, offset=byte_offset, block_stride=total_num_bytes_per_block)`（:1302）。**关键：所有 KVCacheTensor 都 alias 同一块 `size=total_size` 的 backing**，只是各自 `offset` 不同（该层字节在 block 内的起点）、`block_stride` 相同（:1307）。
-- worker 侧 `register_kv_caches` 检测到 `block_stride and shared_by` 后用 `as_strided((num_blocks, block_stride), (block_stride, 1))` 把整块 backing 展成"每行一个 manager-block、行宽=block_stride"的大视图（§5.2 packed 特例 / offloading.md §4.1）——这正是 packed 在搬运层的落点。
+- worker 侧检测到 `block_stride and shared_by` 后用 `as_strided((num_blocks, block_stride), (block_stride, 1))` 把整块 backing 展成"每行一个 manager-block、行宽=block_stride"的大视图（§5.2 路径 A）——这正是 packed config 在搬运层的落点。
 
 **为什么（动机）**：DMA copy engine 偏好大且连续的块。把多层 page 拼进一个 block，物理块从几 KB → 0.5–2 MB（§0.1.3），DMA 吞吐高、TTFT 降 4 倍。代价是改变了 model runner 的 KV 布局，offload worker 必须靠 `block_stride` + `offset` 才能正确跨层寻址。
 
@@ -480,6 +485,104 @@ return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
 ---
 
+### 4.6 K/V Packed 布局：K 和 V 为何共用一个 Tensor
+
+> 这是 §2.8 开篇「术语澄清」中提到的**第一个 packed**——所有 attention backend 的标准做法。本节深入讲解它的物理布局、变体、以及它对 offload 的意义。
+
+#### 4.6.1 核心设计：dim=1 大小为 2，K 和 V 共享同一个 tensor
+
+绝大多数 attention backend（FlashAttention、FlashInfer、TritonAttention）的 `get_kv_cache_shape` 返回（`flash_attn.py:132`）：
+
+```python
+return (num_blocks, 2, block_size, num_kv_heads, head_size)
+#              ↑  K=0, V=1
+```
+
+**K 和 V 不是两个独立 tensor**，而是共用一个 tensor 的 `dim=1`（大小 2）来区分。使用方通过 `.unbind(1)` 或索引 `kv_cache[:, 0]` / `kv_cache[:, 1]` 分别拿到 K cache 和 V cache。
+
+| 维度 | 含义 | 示例值 |
+|------|------|--------|
+| dim=0 | block 维度 | `num_blocks`（如 8192） |
+| dim=1 | **K/V 选择** | `2`（0=K, 1=V） |
+| dim=2 | block 内 token 位置 | `block_size`（如 16） |
+| dim=3 | KV head 数 | `num_kv_heads`（如 8） |
+| dim=4 | 每 head 维度 | `head_size`（如 128） |
+
+#### 4.6.2 物理内存布局：`stride_order` 决定维序
+
+逻辑形状不等于物理排布。`get_kv_cache_stride_order()` 返回一个置换，把逻辑形状映射为物理 stride 顺序。`_reshape_attention_kv_cache`（`attn_utils.py`）用 `raw_tensor.as_strided(shape, ...)` 实现零拷贝 reshape。
+
+**NHD（默认）**：`stride_order = (0, 1, 2, 3, 4)`，即逻辑顺序 = 物理顺序。
+
+```
+物理布局 = (num_blocks, 2, block_size, num_kv_heads, head_size)
+
+一个 block 内（block 5）的物理排布（float16，共 65536 字节）：
+  [K_token0_head0, K_token0_head1, ..., K_token0_head7,   ← 0~2047 字节
+   V_token0_head0, V_token0_head1, ..., V_token0_head7,   ← 2048~4095 字节
+   K_token1_head0, ...,
+   ...
+   V_token15_head7]                                        ← 最后 2048 字节
+```
+
+K 和 V 按 token 交替：先 token 0 的 K（8 heads）→ token 0 的 V（8 heads）→ token 1 的 K → ...
+
+**HND**：`stride_order = (0, 3, 1, 2, 4)`，把 head 维度提前。
+
+```
+物理布局 = (num_blocks, num_kv_heads, 2, block_size, head_size)
+
+一个 block 内：
+  [head0_K_token0..15, head0_V_token0..15,   ← 先 head0 的 K 再 V
+   head1_K_token0..15, head1_V_token0..15,   ← 再 head1 的 K 再 V
+   ...
+   head7_K_token0..15, head7_V_token0..15]   ← 再 head7
+```
+
+HND 的好处是每个 head 的 K/V 在物理内存中连续，GPU 做 attention 时同一 head 访问连续地址，cache line 利用率更高。
+
+#### 4.6.3 变体一览
+
+| Backend | 形状 | 说明 |
+|---------|------|------|
+| **FlashAttention** | `(num_blocks, 2, block_size, H, D)` | NHD 或 HND，取决于 `VLLM_ATTENTION_CACHE_LAYOUT` 环境变量 |
+| **FlashInfer** | `(num_blocks, 2, block_size, H, D)` | 同 FlashAttention，但 ML 模式下额外 `.permute` 到 HND |
+| **TritonAttention** | `(num_blocks, 2, block_size, H, D)` | 同 FlashAttention；量化时末尾加 `scale_pad` 维度 |
+| **MLA 系列** | `(num_blocks, block_size, head_size)` | K/V 本就不分家（MLA 的 KV 是 compressed latent），没有 dim=1 的 2 |
+| **DiffKV** | `(num_blocks, block_size, H, D_k+D_v)` | K 和 V 的 head 维度拼在最后一维（支持 K/V head 数不同） |
+| **TurboQuant** | 自定义 packed | K/V 量化后交织打包，不与标准 backend 共享 tensor |
+
+#### 4.6.4 对 Offload 的决定性意义
+
+**packed 布局是 offload 能以「一个 block_id → 一行 int8 数据」工作的前提。**
+
+offload 的起点是这行代码（`gpu_worker.py:597`）：
+
+```python
+gpu_tensor = kv_cache_tensor.tensor.view(torch.int8).view((-1, gpu_page_size_bytes))
+```
+
+为什么能这么写？因为 packed 布局下：
+
+1. `page_size_bytes = 2 × block_size × num_kv_heads × head_size × dtype_size` 已天然包含了 K 和 V 的全部数据
+2. 无论物理 stride 怎么排（NHD/HND），`view(int8).view((-1, page_size_bytes))` 都把一整个 block 的 **全部 K+V 字节** 展成一行
+
+**如果 K 和 V 是分开的两个 tensor**（很多早期框架的做法），offload 就需要分别搬运每个 layer 的 K tensor 和 V tensor，DMA 的 src/dst 指针数组复杂度翻倍，且无法一次 `view` 搞定。
+
+#### 4.6.5 跨层 Packed：再拼上一层维度
+
+当 KV connector 启用 `prefer_cross_layer_blocks=True`（OffloadingConnector 默认）时，所有层进一步合并成一个 tensor，形状为：
+
+```
+(num_blocks, 2, num_layers, block_size, num_kv_heads, head_size)   # 含 num_layers 维度
+```
+
+或 HND 布局下的变体。此时 `page_size_bytes = 2 × num_layers × block_size × H × D × dt_size`，一个 block 包含了**所有层的 K 和 V**。DMA 搬一个 block 就同时搬了所有层——这就是 §0.1.3 说的「物理块从几 KB 放大到 0.5–2 MB」。
+
+> **区分 §2.8 与本节**：§2.8 的 "Packed Config" 是在 `KVCacheTensor` 配置层面把多层 page 拼成 `block_stride`，物理上是配置层做的事；本节的 "K/V Packed" 是单个 block 内 K 和 V 的排列方式，是所有 backend 的通用约定。二者层级不同，但都服务于「让 DMA 搬运一个 block 时搬更多连续数据」。
+
+---
+
 ## 5. Layer 4：Offload 注册与 CPU 分配
 
 ### 5.1 注册触发点
@@ -583,6 +686,24 @@ CanonicalKVCaches(tensors=block_tensors, group_data_refs=group_data_refs)
 
 > 注：`CanonicalKVCacheRef` 记的是**未 padding 的真实页字节**（`unpadded_page_size_bytes`），传输只搬有效数据；而 `CanonicalKVCacheTensor.page_size_bytes` 记的是含 padding 的整页字节，用于确定张量在 storage 里的物理步长。两者之差即 §4.2 的"page vs real_page"。
 
+**完整数据流**（从 model runner 的 kv_caches 到 CPUOffloadingWorker）：
+
+```mermaid
+flowchart LR
+    A["kv_caches dict<br/>layer_name → (N,2,bs,H,D)"] --> B["register_kv_caches<br/>worker.py:50"]
+    B --> C["逐层 view 成 int8<br/>(num_blocks, page_size_bytes)"]
+    C --> D{"block_stride>0?"}
+    D -->|是| E["路径A: packed 快捷<br/>1 个 CanonicalKVCacheTensor"]
+    D -->|否| F["路径B: 去重聚合<br/>去重 → block_tensors<br/>聚合 → group_data_refs"]
+    E --> G["CanonicalKVCaches"]
+    F --> G
+    G --> H["_init_worker → CPUOffloadingWorker.__init__"]
+    H --> I["GPU tensor view → (N, gpu_page_size)"]
+    H --> J["CPU: torch.zeros pin_memory<br/>或 mmap_region"]
+    I --> K["SingleDirectionOffloadingHandler ×2<br/>store(GPU→CPU) + load(CPU→GPU)"]
+    J --> K
+```
+
 → `_init_worker(canonical_kv_caches)` → `spec.get_worker(...)`。
 
 ### 5.3 CPU 侧分配（`CPUOffloadingWorker.__init__`）
@@ -602,13 +723,120 @@ else:
 - **CPU buffer 形状**：`(num_cpu_blocks, page_size_bytes × block_size_factor)`。`block_size_factor` 表示 CPU 上一个 block 能装下几个 GPU block（默认 1，可配置放大以减少管理开销）。
 - **pin_memory**：锁页内存让 GPU 的 DMA copy engine 直接访问，传输更快。
 - **mmap_region**：多 worker/进程共享同一块 CPU 内存，避免重复分配。
-- 最后构造两个 `SingleDirectionOffloadingHandler`：`_store_handler`（GPU→CPU）与 `_load_handler`（CPU→GPU），均传入 `group_data_refs`。
 
-### 5.4 ⚠️ 重要注意：`prefer_cross_layer_blocks`
+#### `block_size_factor`：粗粒度聚合优化
 
-`OffloadingConnector.prefer_cross_layer_blocks` 返回 `True`（`offloading_connector.py:58`），因此**实际运行默认走 `register_cross_layers_kv_cache` 路径**（`offloading_connector.py:99` → `worker.py:295`）。此时 model runner 会把所有层拼成**单个跨层连续 tensor**（`register_cross_layers_kv_cache` 中 shape 为 `(num_blocks, page_size_bytes × num_layers)`），offload worker 也据此构造单个 `CanonicalKVCacheTensor`。
+CPU 端的 DMA 延迟高但带宽大。如果把 CPU block 设为与 GPU block 完全相同的大小（`block_size_factor=1`），每次传输都是小块 DMA，启动开销占比高。`block_size_factor` 把 CPU 上一个 block 放大为 **N 个 GPU block 的大小**：
 
-> 用户关注的 `register_kv_caches`（per-layer 路径）是在**未启用跨层 block** 时使用的。两条路径的规范化逻辑一致，只是"物理张量数量"不同（跨层 = 1 个，per-layer = 多层）。本报告以 per-layer 路径为主轴讲解，因为它更直观地展示了 Full/SWA 各自 KV 张量的布局。
+```
+GPU block: page_size_bytes (如 65536 = 64KB)
+CPU block: page_size_bytes × block_size_factor (如 factor=4 → 256KB)
+
+CPU block 0  ←→  GPU block 0,1,2,3  (映射关系由 CPUOffloadingManager 维护)
+CPU block 1  ←→  GPU block 4,5,6,7
+...
+```
+
+好处：DMA 批量更大，启动次数减少；Manager 端 block 池元数据开销降低（一个 CPU block 对应多个 GPU block）。代价是换入/换出粒度变粗。
+
+#### mmap vs pin_memory 两条分配路径
+
+| 路径 | 内存来源 | 跨进程共享 | 重启丢数据 | 适用场景 |
+|------|---------|-----------|-----------|---------|
+| **mmap** | 文件映射的共享内存区域（`SharedOffloadRegion`） | ✅ 多 worker 共享 | ❌ 不丢 | 多 GPU worker、跨进程复用 KV cache |
+| **pin_memory** | `torch.zeros` 分配 + `cudaHostRegister` 注册 | ❌ 进程私有 | ✅ 会丢 | 单 worker、简单部署 |
+
+mmap 路径额外调用 `pin_mmap_region(mmap_region)` 把整个 mmap 区域注册为 CUDA pinned memory（`cudaHostRegister`），使 DMA 可以直接访问 mmap 文件映射区，无需中间 bounce buffer。这是真正的**零拷贝**路径。
+
+- 最后构造两个 `SingleDirectionOffloadingHandler`：`_store_handler`（GPU→CPU）与 `_load_handler`（CPU→GPU），均传入 `group_data_refs`。两个 handler **共享同一组 GPU/CPU tensor**，仅方向不同，确保同方向传输按提交顺序串行、不同方向可并发。
+
+### 5.4 KV Connector 跨层场景：`prefer_cross_layer_blocks`（默认路径）
+
+这是 OffloadingConnector 的**实际默认路径**。关键代码位于 `kv_connector_model_runner_mixin.py:115-158`。
+
+#### 5.4.1 触发条件：`use_uniform_kv_cache` 的三个检查
+
+model runner 在 `initialize_kv_cache_tensors` 中调用 `self.use_uniform_kv_cache(self.attn_groups)`，满足以下**全部条件**才走跨层路径：
+
+| 条件 | 检查 | 不满足时的含义 |
+|------|------|--------------|
+| ① KV connector 存在且 `prefer_cross_layer_blocks=True` | `has_kv_transfer_group()` 且 `get_kv_transfer_group().prefer_cross_layer_blocks` | 无 offload → 不需要跨层；connector 不支持 → 走 per-layer |
+| ② 只有一个 attention group | `len(attn_groups) == 1 and len(attn_groups[0]) == 1` | 多 group（Full+SWA 混合）→ 各 group 布局不同，无法合并为一个 tensor |
+| ③ backend 支持 block_stride 索引 | `kv_cache_spec.indexes_kv_by_block_stride` | 某些 backend（如 CPU backend、老旧 kernel）不支持 → fallback |
+
+**条件②是关键**：本文的 Full+SWA 混合注意力模型因为 `len(attn_groups) > 1`，**必然不走跨层路径**——这正是 `register_kv_caches`（per-layer 路径）存在的理由。
+
+#### 5.4.2 跨层 tensor 的外观
+
+当条件满足时，`allocate_uniform_kv_caches`（`kv_connector_model_runner_mixin.py:161`）创建**合并了所有层的单个 tensor**（注意含 `num_layers` 维度）：
+
+```
+NHD 布局: (num_blocks, num_layers, 2, block_size, num_kv_heads, head_size)
+HND 布局: (num_blocks, num_kv_heads, num_layers, 2, block_size, head_size)
+```
+
+无论哪种布局，`num_blocks` 都在**物理 dim=0**（通过 `get_kv_cache_stride_order(include_num_layers_dimension=True)` 保证）。这意味着 `storage[block_id * page_size_bytes : (block_id+1) * page_size_bytes]` 就是**所有层的该 block_id 的全部 K+V 数据**。
+
+此时 `page_size_bytes = num_layers × 2 × block_size × num_kv_heads × head_size × dtype_size`，对于 Llama 8B（32 层），`page_size_bytes = 32 × 65536 = 2 MB`——正如 §0.1.3 所言。
+
+#### 5.4.3 `register_cross_layers_kv_cache` 的简化流程
+
+`worker.py:295-340`，比 per-layer 路径简洁得多：
+
+```python
+def register_cross_layers_kv_cache(self, kv_cache, attn_backend):
+    # 1. 验证 num_blocks 在物理 dim=0（若不在，as_strided 会报错）
+    physical_to_logical = attn_backend.get_kv_cache_stride_order(
+        include_num_layers_dimension=True)
+
+    # 2. 算 page_size_bytes = 单层 × 层数
+    page_size_bytes = kv_cache_spec.page_size_bytes * num_layers
+
+    # 3. 直接把整个 storage 设成 (num_blocks, page_size_bytes) int8 view
+    tensor = torch.tensor([], dtype=torch.int8, device=kv_cache.device)
+             .set_(storage)
+             .view(num_blocks, page_size_bytes)
+
+    # 4. 构造 CanonicalKVCaches：只有 1 个 tensor、1 个 ref、1 个 group
+    CanonicalKVCaches(
+        tensors=[CanonicalKVCacheTensor(tensor, page_size_bytes)],
+        group_data_refs=[[CanonicalKVCacheRef(0, page_size_bytes)]]
+    )
+```
+
+对比 §5.2 的 per-layer 路径需要 5 个 step（逐层建视图 → 去重 → 聚合 ref → 按 group 拼装），跨层路径的代码量不到 1/5——因为它天然就是单 tensor、单 group，不需要任何去重聚合。
+
+#### 5.4.4 两条路径的对比
+
+```mermaid
+flowchart TB
+    subgraph 路径选择
+        Q{"use_uniform_kv_cache?"} -->|"是<br/>单 group + 支持 block_stride<br/>（如纯 Llama + Offload）"| CROSS["register_cross_layers_kv_cache<br/>单个 (num_blocks, total_page) tensor"]
+        Q -->|"否<br/>多 group 或不支持<br/>（如 Full+SWA 混合）"| PER["register_kv_caches<br/>per-layer dict → 去重聚合"]
+    end
+    CROSS --> S1["CanonicalKVCaches<br/>1 tensor, 1 ref"]
+    PER --> S2["CanonicalKVCaches<br/>N tensors, M refs"]
+    S1 --> CPU["CPUOffloadingWorker.__init__"]
+    S2 --> CPU
+```
+
+| 维度 | 跨层路径（默认） | per-layer 路径（混合注意力） |
+|------|-----------------|--------------------------|
+| 触发条件 | 单 group + backend 支持 | 多 group（Full+SWA）或 backend 不支持 |
+| GPU tensor | 1 个，含 `num_layers` 维度 | 多个，每层/每组独立 |
+| `page_size_bytes` | `层数 × 单层 page`（如 2 MB） | 单层 page（如 64 KB） |
+| DMA 块大小 | 超大，最利于吞吐 | 中等，但仍有 K/V packed |
+| `CanonicalKVCaches` 复杂度 | 1 tensor, 1 ref | N tensors, 需去重聚合 |
+| `block_size_factor` | 仍生效，CPU block 可继续放大 | 同左 |
+
+#### 5.4.5 总结
+
+`prefer_cross_layer_blocks` 和 `K/V packed` 是 offload 性能的两个关键设计：
+
+- **K/V packed**（§4.6）：每个 block 内 K+V 共用一个 tensor → 搬一个 block 就搬了 K+V。
+- **跨层 block**（本节）：所有层共用一个 tensor → 搬一个 block 就搬了所有层的 K+V。
+
+两者叠加（单 group 纯注意力模型 + offload），一个 block 的 DMA = 全层的 K+V 连续数据，物理块可达 0.5–2 MB——DMA 效率最大化。混合注意力模型退化为"只有 K/V packed、无跨层"，但仍然是远优于"K V 分别搬运"的设计。
 
 ---
 
@@ -650,33 +878,53 @@ sequenceDiagram
 | `KVCacheGroupSpec` | `kv_cache_interface.py:904` | `layer_names`, `kv_cache_spec` | 一个 KV cache group（同注意力类型的若干层） |
 | `KVCacheConfig` | `kv_cache_interface.py:919` | `num_blocks`, `kv_cache_tensors`, `kv_cache_groups` | 全局 KV 配置，贯穿 scheduler/worker |
 | `AttentionSpec.page_size_bytes` | `kv_cache_interface.py` | `block_size × kv_hidden_size` | 每 block 物理字节数（Full/SWA 必须一致） |
-| GPU 单层张量 | `gpu_model_runner` reshape 后 | `(num_blocks, 2, block_size, num_kv_heads, head_size)` | FlashAttention 布局，K/V 沿 dim=1 拼接 |
-| `CanonicalKVCacheTensor` | `base.py:401` | `tensor`, `page_size_bytes` | 规范化视图 `(num_blocks, page_bytes)` int8 |
-| `CanonicalKVCaches` | `base.py:431` | `tensors`, `group_data_refs` | offload worker 使用的统一表示 |
-| `CPUOffloadingWorker` | `cpu/gpu_worker.py:469` | `_store_handler`, `_load_handler` | 异步 GPU↔CPU 搬运，CPU buffer 分配 |
+| 单层 GPU 张量 | `gpu_model_runner` reshape 后 | `(num_blocks, 2, block_size, H, D)` | FlashAttention 标准布局，K/V 沿 dim=1 packed（§4.6） |
+| 跨层 GPU 张量 | `allocate_uniform_kv_caches` | `(num_blocks, num_layers, 2, bs, H, D)` | 所有层合并成一个 tensor，block 搬运 = 全层搬运（§5.4） |
+| `kv_cache_stride_order` | 各 backend 的 `get_kv_cache_stride_order()` | 置换元组如 `(0,3,1,2,4)` | 逻辑形状 → 物理内存排布；NHD=默认，HND=head 优先（§4.6.2） |
+| `CanonicalKVCacheRef` | `base.py:419` | `tensor_idx`, `page_size_bytes` | 某层 block 数据在哪个物理 tensor、真实字节数 |
+| `CanonicalKVCacheTensor` | `base.py:401` | `tensor`, `page_size_bytes` | 规范化 int8 视图 `(num_blocks, page_bytes)` |
+| `CanonicalKVCaches` | `base.py:431` | `tensors`, `group_data_refs` | offload worker 的统一表示；物理去重 + 逻辑层引用 |
+| `CPUOffloadingWorker` | `cpu/gpu_worker.py:469` | `_store_handler`, `_load_handler`, `block_size_factor` | 异步 GPU↔CPU 搬运，CPU mmap/pin_memory buffer 分配 |
+| `block_size_factor` | `OffloadingSpec` | 正整数（默认 1） | CPU 1 个 block = N 个 GPU block，粗粒度 DMA 优化（§5.3） |
 
 ---
 
 ## 8. 快速问题解答（FAQ）
 
 **Q1：module runner 里的 kv caches 是什么样？**
-是一个 `dict[layer_name, torch.Tensor]`，每个值是该层在 GPU 上的 KV cache 张量，形状 `(num_blocks, 2, block_size, num_kv_heads, head_size)`（FlashAttention）。K 和 V 沿第 1 维拼接。`bind_kv_cache` 后各 attention 层通过 `forward_context` 拿到自己的张量。
+是一个 `dict[layer_name, torch.Tensor]`，每个值是该层在 GPU 上的 KV cache 张量，形状 `(num_blocks, 2, block_size, num_kv_heads, head_size)`（FlashAttention）。K 和 V 沿第 1 维拼接（K/V packed，§4.6）。`bind_kv_cache` 后各 attention 层通过 `forward_context` 拿到自己的张量。
 
 **Q2：Full + SWA 下 KV cache 在哪创建？**
 在 `GPUModelRunner._allocate_kv_cache_tensors`（`gpu_model_runner.py:7081`）以扁平 `int8` 显存块分配，再在 `_reshape_kv_cache_tensors`（`:7133`）按 backend 形状 reshape。**创建位置在 GPU Worker 进程**，但"分组与块数"由 scheduler 的 `KVCacheConfig` 决定。
 
 **Q3：怎么创建的？**
-两步：① `torch.zeros(size, int8, device)` 分配原始 buffer（packed 布局多层共享同一 backing）；② `attn_backend.get_kv_cache_shape(...)` + `get_kv_cache_stride_order()` reshape 成 `(num_blocks, 2, bs, H, D)` 的 view（零拷贝）。
+两步：① `torch.zeros(size, int8, device)` 分配原始 buffer（packed config 时多层共享同一 backing）；② `attn_backend.get_kv_cache_shape(...)` + `get_kv_cache_stride_order()` reshape 成 backend 形状的 view（零拷贝）。
 
 **Q4：布局是怎样的？**
 - **分配时**：一维扁平 `int8` buffer，大小 = `page_size_bytes × num_blocks`。
-- **reshape 后（GPU）**：`(num_blocks, 2, block_size, num_kv_heads, head_size)`，K/V 拼接。
-- **offload 规范化**：`(num_blocks, page_size_bytes)` int8 视图。
-- **CPU 侧**：`(num_cpu_blocks, page_size_bytes × block_size_factor)`，pin_memory 或 mmap。
+- **reshape 后（GPU 单层）**：`(num_blocks, 2, block_size, num_kv_heads, head_size)`，K/V packed（dim=1 区分）。
+- **reshape 后（GPU 跨层）**：`(num_blocks, num_layers, 2, block_size, num_kv_heads, head_size)`，所有层共用。
+- **物理 stride**：由 `get_kv_cache_stride_order()` 决定——NHD（默认）或 HND（head 优先，GPU 访存更友好）。
+- **offload 规范化**：`(num_blocks, page_size_bytes)` int8 视图（§4.6.4）。
+- **CPU 侧**：`(num_cpu_blocks, page_size_bytes × block_size_factor)`，pin_memory 或 mmap（§5.3）。
 - Full 与 SWA **物理布局完全相同**（同 page_size），仅 block_table（逻辑块索引）与注意力窗口不同。
 
 **Q5：开启 KV offload 后多做了什么？**
-在 `initialize_kv_cache` 末尾调用 `register_kv_caches(kv_caches)`（`:7461`），把 per-layer GPU 张量规范化为 `CanonicalKVCaches`，驱动 `CPUOffloadingWorker` 在 CPU 侧分配对应 buffer，并用两个单向 handler 异步搬运。scheduler 侧同时启用 `OffloadingConnectorScheduler` + `CPUOffloadingManager` 管理 CPU 块池与淘汰策略。
+在 `initialize_kv_cache` 末尾：若满足跨层条件（§5.4），走 `register_cross_layers_kv_cache` 直接构造 `CanonicalKVCaches`；否则走 `register_kv_caches` 逐层去重聚合。最终驱动 `CPUOffloadingWorker` 在 CPU 侧分配对应 buffer，用两个单向 handler 异步搬运。scheduler 侧同时启用 `OffloadingConnectorScheduler` + `CPUOffloadingManager` 管理 CPU 块池与淘汰策略。
+
+**Q6：文档里提到的两个 "packed" 到底有什么区别？**
+- **K/V Packed（§4.6）**：所有 backend 通用——K 和 V 共享一个 tensor，dim=1 大小为 2。搬一个 block 就搬了该层的 K+V。
+- **Packed Config（§2.8）**：仅 DSv4/`enable_cross_layers_blocks` 触发——配置层把多层 page 拼成一个 `KVCacheTensor`，用 `block_stride` 标记。让物理 block 从几 KB 放大到 MB 级。
+- 两者叠加 + 跨层 block（§5.4），可实现"一个 block = 全层 K+V 连续数据 = 单次 DMA"。
+
+**Q7：为什么 Full+SWA 混合注意力模型默认不走跨层路径？**
+因为 `use_uniform_kv_cache` 的三个条件中，条件②要求只有一个 attention group（§5.4.1）。混合模型有多 group → 不满足，必须走 per-layer 路径。但 per-layer 路径仍然享受 K/V packed（§4.6）的优势。
+
+**Q8：CPU 侧的 `block_size_factor` 是做什么的？**
+把 CPU block 放大为 N 个 GPU block 的大小（§5.3）。默认 N=1（CPU block = GPU block），设为更大的值可以：
+- 减少 DMA 启动次数（每次搬更大的块）
+- 降低 Manager 端 block 池元数据开销
+- 代价是换入/换出粒度变粗（可能搬不需要的 GPU block）
 
 ---
 
