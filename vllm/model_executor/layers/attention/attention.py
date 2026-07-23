@@ -443,12 +443,16 @@ class Attention(nn.Module, AttentionLayerBase):
         compilation_config.static_forward_context[prefix] = self
         self.attn_type = attn_type
 
+        # 跨层 KV 共享：若指定了 target 层名，先校验其存在且在本层之前、类型一致，
+        # 之后本层将复用 target 层的 KV cache 而不单独分配。
         if kv_sharing_target_layer_name is not None:
             validate_kv_sharing_target(
                 prefix,
                 kv_sharing_target_layer_name,
                 compilation_config.static_forward_context,
             )
+        # KV cache 借用人标记：非空时本层不占 KV 显存、只读 target 层的 KV。
+        # 该字段会透传到各 attention backend，并被 KV cache 分配逻辑用来跳过本层。
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
         # Gemma4: clamp mm_prefix bidirectional ranges by the sliding window
         # (read by the Triton backend impl). Default False for all other models.
@@ -638,6 +642,7 @@ class Attention(nn.Module, AttentionLayerBase):
             # bytes per block. Otherwise (page_size_padded is None) the smallest
             # block is fine — ``unify`` scales it up by an integer ratio.
             shared_page = vllm_config.cache_config.skip_page_size_padded
+            # 先算出一个block占多少字节
             sw_per_token = SlidingWindowSpec(
                 block_size=1,
                 num_kv_heads=self.num_kv_heads,
@@ -647,6 +652,8 @@ class Attention(nn.Module, AttentionLayerBase):
                 kv_quant_mode=quant_mode,
                 sliding_window=self.sliding_window,
             ).real_page_size_bytes
+            # ⚠️ swa 层自己算出block size?
+            # 在该 backend 支持的 kernel block 集合里，挑最大的、且整页仍能塞进 shared_page 的那个 block
             sw_block_size = _largest_kernel_block_within(
                 self.attn_backend, sw_per_token, shared_page, block_size
             )

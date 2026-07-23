@@ -129,7 +129,8 @@ class UvaBackedTensor:
 
     def copy_to_uva(self, n: int | None = None) -> torch.Tensor:
         # CPU-to-CPU copy
-        # CPU -> UVA(CPU) -> GPU
+        # CPU -> UVA(CPU)
+        # GPU直读
         self.gpu = self.pool.copy_to_uva(self.np[:n] if n is not None else self.np)
         return self.gpu
 
@@ -163,17 +164,18 @@ class StagedWriteTensor:
         else:
             # For a large but not-frequently-accessed tensor, we can use UVA instead of
             # GPU to save GPU memory
-            # UVA 是什么？范围不频繁的选择UVA？
-            # size 是完整的，不是只有num_rows
+            # UVA pinned CPU内存，GPU可以直读
             self._uva_buf = UvaBuffer(size, dtype)
             self.gpu = self._uva_buf.uva
 
         self._staged_write_indices: list[int] = []
         self._staged_write_starts: list[int] = []
+        # 所有requests的contents都会flatten放入write_contents
         self._staged_write_contents: list[int | float] = []
         self._staged_write_cu_lens: list[int] = []
 
         # [ max_concurrency, num_rows ]
+        # gpu可以直读的uva缓存区，最多允许 num_rows个请求并发
         new_buffer = partial(UvaBufferPool, max_concurrency=max_concurrency)
 
         self.write_indices = new_buffer(self.num_rows, dtype=torch.int32)
@@ -224,13 +226,15 @@ class StagedWriteTensor:
 
         # Special handling for write_contents
         # CPU -> GPU
+        # 所有requests的contents都会flatten放入write_contents
         write_contents = async_tensor_h2d(
             self._staged_write_contents, device=self.device, dtype=self.dtype
         )
 
         # Write diffs to the GPU buffer
+        #  n 个thread block并行执行
         _apply_write_kernel[(n,)](
-            self.gpu,
+            self.gpu, # GPU or UVA
             self.gpu.stride(0),
             indices_uva, # UVA
             starts_uva, # UVA
@@ -256,12 +260,18 @@ class FusedStagedWriter:
     def __init__(
         self, device: torch.device, max_writes: int, max_concurrency: int | None = None
     ):
+        # 4 个 UvaBufferPool 全部用 int32：group/indices/starts/cu_lens 都是整型路由元数据，
+        # 只承载"写哪个 tensor、哪一行、从哪开始、写多长"，不占 GPU 显存
         new_pool = partial(
             UvaBufferPool, dtype=torch.int32, max_concurrency=max_concurrency
         )
+        # 每条写入归属的 tensor 编号（group 标签）
         self.group_ids = new_pool(max_writes)
+        # 目标行号（如 request index）
         self.indices = new_pool(max_writes)
+        # 行内起始列
         self.starts = new_pool(max_writes)
+        # 全局累积长度，标记每条写入在 contents 中的边界
         self.cu_lens = new_pool(max_writes)
         self.device = device
 
@@ -272,33 +282,44 @@ class FusedStagedWriter:
         output_strides: torch.Tensor,
     ) -> None:
         """Apply and clear the staged writes of `tensors` with one kernel."""
+        # 先在所有 tensor 的 staged writes 在 CPU 侧聚合成 5 个全局列表
         group_ids: list[int] = []
         indices: list[int] = []
         starts: list[int] = []
         contents: list[int | float] = []
         cu_lens: list[int] = []
 
+        # 遍历每个 tensor，用其在列表中的下标作为 group_id
         for group_id, t in enumerate(tensors):
             n = len(t._staged_write_indices)
             if n == 0:
+                # 该 tensor 没有待写内容，跳过
                 continue
 
+            # 给这 n 条写入统一打上 group_id 标签，kernel 据此路由到对应输出 tensor
             group_ids.extend([group_id] * n)
             indices.extend(t._staged_write_indices)
             starts.extend(t._staged_write_starts)
+            # contents 是跨 group 全局拼接的，所以 cu_lens 也要整体平移 content_base，
+            # 拼成连续的全局累积长度，保证 kernel 用 cu_lens[pid-1]/[pid] 取边界正确
             content_base = len(contents)
             contents.extend(t._staged_write_contents)
             cu_lens.extend(content_base + cu_len for cu_len in t._staged_write_cu_lens)
 
         if not group_ids:
+            # 没有任何写入，直接返回，避免启动空 kernel
             return
 
+        # 元数据走 UVA：CPU 写进 pinned 缓冲，GPU kernel 直接读，省去显式 H2D 拷贝
         group_ids_uva = self.group_ids.copy_to_uva(group_ids)
         indices_uva = self.indices.copy_to_uva(indices)
         starts_uva = self.starts.copy_to_uva(starts)
         cu_lens_uva = self.cu_lens.copy_to_uva(cu_lens)
+        # 内容数据量大且 kernel 内连续读，直接异步搬上 GPU（non_blocking 重叠传输）
         contents_gpu = async_tensor_h2d(contents, device=self.device, dtype=torch.int32)
 
+        # 单次 kernel 启动，MULTI_GROUP=True：
+        # output_ptrs/output_strides 是 [num_groups] 指针数组，kernel 内按 group_id 解引用到各自 tensor
         _apply_write_kernel[(len(group_ids),)](
             output_ptrs,
             output_strides,
@@ -308,8 +329,10 @@ class FusedStagedWriter:
             cu_lens_uva,
             group_ids_uva,
             BLOCK_SIZE=1024,
+            # 与 StagedWriteTensor.apply_write 的区别：跨多个 tensor 融合、靠 group_id 路由
             MULTI_GROUP=True,
         )
+        # 一批写完后统一清空所有 tensor 的暂存，便于下一轮 stage
         for t in tensors:
             t.clear_staged_writes()
 
@@ -326,6 +349,25 @@ def _apply_write_kernel(
     BLOCK_SIZE: tl.constexpr,
     MULTI_GROUP: tl.constexpr,
 ):
+    """
+    Triton kernel：将多条分散写入批量写入目标 tensor。
+
+    每个 program (pid) 负责一条写入，将 write_contents 中对应区间的内容
+    写入 output 的指定行和列偏移位置。支持单组和多组模式：
+    单组模式下所有写入目标同一 tensor；多组模式下每条写入可指向不同的
+    输出 tensor（如多个 KV cache group）。
+
+    Args:
+        output_ptr: 单组模式下为目标数据指针；多组模式下为指向各组数据指针的指针数组
+        output_stride: 单组模式下为行 stride；多组模式下为指向各组行 stride 的指针
+        write_indices_ptr: 各条写入的目标行号（UVA pinned 内存）
+        write_starts_ptr: 各条写入的行内起始列偏移（UVA pinned 内存）
+        write_contents_ptr: 扁平拼接的全部写入内容（GPU 显存）
+        write_cu_lens_ptr: 累积长度数组，标记每条写入内容在 write_contents 中的边界（UVA pinned 内存）
+        write_group_ids_ptr: 各条写入所属的组 ID，仅多组模式下使用
+        BLOCK_SIZE: tl.constexpr，每个线程块处理的元素数
+        MULTI_GROUP: tl.constexpr，是否启用多组模式
+    """
     pid = tl.program_id(0)
     row_idx = tl.load(write_indices_ptr + pid)
     start_idx = tl.load(write_starts_ptr + pid)

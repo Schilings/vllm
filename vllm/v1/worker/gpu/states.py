@@ -30,11 +30,13 @@ class RequestState:
         # NOTE(woosuk): This tensor can be extremely large (e.g., several GBs)
         # depending on the configured max_num_reqs and max_model_len.
         # To save GPU memory, we use UVA instead of GPU for this tensor.
-        # 记录每个req的所有token ids? 使用UVA
+        # uva_instead_of_gpu=True，apply_write之后实际写入gpu，否则的是uva cpu内存
+        # ⚠️ UVA CPU内存，GPU直读
         self.all_token_ids = StagedWriteTensor(
             (self.max_num_reqs, self.max_model_len),
             dtype=torch.int32,
             device=device,
+            # 不使用GPU，使用UVA CPU内存
             uva_instead_of_gpu=True,
         )
         # NOTE(woosuk): Distinguish clearly between prompt_len and prefill_len:
@@ -46,15 +48,19 @@ class RequestState:
         # preemption, prefill_len may be greater. Differentiating between these values
         # is crucial, as certain features such as prompt logprobs or frequency penalties
         # must treat prompt and output tokens separately.
+        # ⚠️ UVA CPU内存，GPU直读
         self.prompt_len = UvaBackedTensor(self.max_num_reqs, dtype=torch.int32)
         self.prefill_len = UvaBackedTensor(self.max_num_reqs, dtype=torch.int32)
+
         # total_len = prompt_len + output_len. It grows as the request progresses.
+        # ⚠️ GPU，apply_write之后写入GPU
         self.total_len = StagedWriteTensor(
             self.max_num_reqs, dtype=torch.int32, device=device
         )
 
         # Number of computed tokens.
         self.num_computed_prefill_tokens = np.zeros(self.max_num_reqs, dtype=np.int32)
+        #⚠️  GPU，apply_write之后写入GPU
         self.num_computed_tokens = StagedWriteTensor(
             self.max_num_reqs, dtype=torch.int32, device=device
         )
@@ -62,6 +68,7 @@ class RequestState:
         self.num_computed_tokens_np = np.zeros(self.max_num_reqs, dtype=np.int32)
 
         # Last sampled tokens.
+        # ⚠️  GPU，这个比较重要，用于记录上一次调度生成的tokenids，方便async schedule提前调度时读取上次输出
         self.last_sampled_tokens = torch.zeros(
             self.max_num_reqs, 1, dtype=torch.int64, device=device
         )
@@ -70,13 +77,14 @@ class RequestState:
         self.max_seq_len = np.zeros(self.max_num_reqs, dtype=np.int32)
 
         # Draft tokens.
+        # ⚠️ GPU
         self.draft_tokens = torch.zeros(
             self.max_num_reqs,
             self.num_speculative_steps,
             dtype=torch.int64,
             device=device,
         )
-
+        # ⚠️ GPU
         self.next_prefill_tokens = torch.zeros(
             self.max_num_reqs, dtype=torch.int32, device=device
         )
@@ -105,6 +113,7 @@ class RequestState:
             f"prefill_len {prefill_len} < prompt_len {prompt_len}"
         )
         self.prefill_len.np[req_idx] = prefill_len
+        # start = 0
         self.total_len.stage_write_elem(req_idx, prefill_len)
         self.all_token_ids.stage_write(req_idx, 0, all_token_ids)
         self.num_computed_prefill_tokens[req_idx] = num_computed_tokens

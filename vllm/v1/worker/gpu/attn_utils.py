@@ -48,15 +48,18 @@ class AttentionCGSupportInfo:
 
 
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
+    # 返回字典{ layer_name -> KVCacheSpec }
     kv_cache_spec: dict[str, KVCacheSpec] = {}
     layer_type = cast(type[Any], AttentionLayerBase)
     attn_layers = get_layers_from_vllm_config(vllm_config, layer_type)
     for layer_name, attn_module in attn_layers.items():
+        # 该layer复用其他layer的KV cache，则跳过
         if getattr(attn_module, "kv_sharing_target_layer_name", None):
             # This layer will use KV cache of the sharing target layer.
             continue
         # Skip modules that don't need KV cache (eg encoder-only attention)
         if spec := attn_module.get_kv_cache_spec(vllm_config):
+            # 如果是Attention架构
             if isinstance(spec, AttentionSpec):
                 backend = attn_module.get_attn_backend()
                 # indexes_kv_by_block_stride() -> get_kv_cache_stride_order() ->
@@ -89,6 +92,8 @@ def init_attn_backend(
     # Add KV-sharing layers to their target's kv cache group so they are
     # discovered alongside the target layer in Phase 1 below.
     add_kv_sharing_layers_to_kv_cache_groups(
+        # 获取哪些layer需要复用别的layer的kv cache
+        # { layer_name -> target_layer_name }
         get_shared_kv_cache_layers(vllm_config), kv_cache_config.kv_cache_groups
     )
 

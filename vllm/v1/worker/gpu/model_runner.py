@@ -219,7 +219,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             vocab_size=self.vocab_size,
             device=self.device,
         )
-        # 输入 buffers（预分配）
+        # 输入gpu buffers（预分配）: input_ids,positions,query_start_loc,is_padding,seq_lens,dcp_local_seq_lens
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
@@ -398,6 +398,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return torch.cuda.current_stream(self.device)
 
     def get_kv_cache_spec(self):
+        # 返回字典{ layer_name -> KVCacheSpec }
         return get_kv_cache_spec(self.vllm_config)
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
@@ -414,6 +415,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 getattr(self.model_config.hf_config, "max_source_positions", 0),
             )
 
+        # Hybrid Attention，已经分组完成。例如[ Full 0, SWA 0, SWA 1 ]
         block_sizes = []
         max_num_blocks_per_group = []
         for kv_cache_group in kv_cache_config.kv_cache_groups:
@@ -422,6 +424,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # When using DCP, each request's KV cache is sharded among different ranks.
             # As a result, one block on the current rank covers `block_size * cp_size`
             # tokens in the full, global (unsharded) sequence.
+            # 如果开启了DCP，那么实际的block_size = block_size * cp_size
+            # 一个请求需要匹配的token数 = block_size * cp_size，才是表示匹配了一个block
             max_num_blocks = cdiv(
                 block_table_max_model_len, spec.block_size * self.dcp_size
             )
@@ -440,13 +444,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.attn_groups, attn_cg_support, self.kernel_block_sizes = init_attn_backend(
             self.kv_cache_config, self.vllm_config, self.device
         )
-        #
+        # 每组各自维护自己的 block table
         self.block_tables = BlockTables(
+            # block_sizes: 每个组的block_size，例如[ Full 0, SWA 0, SWA 1 ]
             block_sizes=block_sizes,
             max_num_reqs=self.max_num_reqs,
             max_num_batched_tokens=self.max_num_tokens,
+            # max_num_blocks_per_group: 每个组的最大block数，例如[ Full 0, SWA 0, SWA 1 ]
             max_num_blocks_per_group=max_num_blocks_per_group,
             device=self.device,
+            # kernel_block_sizes: 每个组的kernel_block_sizes，例如[ Full 0, SWA 0, SWA 1 ]
             kernel_block_sizes=self.kernel_block_sizes,
             cp_size=self.dcp_size,
             cp_rank=self.dcp_rank,
