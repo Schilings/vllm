@@ -100,9 +100,16 @@ class KVCacheSpecKind(str, Enum):
 class KVCacheSpec:
     """
     A base class for specifying the KV cache format of one layer.
+    描述"单层"KV 缓存的格式与布局。它是连接两端的桥梁:
+      - 给 KV manager / block pool:经 page_size_bytes + max_memory_usage_bytes
+        决定每块占多少字节、缓存该层需要多少显存;
+      - 给 attention backend:经 copy_with_new_block_size 换虚拟分块后,决定
+        block table 的 stride 解读方式。
+    所有具体 spec(Full/SlidingWindow/MLA/Mamba/...)都派生自此。
     """
 
     # number of tokens in a block
+    # 逻辑定义的block size
     block_size: int
 
     @property
@@ -117,6 +124,7 @@ class KVCacheSpec:
 
     @property
     def storage_block_size(self) -> int:
+        # 实际存储的物理block size
         return self.block_size
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
@@ -139,6 +147,7 @@ class KVCacheSpec:
         """
         Merge a list of KVCacheSpec objects into a single KVCacheSpec object.
         """
+        # 这个是一个实例，完全一致！对同个实例的引用！
         assert all(spec == specs[0] for spec in specs[1:]), (
             "All layers in the same KV cache group must be the same."
         )
@@ -150,11 +159,20 @@ class KVCacheSpec:
         """
         Whether this KVCacheSpec is uniform with all specs of all layers.
         """
+        # Registry 允许不同 spec 子类注册为同一个"统一基类"。
+        # FullAttentionSpec  ←── MLAAttentionSpec
+        #                    ←── TQFullAttentionSpec
+        #                    ←── SinkFullAttentionSpec
+        # 这几个虽然 class 不同，但它们的 uniform_type_base_spec 都注册为 FullAttentionSpec，所以在 KV cache 分组时被视为同一类型。
+        # 1. 查 registry：我这个 spec 属于哪个基类 FullAttentionSpec？
+        #    内部沿 MRO 往上找，找到第一个注册过的基类，返回其 uniform_type_base_spec
         uniform_type_base_spec = KVCacheSpecRegistry.get_uniform_type_base_spec(self)
         assert uniform_type_base_spec is not None, (
             f"Unsupported KV cache spec type: {type(self)}. "
             "Please register it using @register_kv_cache_spec decorator."
         )
+
+        # 2. 检查集合中所有 spec 是否都属于同一个统一类型
         return all(
             isinstance(spec, uniform_type_base_spec) for spec in kv_cache_specs.values()
         )
@@ -215,6 +233,8 @@ class FullAttentionSpec(AttentionSpec):
 
     head_size_v: int = None  # type: ignore[assignment]
 
+    # 保留所有 token（最多 max_model_len），从不淘汰
+    # 但只计算窗口内的kv
     sliding_window: int | None = None
     """
     Default to None for not using sliding window attention.
@@ -246,6 +266,7 @@ class FullAttentionSpec(AttentionSpec):
 
     @classmethod
     def merge_window_sizes(cls, window_sizes: set[int]) -> int | None:
+        # 计算的window size只能一个
         if len(window_sizes) == 0:
             return None
         elif len(window_sizes) == 1:
@@ -266,6 +287,7 @@ class FullAttentionSpec(AttentionSpec):
             "All attention layers in the same KV cache group must be FullAttentionSpec."
         )
 
+        # 计算的sliding window只允许一样的
         sliding_window = set(
             spec.sliding_window for spec in specs if spec.sliding_window is not None
         )
@@ -312,12 +334,16 @@ class FullAttentionSpec(AttentionSpec):
             # Packed layout per head: fp4 data + fp8 block scales.
             # fp4 data: head_size//2 bytes (2 fp4 values per byte)
             # fp8 block scale: head_size//16 bytes (1 scale per 16 elements)
+            # fp4数据+fp8量化scale
             last_dim = nvfp4_kv_cache_full_dim(
                 self.head_size
             ) + nvfp4_kv_cache_full_dim(self.head_size_v)
         elif self.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
+            # int4量化，但是kv cache分配单位为byte
+            # 没有scale值
             last_dim = self.head_size // 2 + self.head_size_v // 2
         else:
+            # kv head dim不一致
             last_dim = self.head_size + self.head_size_v
         return (
             self.block_size * self.num_kv_heads * last_dim * get_dtype_size(self.dtype)
@@ -364,16 +390,20 @@ class MLAAttentionSpec(FullAttentionSpec):
     # TODO(Lucas/Chen): less hacky way to do this
     cache_dtype_str: str | None = None
     # DeepseekV4 only fields. Non-DeepseekV4 MLA models leave these at defaults.
+    # ⚠️ self.page_size_padded = real_page_size_bytes填充到alignment倍数
     alignment: int | None = None  # Default to None for no padding.
+    # 压缩比
     compress_ratio: int = 1  # Default to 1 for no compression.
     model_version: str | None = None
 
     def __post_init__(self):
         super().__post_init__()
+        # ⚠️ self.page_size_padded = real_page_size_bytes填充到alignment倍数
         _apply_alignment_padding(self)
 
     @property
     def storage_block_size(self) -> int:
+        # 开启了压缩，实际存储block size改变
         return self.block_size // self.compress_ratio
 
     @property
@@ -382,6 +412,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             if self.model_version == "deepseek_v4":
                 # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
                 # head_size stays semantic (512); bytes are determined here.
+                # ⚠️ DeepSeek V4强制：448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
                 return self.storage_block_size * 584
             # V3.2 main MLA: 656-byte custom layout (kv_lora_rank=512 +
             # qk_rope_head_dim=64, head_size=576). See flashmla_sparse.py.
@@ -390,6 +421,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             head_dim = self.head_size // 2
         else:
             head_dim = self.head_size
+        # 单份head dim
         return (
             self.storage_block_size
             * self.num_kv_heads
@@ -402,6 +434,7 @@ class MLAAttentionSpec(FullAttentionSpec):
         assert all(isinstance(spec, MLAAttentionSpec) for spec in specs), (
             "All attention layers in the same KV cache group must be MLAAttentionSpec."
         )
+        # 需要属性全都一致！
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
@@ -516,6 +549,7 @@ class ChunkedLocalAttentionSpec(AttentionSpec):
 
 @dataclass(frozen=True, kw_only=True)
 class SlidingWindowSpec(AttentionSpec):
+    # 只保留最近 ~4096 个 token，旧 block 被主动释放
     sliding_window: int
     head_size_v: int = None  # type: ignore[assignment]
 
@@ -579,6 +613,7 @@ class SlidingWindowSpec(AttentionSpec):
     def is_uniform_with_collection(
         self, kv_cache_specs: dict[str, KVCacheSpec]
     ) -> bool:
+        # 都是SlidiWindowSpec且sliding_window一致
         return all(
             isinstance(spec, SlidingWindowSpec)
             and spec.sliding_window == self.sliding_window
@@ -592,11 +627,13 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
 
     cache_dtype_str: str | None = None
     # DeepseekV4-only: see MLAAttentionSpec.model_version.
+    # ⚠️ self.page_size_padded = real_page_size_bytes填充到alignment倍数
     alignment: int | None = None  # Default to None for no padding.
     compress_ratio: int = 1
     model_version: str | None = None
 
     def __post_init__(self):
+        # ⚠️ self.page_size_padded = real_page_size_bytes填充到alignment倍数
         _apply_alignment_padding(self)
 
     @property
@@ -793,6 +830,7 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
 
     @property
     def page_size_bytes(self) -> int:
+        # ⚠️ 是求sum！！！！
         return sum(spec.page_size_bytes for spec in self.kv_cache_specs.values())
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
@@ -810,11 +848,13 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         Uses the registry to determine grouping base classes, so custom specs
         that inherit from FullAttentionSpec are treated as full attention.
         """
+        # block size肯定要一样！
         block_sizes = set(spec.block_size for spec in kv_cache_specs.values())
         if len(block_sizes) > 1:
             # Different block sizes, not uniform.
             return False
         first_spec = next(iter(kv_cache_specs.values()))
+        #
         return first_spec.is_uniform_with_collection(kv_cache_specs)
 
     @classmethod
@@ -823,6 +863,7 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         Return a SameTypeKVCacheSpecs object if all layers have the same type
         of KV cache spec. Return None if not.
         """
+        # 所以KVCacheSpec的父基类相同 且 block_size一致
         if cls.is_uniform_type(kv_cache_specs):
             block_size = next(iter(kv_cache_specs.values())).block_size
             return cls(block_size=block_size, kv_cache_specs=kv_cache_specs)
@@ -834,6 +875,17 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         return list(set(spec.page_size_bytes for spec in self.kv_cache_specs.values()))
 
     def get_num_layer_tuples(self) -> int:
+        # full MLA group:
+        #   layer_0: page_size=1000  ─┐
+        #   layer_1: page_size=1000   │→ 最常见，出现 11 次
+        #   ...                       │
+        #   layer_10: page_size=1000 ─┘
+        #   layer_11: page_size=2000 ─┐
+        #   ...                       │→ 出现 10 次
+        #   layer_20: page_size=2000 ─┘
+        #
+        # Counter: {1000: 11, 2000: 10}
+        # most_common(1) → (1000, 11) → num_layer_tuples = 11
         return Counter(
             spec.page_size_bytes for spec in self.kv_cache_specs.values()
         ).most_common(1)[0][1]

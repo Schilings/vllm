@@ -42,6 +42,9 @@ class CPUOffloadingManager(OffloadingManager):
     Policy-specific block organization and eviction decisions are delegated
     to the CachePolicy implementation.
     """
+    """
+    这个类只负责管理逻辑CPU block，不负责实际的transfer逻辑
+    """
 
     def __init__(
         self,
@@ -118,7 +121,7 @@ class CPUOffloadingManager(OffloadingManager):
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         # counts 与 policy不是绑定的
-        # counts每次lookup都会统计 访问次数，在这里用来只 offload 被访问过足够多次的 block
+        # ⚠️ counts每次lookup都会统计 访问次数，在这里用来只 offload 被访问过足够多次的 block
         # 等到prepare_store的时候才会看counts记录的访问次数来选择offload哪些block
         if self.counts is not None:
             if key in self.counts:
@@ -147,14 +150,14 @@ class CPUOffloadingManager(OffloadingManager):
         blocks = []
         for key in keys:
             block = self._policy.get(key)
-            # policy存储的都是已经从gpu store到cpu的block
+            # ⚠️ policy 存储的都是已经从gpu store到cpu的block
             assert block is not None, f"Block {key!r} not found in cache"
             assert block.is_ready, f"Block {key!r} is not ready for reading"
             if block.ref_cnt == 0:
                 self._policy.mark_non_evictable(key)
                 self._num_evictable_cache_blocks -= 1  # ref_cnt 0 -> 1
                 assert self._num_evictable_cache_blocks >= 0
-            # 临时引用，完成后释放引用
+            # ⚠️ 临时引用，完成后释放引用
             # 所以只要在传输状态下的block，ref_cnt > 0
             # 其余时候都是ref_cnt=0，是evictable
             block.ref_cnt += 1
@@ -164,17 +167,18 @@ class CPUOffloadingManager(OffloadingManager):
 
     @override
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
+        # ⚠️ LRU touch，放到队尾，保留更久
         self._policy.touch(keys)
 
     @override
     def complete_load(
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> None:
+        # ⚠️ 完成后释放引用
         for key in keys:
             block = self._policy.get(key)
             assert block is not None, f"Block {key!r} not found"
             assert block.ref_cnt > 0, f"Block {key!r} ref_cnt is already 0"
-            # 完成后释放引用
             block.ref_cnt -= 1
             if block.ref_cnt == 0:
                 self._num_evictable_cache_blocks += 1  # ref_cnt 1 -> 0
@@ -205,7 +209,7 @@ class CPUOffloadingManager(OffloadingManager):
                 evicted_keys=[],
             )
 
-        # cpu内存不足，需要lru淘汰腾出空间
+        # ⚠️ cpu内存不足，需要lru淘汰腾出空间
         num_blocks_to_evict = len(keys_to_store) - self._get_num_free_blocks()
 
         to_evict: list[OffloadKey] = []
@@ -243,14 +247,14 @@ class CPUOffloadingManager(OffloadingManager):
                 )
             )
 
-        # 分配新的block（不涉及内存，单纯逻辑）
+        # ⚠️ 分配新的block（不涉及内存，单纯逻辑）
         blocks = self._allocate_blocks(keys_to_store)
         assert len(blocks) == len(keys_to_store), (
             "Block pool did not allocate the expected number of blocks"
         )
 
         # 同时插入policy
-        # policy里存的都是已经offload的block，跳过这些
+        # ⚠️ policy里存的都是已经offload的block，跳过这些
         # 但此刻这些block.is_ready=False
         for key, block in zip(keys_to_store, blocks):
             self._policy.insert(key, block)

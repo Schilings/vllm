@@ -21,6 +21,7 @@ def test_block_tables_apply_staged_writes_fuses_kv_groups(monkeypatch):
         max_num_batched_tokens=64,
         max_num_blocks_per_group=[8, 8, 8],
         device=device,
+        # num_blocks [8, 8, 8] ==> [8, 16, 8]
         kernel_block_sizes=[16, 16, 8],
     )
 
@@ -30,11 +31,17 @@ def test_block_tables_apply_staged_writes_fuses_kv_groups(monkeypatch):
     for block_table in block_tables.block_tables:
         monkeypatch.setattr(block_table, "apply_write", fail_if_apply_write_called)
 
+    # 0: [[1,2]
+    #     [20,21,22,23]
+    #     []]
     block_tables.append_block_ids(
         req_index=0,
         new_block_ids=([1, 2], [10, 11], []),
         overwrite=True,
     )
+    # 1: [[3]
+    #     [24,25]
+    #     [5,6]]
     block_tables.append_block_ids(
         req_index=1,
         new_block_ids=([3], [12], [5, 6]),
@@ -121,8 +128,10 @@ def test_block_tables_apply_staged_writes_single_group():
     block_tables.append_block_ids(
         req_index=0,
         new_block_ids=([1, 2],),
+        # start = 0
         overwrite=True,
     )
+    #
     block_tables.apply_staged_writes()
     torch.accelerator.synchronize()
 

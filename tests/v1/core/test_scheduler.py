@@ -141,6 +141,7 @@ def test_async_scheduling_pp_allows_rescheduling_with_output_placeholders():
 
     # before any update_from_output, we still expect the request can be
     # scheduled again (multi-step in-flight).
+    # 没有update_from_output，也可以提前调度该request，因为asycn schedule
     output = scheduler.schedule()
     assert req.request_id in output.num_scheduled_tokens
 
@@ -196,6 +197,10 @@ def test_schedule_partial_requests():
         max_num_batched_tokens=1024,
     )
     mm_positions = [[PlaceholderRange(offset=100, length=600)] for _ in range(3)]
+    # 每个 request 的 token 布局是：
+    # [0,100)      : 100 个文本 token      ← 不耗 encoder 预算
+    # [100,700)    : 600 个 <img> 占位 token ← 耗 600 encoder 预算
+    # [700,800)    : 100 个文本 token
     requests = create_requests(
         num_requests=3,
         num_tokens=800,
@@ -208,15 +213,19 @@ def test_schedule_partial_requests():
     assert len(output.scheduled_new_reqs) == 3
     assert output.scheduled_cached_reqs.num_reqs == 0
     assert len(output.finished_req_ids) == 0
-
+    #
     assert scheduler.max_num_encoder_input_tokens == 1024
     # The first request is scheduled fully.
+    # ⚠️ encoder_compute_budget 减 600 → 剩 424；token_budget 减 800 → 224
     assert output.num_scheduled_tokens[requests[0].request_id] == 800
     # The second request is scheduled partially.
     # The <img> tokens are not scheduled because of the encoder budget.
+    # ⚠️  600 > 424 → 失败（encoder 预算不够）
+    # 只排那 100 个文本 token，image 整段推迟（注释 1489-1491 写明：encoder 是双向注意力，image 必须整块编，不能切块）
     assert output.num_scheduled_tokens[requests[1].request_id] == 100
     # The third request is also scheduled partially.
     # The <img> tokens are not scheduled because of the encoder budget.
+    # ⚠️ 同样 image 需 600，剩余 budget 仍是 424 < 600 → 失败 → 回滚到 start_pos=100
     assert output.num_scheduled_tokens[requests[2].request_id] == 100
     req_to_index = {request.request_id: i for i, request in enumerate(requests)}
     model_runner_output = ModelRunnerOutput(
@@ -229,6 +238,7 @@ def test_schedule_partial_requests():
         prompt_logprobs_dict={},
         pooler_output=[],
     )
+    #
     scheduler.update_from_output(output, model_runner_output)
 
     # Schedule the next step.
@@ -256,6 +266,7 @@ def test_schedule_prefills_gating(has_running: bool):
     scheduler = create_scheduler(max_num_seqs=16, max_num_batched_tokens=8192)
 
     if has_running:
+        # ⚠️
         # Establish a running (decode) request via a prefill + output step.
         (running_req,) = create_requests(num_requests=1, num_tokens=8, req_ids=["run0"])
         scheduler.add_request(running_req)
@@ -311,6 +322,7 @@ def _setup_remote_kv_resume(num_prompt_tokens: int, matched_tokens: int):
     # connector's external async load.
     r1, r2 = create_requests(
         num_requests=2,
+        # ⚠️ same_prompt: bool = False
         num_tokens=num_prompt_tokens,
         max_tokens=20,
         block_size=BLOCK_SIZE,
@@ -333,6 +345,7 @@ def _setup_remote_kv_resume(num_prompt_tokens: int, matched_tokens: int):
     output = scheduler.schedule()  # r1 decodes; r2 -> WAITING_FOR_REMOTE_KVS
     assert r2.status == RequestStatus.WAITING_FOR_REMOTE_KVS
     scheduler.update_from_output(
+        # finished_recving={"r2"}
         output, create_model_runner_output([r1], finished_recving={"r2"})
     )
     assert "r2" in scheduler.finished_recving_kv_req_ids
@@ -347,7 +360,9 @@ def test_throttle_prefills_excludes_fully_transferred_remote_kv():
     """
     block_size = 16
     num_prompt = block_size * 2
+
     # Fully matched: the whole prompt is loaded remotely.
+    # ⚠️ matched_tokens=num_prompt
     scheduler = _setup_remote_kv_resume(num_prompt, matched_tokens=num_prompt)
 
     output = scheduler.schedule(throttle_prefills=True)
@@ -510,6 +525,7 @@ def test_schedule_concurrent_partial_requests(enable_prefix_caching: bool):
     scheduler = create_scheduler(
         model="facebook/opt-125m",
         max_num_batched_tokens=1024,
+        # ⚠️ 单个request的允许的最长prefill长度
         long_prefill_token_threshold=400,
         enable_prefix_caching=enable_prefix_caching,
     )
@@ -579,9 +595,10 @@ def test_stop_via_update_from_output():
     """Test stopping behavior through update_from_output"""
     scheduler = create_scheduler(num_speculative_tokens=1)
 
-    # Test case 1: Stop on EOS token
+    # ===== 用例1: 命中 EOS token 停止 =====
     requests = create_requests(num_requests=2, max_tokens=10)
     for req in requests:
+        # 伪造 prefill 已完成、处于 decode 态: computed 等于总 token 数
         req.num_computed_tokens = req.num_tokens
         scheduler.requests[req.request_id] = req
         scheduler.running.append(req)
@@ -590,9 +607,12 @@ def test_stop_via_update_from_output():
     scheduler_output = SchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=CachedRequestData.make_empty(),
+        # 本步为 decode, 各请求调度 1~2 个 token
         num_scheduled_tokens={requests[0].request_id: 1, requests[1].request_id: 2},
         total_num_scheduled_tokens=3,
         scheduled_encoder_inputs={},
+        # 投机 token: 仅用于让 num_scheduled_tokens 与采样长度对齐,
+        # 实际停止判定只看 sampled_token_ids
         scheduled_spec_decode_tokens={
             requests[0].request_id: [],
             requests[1].request_id: [10],
@@ -606,9 +626,11 @@ def test_stop_via_update_from_output():
         req_ids=[req.request_id for req in requests],
         req_id_to_index={req.request_id: i for i, req in enumerate(requests)},
         sampled_token_ids=[
+            # 请求0: 仅采样到 EOS
             [EOS_TOKEN_ID],
+            # 请求1: 正常续写
             [10, 11],
-        ],  # First request hits EOS, second continues
+        ],
         logprobs=None,
         prompt_logprobs_dict={},
         pooler_output=[],
@@ -616,7 +638,8 @@ def test_stop_via_update_from_output():
 
     scheduler.update_from_output(scheduler_output, model_output)
 
-    # Verify first request stopped, second continues
+    # 验证: 请求0 命中 EOS → FINISHED_STOPPED 并移出 running; 请求1 继续
+    # (EOS 本身会被保留在 output_token_ids, 见 check_stop 先 append 后判定)
     assert len(scheduler.running) == 1
     assert scheduler.running[0].request_id == requests[1].request_id
     assert requests[0].status == RequestStatus.FINISHED_STOPPED
@@ -624,7 +647,7 @@ def test_stop_via_update_from_output():
     assert list(requests[0].output_token_ids) == [EOS_TOKEN_ID]
     assert list(requests[1].output_token_ids) == [10, 11]
 
-    # Test case 2: Stop on custom stop token
+    # ===== 用例2: 命中自定义 stop token 停止 =====
     scheduler = create_scheduler(num_speculative_tokens=2)
     requests = create_requests(num_requests=2, max_tokens=10, stop_token_ids=[42, 43])
     for req in requests:
@@ -640,6 +663,7 @@ def test_stop_via_update_from_output():
         total_num_scheduled_tokens=5,
         scheduled_encoder_inputs={},
         scheduled_spec_decode_tokens={
+            # 含 stop token 42 (仅占位/对齐用)
             requests[0].request_id: [10, 42],
             requests[1].request_id: [13],
         },
@@ -651,7 +675,8 @@ def test_stop_via_update_from_output():
     model_output = ModelRunnerOutput(
         req_ids=[req.request_id for req in requests],
         req_id_to_index={req.request_id: i for i, req in enumerate(requests)},
-        sampled_token_ids=[[10, 42, 12], [13, 14]],  # First request hits stop token
+        # 请求0: 采样 [10, 42, 12], 第二个 token(42) 命中 stop_token_ids
+        sampled_token_ids=[[10, 42, 12], [13, 14]],
         logprobs=None,
         prompt_logprobs_dict={},
         pooler_output=[],
@@ -659,16 +684,17 @@ def test_stop_via_update_from_output():
 
     scheduler.update_from_output(scheduler_output, model_output)
 
-    # Verify first request stopped on custom token
+    # 验证: 请求0 在 token 42 处停止 → FINISHED_STOPPED, stop_reason=42
+    # (check_stop 逐 token 调, append 42 后命中 → trim 掉后续 12)
     assert len(scheduler.running) == 1
     assert scheduler.running[0].request_id == requests[1].request_id
     assert requests[0].status == RequestStatus.FINISHED_STOPPED
     assert requests[0].stop_reason == 42
     assert requests[0].request_id in scheduler.finished_req_ids
-    assert list(requests[0].output_token_ids) == [10, 42]
+    assert list(requests[0].output_token_ids) == [10, 42]  # 42 保留, 12 被截掉
     assert list(requests[1].output_token_ids) == [13, 14]
 
-    # Test case 3: Stop on max tokens
+    # ===== 用例3: 达到 max_tokens 长度上限停止 =====
     scheduler = create_scheduler(num_speculative_tokens=2)
     requests = create_requests(num_requests=2, max_tokens=2)
     for req in requests:
@@ -695,7 +721,9 @@ def test_stop_via_update_from_output():
     model_output = ModelRunnerOutput(
         req_ids=[req.request_id for req in requests],
         req_id_to_index={req.request_id: i for i, req in enumerate(requests)},
-        sampled_token_ids=[[10, 11, 12], [13]],  # First request exceeds max_tokens
+        # 请求0 采样 [10, 11, 12]: 前 2 个(10,11)已达 max_tokens=2,
+        # 第 3 个(12) 因长度上限被截掉
+        sampled_token_ids=[[10, 11, 12], [13]],
         logprobs=None,
         prompt_logprobs_dict={},
         pooler_output=[],
@@ -703,16 +731,18 @@ def test_stop_via_update_from_output():
 
     scheduler.update_from_output(scheduler_output, model_output)
 
-    # Verify first request stopped due to length
+    # 验证: 请求0 因长度上限 → FINISHED_LENGTH_CAPPED
+    # (num_output_tokens >= max_tokens 时停止; 12 被 trim 掉)
     assert len(scheduler.running) == 1
     assert scheduler.running[0].request_id == requests[1].request_id
     assert requests[0].status == RequestStatus.FINISHED_LENGTH_CAPPED
     assert requests[0].request_id in scheduler.finished_req_ids
-    assert list(requests[0].output_token_ids) == [10, 11]  # Truncated to max_tokens
+    assert list(requests[0].output_token_ids) == [10, 11]  # 截断到 max_tokens
     assert list(requests[1].output_token_ids) == [13]
 
-    # Test case 4: Ignore EOS flag
+    # ===== 用例4: ignore_eos 时跳过 EOS, 继续生成 =====
     scheduler = create_scheduler(num_speculative_tokens=2)
+    # ignore_eos=True → sampling_params.eos_token_id 置为 None
     requests = create_requests(num_requests=1, max_tokens=10, ignore_eos=True)
     requests[0].num_computed_tokens = requests[0].num_tokens
     scheduler.requests[requests[0].request_id] = requests[0]
@@ -733,6 +763,7 @@ def test_stop_via_update_from_output():
     model_output = ModelRunnerOutput(
         req_ids=[requests[0].request_id],
         req_id_to_index={requests[0].request_id: 0},
+        # 首 token 即 EOS, 但 ignore_eos → 不应停止
         sampled_token_ids=[[EOS_TOKEN_ID, 10, 11]],
         logprobs=None,
         prompt_logprobs_dict={},
@@ -741,7 +772,7 @@ def test_stop_via_update_from_output():
 
     scheduler.update_from_output(scheduler_output, model_output)
 
-    # Verify request continues past EOS
+    # 验证: 请求未停止, EOS 之后的 token 也正常追加
     assert len(scheduler.running) == 1
     assert not requests[0].is_finished()
     assert list(requests[0].output_token_ids) == [EOS_TOKEN_ID, 10, 11]
@@ -852,6 +883,7 @@ def test_schedule_concurrent_batches(
         max_num_seqs=2,
         enable_prefix_caching=enable_prefix_caching,
     )
+
     requests = create_requests(
         num_requests=2,
         num_tokens=512,
@@ -933,6 +965,7 @@ def test_preempt_during_execution():
     scheduler = create_scheduler(
         max_num_batched_tokens=100,
         block_size=16,
+        # 实际只有 10 个可用
         num_blocks=11,
         enable_prefix_caching=False,
     )
@@ -941,12 +974,17 @@ def test_preempt_during_execution():
     # Schedule the first request.
     scheduler.add_request(requests[0])
     scheduler_output0 = scheduler.schedule()
+    # 第二个请求没有add request
     assert len(scheduler_output0.num_scheduled_tokens) == 1
     assert len(scheduler_output0.scheduled_new_reqs[0].block_ids[0]) == 5
 
     # Schedule the second request while the first request is still running.
     # This scenario can occur in certain cases, when max_concurrent_batches > 1
     # (e.g., when pipeline parallelism is used).
+    # ⚠️ "num_computed_tokens 已记录执行后的值" → 对，而且这是关键。
+    # schedule0 在 :1048 把 requests[0] 的 num_computed_tokens 写回成 80（prefill 完的进度）。
+    # 而此时 num_tokens_with_spec 还是 80（因为 update_from_output 还没调、output token 0 尚未追加进 _all_token_ids）。
+    # 两者相等 → num_new_tokens = 0。
     scheduler.add_request(requests[1])
     scheduler_output1 = scheduler.schedule()
     assert len(scheduler_output1.num_scheduled_tokens) == 1
@@ -965,6 +1003,7 @@ def test_preempt_during_execution():
 
     # Schedule the first request again. This will cause the preemption
     # of the second request because the KV cache is full.
+    # ⚠️ 会抢占请求1
     _ = scheduler.schedule()
     assert len(scheduler.running) == 1
     assert scheduler.running[0] == requests[0]
@@ -978,6 +1017,8 @@ def test_preempt_during_execution():
         prompt_logprobs_dict={},
         pooler_output=[],
     )
+    # ⚠️ 被抢占了的request 1
+    # 抢占只回收 KV 与计算进度，不动 token 序列；update_from_output 通过 requests 字典存活性检查、num_computed_tokens > 0 下界保护、status_before_stop 分流三处设计，保证迟到的 output 仍能安全落到已被抢占的请求上
     scheduler.update_from_output(scheduler_output1, model_runner_output1)
 
     # The second request (that is preempted) should be updated with the
@@ -1042,11 +1083,15 @@ def test_reset_connector_cache_no_connector_is_no_op_success():
 @pytest.mark.parametrize(
     "spec_tokens,output_tokens,expected",
     [
+        # 单个请求
         ([[1, 2, 3]], [[1, 2, 3, 4]], (1, 3, 3, [1, 1, 1])),  # perfect match
         ([[1, 2, 3]], [[1, 5]], (1, 3, 1, [1, 0, 0])),  # early mismatch
+        # 两个请求
         ([[1, 2], [3]], [[1, 2, 5], [3, 4]], (2, 3, 3, [2, 1])),  # multiple sequences
+        # 单个请求
         ([[1]], [[1, 2]], (1, 1, 1, [1])),  # single token sequence
         ([[]], [[5]], (0, 0, 0, [0])),  # empty sequence
+        # 两个请求
         (
             [[1, 2, 3], [4, 5, 6]],
             [[1, 2, 7], [4, 8]],
@@ -1089,6 +1134,8 @@ def test_schedule_spec_decoding_stats(spec_tokens, output_tokens, expected):
         pooler_output=[],
     )
     engine_core_outputs = scheduler.update_from_output(output, model_runner_output)
+
+    # ⚠️ 假设这次调度产生了 draft tokens
     draft_token_ids = DraftTokenIds(req_ids, spec_tokens)
     scheduler.update_draft_token_ids(draft_token_ids)
 
@@ -1470,24 +1517,39 @@ def _assert_right_kv_cache_manager(
     num_total_blocks: int,
 ):
     """Check whether KVCacheManager is correct after allocate."""
+    # 注意：此函数只校验"物理 block 是否被正确分配/标记"，并不区分这些
+    # block 里的 KV 来自本地新算、本地 prefix cache 命中还是远端 KV 命中——
+    # 只要能被 num_cached_block 计为 cached 即可（三种来源都会被标成 cached）。
+    # 因此调用方传进来的 num_tokens 始终是请求的【总】token 数，而不是增量数。
 
     # Make sure the request stats are right.
+    # 单个请求应占用的 block 数 = 总 token 数 / block_size（整数整除）。
     EXPECTED_TOTAL_BLOCKS = num_tokens // block_size
     for req in requests:
+        # 取第一个（也是唯一一个）KV cache 类型管理器的 mapping。
         blocks = scheduler.kv_cache_manager.coordinator.single_type_managers[
             0
         ].req_to_blocks[req.request_id]
         hashes = req.block_hashes
+        # num_cached_block 表示这个请求有多少 block 被标记为 cached
+        # （含本地命中与远端加载）。在 connector 测试里所有 block 最终都会
+        # 落进 cache，所以应等于总 block 数。
         assert (
             scheduler.kv_cache_manager.coordinator.single_type_managers[
                 0
             ].num_cached_block[req.request_id]
             == EXPECTED_TOTAL_BLOCKS
         )
+        # 实际分配给该请求的 block 列表长度也应等于总 block 数。
         assert len(blocks) == EXPECTED_TOTAL_BLOCKS
+        # 请求自身的 block_hashes 数量（每 block 一个 hash）同样一致，
+        # 说明前缀哈希切分与分配结果对得上。
         assert len(hashes) == EXPECTED_TOTAL_BLOCKS
 
     # Make sure we actually touched all the blocks.
+    # 所有请求共享同一个 block pool，每个请求按总 token 数占 BLOCKS_PER_REQ 个
+    # block（这里用浮点，因为最终断言是精确减法，整数除法不会有余数问题）。
+    # 空闲 block 应 = 初始总数 - 请求数 * 每请求占用数。
     BLOCKS_PER_REQ = num_tokens / block_size
     assert (
         scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
@@ -1501,23 +1563,35 @@ def _step_until_done(
     model_runner_output: ModelRunnerOutput,
 ):
     """Loop over schedule(), update_from_output() until finished."""
+    # 把一组请求从"刚 prefill 完 / 刚被调度"的状态一直驱动到全部生成结束。
+    # model_runner_output 是固定构造的假输出（sampled_token_ids=[[1000]]），
+    # 只用于让 update_from_output 把 token 写回请求、推进生成步数。
 
     all_finished = False
+    # 先吃一次初始 output（首次 prefill 阶段的 output），把 token 落地。
     _ = scheduler.update_from_output(output, model_runner_output)
     while not all_finished:
         # Schedule + a few iterations until stopping.
+        # 进入 decode 阶段：再次调度，应至少有一个 running 请求。
         output = scheduler.schedule()
         assert len(scheduler.running)
         for _, num_scheduled_tokens in output.num_scheduled_tokens.items():
             # We should be in the decode phase now.
+            # decode 阶段每个请求每步只算 1 个 token。
             assert num_scheduled_tokens == 1
+        # 一旦请求都已 prefill 完、进入纯 decode，KV connector 不应再有
+        # 需要"加载远端 KV"的新请求（metadata 应为空）。
         if scheduler.connector is not None:
             assert len(output.kv_connector_metadata.requests) == 0
+        # encoder connector 同理：decode 阶段不会再送多模态数据。
         if scheduler.ec_connector is not None:
             assert len(output.ec_connector_metadata.mm_datas) == 0
+        # 把本轮模型输出写回，拿到 EngineCoreOutputs 检查每个请求是否结束。
         ecos = scheduler.update_from_output(output, model_runner_output)[0]
         all_done = True
         for eco in ecos.outputs:
+            # 只要还有请求没拿到 finish_reason（未到 max_tokens / EOS），
+            # 本轮就不算全结束。
             if eco.finish_reason is None:
                 all_done = False
         all_finished = all_done
@@ -1531,7 +1605,11 @@ def _step_until_kv_transfer_finished(scheduler: Scheduler, req_ids: list[str]):
     """Cycle requests through a KV transfer cycle."""
 
     # Requests should first transition to WAITING_FOR_REMOTE_KVS
+    # 第一次 schedule() 时，需要 KV 传输的请求被发现本地没缓存、要等远端 → 被标成 WAITING_FOR_REMOTE_KVS，
+    # 不调度任何计算（scheduled_new_reqs == 0，running == 0）。
+    # 这是正常的"等远端 KV"状态
     output = scheduler.schedule()
+    # 需要kv transfer的请求第一次调度会跳过，触发其进行kv transfer
     assert _num_waiting_requests(scheduler) == len(req_ids)
     assert len(scheduler.running) == 0
     assert len(output.scheduled_new_reqs) == 0
@@ -1550,6 +1628,8 @@ def _step_until_kv_transfer_finished(scheduler: Scheduler, req_ids: list[str]):
     initial_ecos = scheduler.update_from_output(output, EMPTY_OUTPUT)
 
     # Simulate KV transfer completion using KVConnectorOutput.finished_recving
+    # 第二次 schedule() 之前，它只做了 update_from_output(output, EMPTY_OUTPUT)（1566 行）——传的是空的 EMPTY_OUTPUT，里面没有 finished_recving。
+    # 所以这一次 schedule() 时，调度器还不知道传输完成了。请求状态仍是 WAITING_FOR_REMOTE_KVS（还在 waiting 里），自然 running == 0、还在 waiting。
     output = scheduler.schedule()
     assert _num_waiting_requests(scheduler) == len(req_ids)
     assert len(scheduler.running) == 0
@@ -1561,6 +1641,9 @@ def _step_until_kv_transfer_finished(scheduler: Scheduler, req_ids: list[str]):
         logprobs=None,
         prompt_logprobs_dict={},
         pooler_output=[],
+        # ⚠️ 难道关键在于kv_connector_output？
+        # KV transfer 什么时候"对调度器算完成"，看的是 ModelRunnerOutput（即 worker/model runner 回传给调度器的那次 output），而不是调度器自己判断的。
+        # KV transfer 完成由 worker 侧的 KV 连接器 agent 检测，并通过 ModelRunnerOutput.kv_connector_output.finished_recving 回传给调度器；调度器完全被动接收这个信号。
         kv_connector_output=KVConnectorOutput(finished_recving=req_ids),
     )
     scheduler.update_from_output(output, MODEL_RUNNER_OUTPUT)
@@ -1576,9 +1659,23 @@ def test_kv_connector_basic(is_async: bool):
     Test whether Scheduler with KVConnector schedules tokens, allocates
     memory, and cleans up requests as expected under normal operation.
     """
+    # 本测试验证的核心点：
+    # 1) 带 KVConnector（kv_both 即同时负责加载/保存远端 KV）的 Scheduler，
+    #    在「远端 KV 命中」场景下，只调度本地还没有的【增量 token】，
+    #    而不是把 prompt 全部重算一遍。
+    # 2) 本地 prefix cache（APC）与远端 KV connector 命中可以【叠加】：
+    #    第二次发请求时，前面一半命中本地 prefix cache，后面一段命中远端，
+    #    两者都不需要重新计算。
+    # 3) 内存分配 / 回收正确：无论本地还是远端命中，最终占用的 block 数应
+    #    等于"实际需要的新 token 数 / block_size"，且请求结束后全部归还。
+    # 4) 同步（is_async=False，等 transfer 完成才继续）与异步（is_async=True，
+    #    请求先转 WAITING_FOR_REMOTE_KVS，通过 ModelRunnerOutput 回传
+    #    finished_recving 才转回）两条路径都要通过。
 
     # Setup Scheduler.
     BLOCK_SIZE = 16
+    # mock connector 会"假装"在远端匹配到 NUM_MATCHED_NEW_TOKENS 个 token 的 KV，
+    # 即这前 32 个 token 不用本地算，直接从远端加载。
     NUM_MATCHED_NEW_TOKENS = BLOCK_SIZE * 2
     scheduler = create_scheduler(
         enable_prefix_caching=True,
@@ -1587,11 +1684,15 @@ def test_kv_connector_basic(is_async: bool):
         ),
         block_size=BLOCK_SIZE,
     )
+    # 记录初始空闲 block 数，作为"内存最终应回到此值"的基准。
     NUM_TOTAL_BLOCKS = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
 
     ######################################################
     # FIRST SET OF REQUESTS - External Hit Only
+    # 第一组：只有远端命中（此时本地 prefix cache 还是空的，没有任何本地命中）。
     NUM_REQUESTS = 2
+    # 每个请求 prompt 共 64 token，其中前 32 个由远端 KV 提供，
+    # 本地只需算后 32 个。
     NUM_TOKENS = NUM_MATCHED_NEW_TOKENS * 2
     MAX_TOKENS = 3
     requests = create_requests(
@@ -1607,6 +1708,11 @@ def test_kv_connector_basic(is_async: bool):
         req_ids.append(request.request_id)
         req_to_index[request.request_id] = i
 
+    # 异步模式下，先驱动请求走完"等远端 KV"的周期：
+    # 请求先被标成 WAITING_FOR_REMOTE_KVS（不调度计算），直到
+    # ModelRunnerOutput.kv_connector_output.finished_recving 回传，
+    # 才记到 finished_recving_kv_req_ids、转回可调度状态。
+    # 同步模式则无需这一步——connector 在调度时直接同步返回已命中。
     if is_async:
         _step_until_kv_transfer_finished(scheduler, req_ids)
 
@@ -1621,31 +1727,44 @@ def test_kv_connector_basic(is_async: bool):
 
     # Ensure ScheduleOutput is correct.
     output = scheduler.schedule()
+    # 验证：2 个请求都注入了 kv_connector_metadata（需要向远端加载 KV），
+    # 且每个请求实际被调度的 token 数 = 64 - 32(远端命中) = 32。
     _assert_right_scheduler_output(
         output=output,
         num_requests=NUM_REQUESTS,
         # Just the incremental tokens should be scheduled.
+        # 远端命中的 NUM_MATCHED_NEW_TOKENS 个 token 不再需要本地计算，
+        # 只调度剩余的"增量"token。
         expected_num_scheduled_tokens=NUM_TOKENS - NUM_MATCHED_NEW_TOKENS,
     )
 
     # Ensure KVCacheManager is correct.
+    # 验证：分配到的 block 数 = NUM_TOKENS / BLOCK_SIZE（全部 64 个 token
+    # 都要物理 block，因为 KV 即使来自远端也要落本地 block 供后续注意力使用），
+    # 且这些 block 全部被标记为 cached（来自远端或本地）。
     _assert_right_kv_cache_manager(
         scheduler, requests, NUM_TOKENS, BLOCK_SIZE, NUM_REQUESTS, NUM_TOTAL_BLOCKS
     )
 
     # Continue Generation until done.
+    # 驱动 decode 阶段直到两个请求都达到 max_tokens=3 而结束。
     _step_until_done(scheduler, output, MODEL_RUNNER_OUTPUT)
     _ = scheduler.schedule()
     # Confirm we clean up the memory properly.
+    # 请求全部结束后，所有 block 应被释放，空闲数回到基准值。
     assert (
         scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == NUM_TOTAL_BLOCKS
     )
 
     ######################################################
     # SECOND SET OF REQUESTS - Local And External Hit
-    NUM_TOKENS_PREFIX = NUM_TOKENS
+    # 第二组：本地 prefix cache + 远端命中【双重命中】。
+    # 复用与第一组相同的前缀 token，使前面一段命中本地 prefix cache。
+    NUM_TOKENS_PREFIX = NUM_TOKENS  # = 64，即第一组每个请求的 prompt 长度
     # We will get a local prefix cache hit for the first
     # NUM_TOKENS_PREFIX tokens since they are used above.
+    # 第二组 prompt 翻倍到 128，前 64 个命中本地 prefix cache，
+    # 接着 32 个命中远端 KV，最后只剩 32 个需要本地算。
     NUM_TOKENS = NUM_TOKENS_PREFIX * 2
     requests = create_requests(
         num_requests=NUM_REQUESTS,
@@ -1660,6 +1779,7 @@ def test_kv_connector_basic(is_async: bool):
         req_ids.append(request.request_id)
         req_to_index[request.request_id] = i
 
+    # 异步模式同样先走完等远端 KV 的周期。
     if is_async:
         _step_until_kv_transfer_finished(scheduler, req_ids)
 
@@ -1675,6 +1795,8 @@ def test_kv_connector_basic(is_async: bool):
     # We should get a local cache hit of NUM_TOKENS_PREFIX and
     # a remote KV cache hit of NUM_MATCHED_NEW_TOKENS.
     output = scheduler.schedule()
+    # 验证：本地命中 64 + 远端命中 32 = 96 个 token 都不需重算，
+    # 每个请求只调度 128 - 64 - 32 = 32 个增量 token。
     _assert_right_scheduler_output(
         output=output,
         num_requests=NUM_REQUESTS,
@@ -1685,6 +1807,8 @@ def test_kv_connector_basic(is_async: bool):
     )
 
     # Ensure KVCacheManager is correct.
+    # 物理 block 仍需覆盖全部 128 个 token（同样，远端/本地命中的 KV 也要
+    # 落本地 block），但其中绝大多数被标记为 cached，只有增量部分是新算的。
     _assert_right_kv_cache_manager(
         scheduler, requests, NUM_TOKENS, BLOCK_SIZE, NUM_REQUESTS, NUM_TOTAL_BLOCKS
     )
@@ -1705,6 +1829,15 @@ def test_external_prefix_cache_metrics(is_async: bool, local_cache_hits: bool):
     Verify connector prefix cache metrics are updated
     correctly when the scheduler processes requests with KV connector hits.
     """
+    # 本测试验证：调度器在处理"带 KV connector 命中"的请求时，两类前缀缓存
+    # 统计指标被正确更新：
+    #   - prefix_cache_stats：本地 APC（Automatic Prefix Caching）的查询/命中；
+    #   - connector_prefix_cache_stats：远端 KV connector 的查询/命中/请求数/
+    #     被抢占请求数。
+    # 两个布尔维度交叉验证：
+    #   - is_async：同步 vs 异步（异步的本地/远端命中指标会在"等远端完成"
+    #     那一步的 ecos 里，而非最终 update_from_output 的 ecos）；
+    #   - local_cache_hits：是否还有本地 prefix cache 命中（另一组场景）。
 
     BLOCK_SIZE = 16
     if local_cache_hits:
@@ -1713,6 +1846,8 @@ def test_external_prefix_cache_metrics(is_async: bool, local_cache_hits: bool):
         NUM_REQUESTS = 1
         NUM_TOKENS = NUM_LOCAL_HITS * 2  # 128 tokens
     else:
+        # 无本地命中场景：仅验证远端 connector 指标。2 个请求、各 8 token，
+        # 远端匹配 4 token，本地无命中（enable_prefix_caching=False）。
         NUM_MATCHED_NEW_TOKENS = 4
         NUM_LOCAL_HITS = 0
         NUM_REQUESTS = 2
@@ -1720,6 +1855,7 @@ def test_external_prefix_cache_metrics(is_async: bool, local_cache_hits: bool):
 
     # Setup Scheduler.
     scheduler = create_scheduler(
+        # 本地命中场景才打开 APC，否则拿不到本地 prefix_cache_stats。
         enable_prefix_caching=local_cache_hits,
         use_kv_connector=mock_kv(
             matched_tokens=NUM_MATCHED_NEW_TOKENS, is_async=is_async
@@ -1729,6 +1865,8 @@ def test_external_prefix_cache_metrics(is_async: bool, local_cache_hits: bool):
 
     if local_cache_hits:
         # First, establish local cache by running a request to completion
+        # 先单独跑一个 64-token 的请求到结束，把它的前缀写进本地 prefix cache，
+        # 这样后面正式请求的前 64 token 才能命中本地缓存。
         requests = create_requests(
             num_requests=1,
             num_tokens=NUM_LOCAL_HITS,
@@ -1773,6 +1911,9 @@ def test_external_prefix_cache_metrics(is_async: bool, local_cache_hits: bool):
         req_ids.append(request.request_id)
         req_to_index[request.request_id] = i
 
+    # 异步模式下，先驱动请求走完"等远端 KV"周期；期间产生的 ecos 里
+    # 才带有本测试的本地/远端命中指标（initial_ecos），后面 update_from_output
+    # 的 ecos 里反而不再有这些指标。
     initial_ecos = None
     if is_async:
         initial_ecos = _step_until_kv_transfer_finished(scheduler, req_ids)
@@ -1789,6 +1930,7 @@ def test_external_prefix_cache_metrics(is_async: bool, local_cache_hits: bool):
     )
 
     # Update scheduler stats
+    # update_from_output 会汇总本次调度产生的 scheduler_stats（含两类缓存指标）。
     ecos = scheduler.update_from_output(output, MODEL_RUNNER_OUTPUT)
 
     # --- Assertions ---
@@ -1797,23 +1939,29 @@ def test_external_prefix_cache_metrics(is_async: bool, local_cache_hits: bool):
 
     if local_cache_hits:
         # For async, local cache stats come from the first step
+        # 取本地 APC 指标：同步取最终 ecos，异步取 initial_ecos（等远端那步）。
         if initial_ecos:
             local_stats = initial_ecos[0].scheduler_stats.prefix_cache_stats
         else:
             local_stats = ecos[0].scheduler_stats.prefix_cache_stats
         assert local_stats is not None
+        # 本地查询数 = 每请求总 token 数 * 请求数；命中数 = 本地命中数 * 请求数。
         assert local_stats.queries == NUM_TOKENS * NUM_REQUESTS
         assert local_stats.hits == NUM_LOCAL_HITS * NUM_REQUESTS
 
+    # 远端 connector 指标同理：同步取最终 ecos，异步取 initial_ecos。
     if initial_ecos:
         external_stats = initial_ecos[0].scheduler_stats.connector_prefix_cache_stats
     else:
         external_stats = ecos[0].scheduler_stats.connector_prefix_cache_stats
     assert external_stats is not None
 
+    # 远端查询数 = (总 token - 本地命中) * 请求数（远端只"看"本地没覆盖的部分）。
     assert external_stats.queries == (NUM_TOKENS - NUM_LOCAL_HITS) * NUM_REQUESTS
+    # 远端命中数 = 远端匹配 token 数 * 请求数。
     assert external_stats.hits == NUM_MATCHED_NEW_TOKENS * NUM_REQUESTS
     assert external_stats.requests == NUM_REQUESTS
+    # 正常流程无抢占，被抢占请求数应为 0。
     assert external_stats.preempted_requests == 0
 
 
@@ -1825,10 +1973,15 @@ def test_kv_connector_unable_to_allocate(use_ec_connector, ec_role):
     Test whether scheduler with KVConnector is able to handle
     unable to allocate (run out of blocks in allocate_slots().
     """
+    # 本测试验证：当 KV cache block 不够、allocate_slots() 无法为第二个请求分配
+    # 足够 block 时，调度器能正确让一个请求 running、另一个留在 waiting，
+    # 且等第一个请求跑完后，第二个请求能接着被调度、最终内存回收干净。
+    # 同时验证 encoder connector（use_ec_connector）的开关不影响这套行为。
 
     # Setup Scheduler With Mock External Cache Hit.
     BLOCK_SIZE = 4
     NUM_BLOCKS = 10
+    # 远端匹配 8 token（2 个 block），即每个请求只需本地算的部分减 8。
     NUM_MATCHED_NEW_TOKENS = BLOCK_SIZE * 2
     scheduler = create_scheduler(
         enable_prefix_caching=True,
@@ -1836,6 +1989,7 @@ def test_kv_connector_unable_to_allocate(use_ec_connector, ec_role):
         block_size=BLOCK_SIZE,
         num_blocks=NUM_BLOCKS,
         # encoder connector should not affect test results
+        # （开启 ec connector 只是为了确认它不干扰本次分配/调度逻辑）
         use_ec_connector=use_ec_connector,
         ec_role=ec_role,
     )
@@ -1843,6 +1997,8 @@ def test_kv_connector_unable_to_allocate(use_ec_connector, ec_role):
     # Create two requests. The second request will not be able to
     # allocate slots because it will not have enough blocks.
     NUM_REQUESTS = 2
+    # NUM_TOKENS = (10//2 + 1)*4 = 6*4 = 24 token → 需 6 个 block。
+    # 两个请求各需 6 block 共 12，超过 NUM_BLOCKS=10，故第二个放不下。
     NUM_TOKENS = (NUM_BLOCKS // 2 + 1) * BLOCK_SIZE
     MAX_TOKENS = 2
     requests = create_requests(
@@ -1868,22 +2024,30 @@ def test_kv_connector_unable_to_allocate(use_ec_connector, ec_role):
     )
 
     # Just one request should be running.
+    # 首轮调度：只有 1 个请求能分到 block 而 running，另 1 个进 waiting。
     output = scheduler.schedule()
     _assert_right_scheduler_output(
         output,
         num_requests=1,
+        # 被调度的那个请求只算增量（24 - 8 远端命中 = 16）。
         expected_num_scheduled_tokens=NUM_TOKENS - NUM_MATCHED_NEW_TOKENS,
     )
     assert len(scheduler.running) == 1
     assert len(scheduler.waiting) == 1
 
     # All memory should be freed, with one request waiting.
+    # 第一个请求跑完（max_tokens=2）后，其占用释放，但第二个仍在 waiting。
+    # 空闲 block = 总数 10 - 第二个请求仍占用的 1 个？这里其实第一个请求已结束，
+    # 第二个还没被调度，空闲应为 NUM_BLOCKS - 0？实际断言是 NUM_BLOCKS - 1，
+    # 因为 null_block 不计入可用，详见 block_pool（get_num_free_blocks 含 null
+    # block，但分配时 null_block 被预留，故"除 null 外的空闲"为 NUM_BLOCKS-1）。
     _step_until_done(scheduler, output, MODEL_RUNNER_OUTPUT)
     assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == NUM_BLOCKS - 1
     assert len(scheduler.running) == 0
     assert len(scheduler.waiting) == 1
 
     # Just one request should be running.
+    # 第二轮调度：waiting 的那个请求现在能分到 block 而 running，此时无 waiting。
     output = scheduler.schedule()
     _assert_right_scheduler_output(
         output,
@@ -1894,6 +2058,7 @@ def test_kv_connector_unable_to_allocate(use_ec_connector, ec_role):
     assert len(scheduler.waiting) == 0
 
     # All memory should be freed, with no requests waiting / running.
+    # 第二个请求也跑完，所有请求结束，内存回到"仅 null_block 被占"的状态。
     _step_until_done(scheduler, output, MODEL_RUNNER_OUTPUT)
     assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == NUM_BLOCKS - 1
     assert len(scheduler.running) == 0

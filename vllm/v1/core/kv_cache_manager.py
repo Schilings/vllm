@@ -112,6 +112,16 @@ class KVCacheBlocks:
 
 
 class KVCacheManager:
+    """KV 缓存的总编排器(facade)。
+
+    它本身不直接管理 block,而是持有一个 `coordinator`(按注意力类型分发的
+    子管理器集合,见 single_type_kv_cache_manager.py)和一个共享的 `block_pool`
+    (物理块池)。对外暴露调度器需要的核心 API:
+      - get_computed_blocks: 查 prefix cache 命中,返回可复用的已算 block;
+      - allocate_slots: 为新 token 分配/接入 block(含窗口外回收、水位线判断);
+      - free / remove_skipped_blocks: 释放或回收 block。
+    多个 KV cache group 的 block 由 coordinator 并行管理,但统一走同一套接口。"""
+
     def __init__(
         self,
         kv_cache_config: KVCacheConfig,
@@ -228,6 +238,7 @@ class KVCacheManager:
         # the single last token, because allocate_slots() requires
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
+        # ⚠️ 一定要-1，因为至少要计算最后一个token，说不定采样结果不一致呢
         max_cache_hit_length = request.num_tokens - 1
         computed_blocks, num_new_computed_tokens = (
             self.coordinator.find_longest_cache_hit(
@@ -356,7 +367,6 @@ class KVCacheManager:
 
         # The number of computed tokens is the number of computed tokens plus
         # the new prefix caching hits
-        # computed总数
         num_local_computed_tokens = (
             request.num_computed_tokens + num_new_computed_tokens
         )
@@ -368,8 +378,8 @@ class KVCacheManager:
         watermark_blocks = 0
         # The watermark is applied to waiting/preempted requests only, and only
         # when there's at least one request already scheduled.
-        # 相当于running队列有请求在decode？
-        # 每次多分配几个watermark_blocks，防止running队列太长，导致running队列中的请求被preempted
+        # 相当于running队列有请求在decode。
+        # 于是: 每次多分配几个watermark_blocks，防止running队列太长，导致running队列中的请求被preempted
         if has_scheduled_reqs and request.status in (
             RequestStatus.WAITING,
             RequestStatus.PREEMPTED,
@@ -401,9 +411,9 @@ class KVCacheManager:
             if required_blocks > self.block_pool.get_num_free_blocks():
                 return None
 
-        # 计算后的总长度，基本要slot
+        # ⚠️ 计算后的总长度，基本要slot
         num_tokens_main_model = total_computed_tokens + num_new_tokens
-        # 多一部分lookahead需要slot
+        # ⚠️ 多一部分lookahead需要slot
         num_tokens_need_slot = min(
             num_tokens_main_model + num_lookahead_tokens, self.max_model_len
         )
@@ -414,15 +424,18 @@ class KVCacheManager:
         # insufficient free blocks.
         # Should call this function before allocating new blocks to reduce
         # the number of evicted blocks.
-        # 1️⃣ 先释放窗口外 block，后面再检查够不够——这个顺序是关键
-        # SWA 层的旧 token 已经滑出窗口了，对应的 block K/V 永远不会再被这个请求访问。这些 block 现在就可以回收，不需要等到请求结束。
-        # 即使最终 block 不够、返回 None 触发 preempt，这步释放也是安全无害的——反正那些窗口外 block 永远用不到了，早点还回去就能早点给别的请求用。
+        # 1️⃣ 先释放窗口外 block，后面再检查够不够——这个顺序是关键。
+        # 一个Request只有第二次allocate时才会触发remove skipped blocks
+        # SWA 层的旧 token 已经滑出窗口了，对应的 block K/V 永远不会再被这个请求访问。
+        # 这些 block 现在就可以回收（替换成null block，实际block返回free queue），不需要等到请求结束。
         self.coordinator.remove_skipped_blocks(
             request.request_id,
             total_computed_tokens,
             num_prompt_tokens=request.num_prompt_tokens,
         )
         # 2️⃣ 需要新分配的block数，如果new_computed_blocks中有在free queue，也加上，需要touch加个引用
+        # 这个返回值，只是用于校验block pool/free queue剩余的free blocks还够不够（包括cached但free的block）
+        # 实际的allocate new blocks还是看 num new tokens
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
             num_tokens=num_tokens_need_slot,
@@ -448,7 +461,8 @@ class KVCacheManager:
             # Cannot allocate new blocks
             return None
 
-        # 3️⃣
+        # 3️⃣ 对于new local computed blocks 只需要从free queue取出，且ref_cnt += 1, 不用进行cache full
+        # 对于new external computed blocks 要从free queue取出，且ref_cnt += 1，进行cache full
         if (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks
             or num_external_computed_tokens > 0
@@ -462,7 +476,7 @@ class KVCacheManager:
                 num_external_computed_tokens=num_external_computed_tokens,
             )
 
-        # 4️⃣
+        # 4️⃣ 实际allocate只看num_tokens_need_slot、num_tokens_main_model
         new_blocks = self.coordinator.allocate_new_blocks(
             request.request_id,
             num_tokens_need_slot,

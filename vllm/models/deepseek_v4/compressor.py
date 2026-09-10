@@ -124,10 +124,26 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
         prefix: str,
     ):
         super().__init__()
+        # state_dim: 单个 token 的压缩状态总维度 = kv_state_dim + score_state_dim，
+        # 由调用方传入（DeepseekCompressor 处为 2*coff*head_dim）。fp32 存储。
         self.state_dim = state_dim
+        # 状态缓存统一用 fp32（压缩中间态需要高精度累加，避免误差累积）。
         self.dtype = dtype
         self.prefix = prefix
+        # kv_cache 在 __init__ 时为空占位张量；真正分配与"注入"发生在引擎启动时：
+        #   1) 各层 get_kv_cache_spec() 描述形状/对齐，vLLM 从一块大 kv_raw_tensor
+        #      用 torch.as_strided 切出每层的 kv_cache 视图（见 attn_utils.py 的
+        #      _reshape_attention_kv_cache）。
+        #   2) bind_kv_cache()（worker/utils.py）执行
+        #      forward_context[layer_name].kv_cache = kv_cache，直接改写本对象的
+        #      .kv_cache 属性——forward_context 正是上面注册的 static_forward_context，
+        #      故"注入"本质是一次普通属性赋值，覆盖掉占位空张量。
+        #   3) forward 时 DeepseekCompressor 通过 self._static_forward_context[
+        #      self.k_cache_prefix] 反查取回这个已填充的 kv_cache 写入压缩结果。
         self.kv_cache = torch.tensor([])
+        # 把本层注册进 static_forward_context：forward 时通过 prefix 反查拿到
+        # 真实分配好的 kv_cache（见 DeepseekCompressor.forward 里
+        # self._static_forward_context[self.k_cache_prefix]）。
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -135,6 +151,10 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
 
         assert self.dtype == torch.float32
         assert compress_ratio in [4, 128]
+        # coff(co-compress factor): C4 时 overlap=True → coff=2；C128 时 coff=1。
+        # sliding_window = coff * compress_ratio：状态缓存需要覆盖的"未压缩 token
+        # 滑动窗口"长度。C4 → 2*4=8，C128 → 1*128=128。即每个压缩块依赖其前
+        # sliding_window 个原始 token 的局部状态。
         coff = 1 + (compress_ratio == 4)
         self.sliding_window = coff * compress_ratio
         # Block size is constrained by tensor sharing between compressor states
@@ -156,6 +176,11 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
         # full-cache rows share state pages with contiguous KV pages, so padding
         # would break page matching.
         uses_fp8_ds_mla_layout = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
+        # SlidingWindowMLASpec：压缩状态缓存本质是"滑窗 + 单向量(无 K/V 分离)"的
+        # MLA 布局。head_size=self.state_dim(=kv_state_dim+score_state_dim)，
+        # num_kv_heads=1(压缩后已降秩为单头向量)，sliding_window 限制只可见最近
+        # sliding_window 个原始 token 的状态。alignment 同主 KV cache：fp8_ds_mla
+        # 用 576B 对齐，plain 用 512B。
         return SlidingWindowMLASpec(  # only has one vector instead of K + V
             block_size=self.block_size,
             num_kv_heads=1,
@@ -194,15 +219,21 @@ class DeepseekCompressor(nn.Module):
         use_fp4_cache: bool = False,
     ):
         super().__init__()
+        # compress_ratio: 压缩比，C4=4 / C128=128。决定每几个原始 token 压成 1 个状态。
         self.compress_ratio = compress_ratio
         self.hidden_size = hidden_size
+        # head_dim: 压缩后 KV 的隐维度。HCA/CSA 用 512，indexer 复用 compressor 时用 128。
         self.head_dim = head_dim
         self.rotate = rotate
         self.prefix = prefix
+        # k_cache_prefix: 主 KV cache 层在 static_forward_context 中的注册名，forward
+        # 时据此取出真实 kv_cache 张量写入压缩结果。
         self.k_cache_prefix = k_cache_prefix
         self.use_fp4_cache = use_fp4_cache
 
         config = vllm_config.model_config.hf_config
+        # RoPE 段维度（DeepSeek-V4 中 qk_rope_head_dim，如 64）；nope_head_dim 为
+        # 非位置编码段 = head_dim - rope_head_dim（如 512-64=448）。
         self.rope_head_dim = config.qk_rope_head_dim
         self.nope_head_dim = self.head_dim - self.rope_head_dim
         self.rms_norm_eps = config.rms_norm_eps
@@ -210,9 +241,13 @@ class DeepseekCompressor(nn.Module):
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.max_model_len = vllm_config.model_config.max_model_len
 
+        # overlap: 是否"重叠压缩"。C4(CSA) 需要重叠窗口 → True；C128(HCA) → False。
         self.overlap = compress_ratio == 4
+        # coff: co-compress factor，C4 时 2，C128 时 1。用于放大状态/投影维度。
         self.coff = 1 + self.overlap
 
+        # APE(Absolute Position Embedding)状态：形状 [compress_ratio, coff*head_dim]，
+        # 在 save_partial_states 时叠加到 kv/score 上注入绝对位置信息。fp32、不训练。
         state_dtype = torch.float32
         self.ape = nn.Parameter(
             torch.empty(
@@ -223,8 +258,12 @@ class DeepseekCompressor(nn.Module):
             requires_grad=False,
         )
 
+        # disable_tp=True：fused_wkv_wgate 退化为 ReplicatedLinear（权重全复制、
+        # 不按 TP 切分）。原因：压缩投影在各 TP rank 上需要完整 hidden→coff*head_dim
+        # 的输出，且后续 compressor 状态是 per-token 局部计算，无需跨 rank 分片。
         self.fused_wkv_wgate = MergedColumnParallelLinear(
             self.hidden_size,
+            # 两路合并输出：kv 投影 [coff*head_dim] + gate/score 投影 [coff*head_dim]
             [self.coff * self.head_dim, self.coff * self.head_dim],
             bias=False,
             return_bias=False,
@@ -232,8 +271,12 @@ class DeepseekCompressor(nn.Module):
             disable_tp=True,
             prefix=f"{prefix}.fused_wkv_wgate",
         )
+        # RMSNorm 作用于压缩后的 head_dim 向量（压缩→norm→RoPE 流水线的一步）。
         self.norm = RMSNorm(self.head_dim, self.rms_norm_eps)
 
+        # 持有 CompressorStateCache 子模块：state_dim = 2*coff*head_dim，即
+        # kv_state(coff*head_dim) + score_state(coff*head_dim) 拼接。score 是
+        # Lightning Indexer 路由用的稀疏分数，与 kv 一起被压缩缓存。
         self.state_cache = CompressorStateCache(
             state_dim=2 * self.coff * self.head_dim,  # kv_state + score_state
             dtype=state_dtype,
@@ -241,25 +284,39 @@ class DeepseekCompressor(nn.Module):
             prefix=f"{prefix}.state_cache",
         )
 
+        # 缓存 static_forward_context 引用：__init__ 时才能拿到 vllm_config，
+        # forward 时已不可用，故提前存引用供 forward 反查 kv_cache。
         # Save reference to static_forward_context for forward-time KV cache lookup.
         # get_current_vllm_config() is only available during __init__, not forward.
         self._static_forward_context = (
             vllm_config.compilation_config.static_forward_context
         )
 
+        # 量化 + 写 cache 的布局参数，分两条路径（对应 HCA/CSA 的 head_dim=512 与
+        # indexer 的 head_dim=128）。这些参数决定 compress_norm_rope_store 内核里
+        # 每个 token 在 KV cache 中占多少字节、scale 怎么排。
         if self.head_dim == 512:
+            # HCA/CSA 主 KV cache 路径（head_dim=512，nope=448 + rope=64）。
             assert not use_fp4_cache, (
                 "MXFP4 cache is only supported for indexer (head=128)"
             )
             self._quant_block = 64
+            # 单 token KV cache 行字节数（fp8）：NoPE 段 448 + RoPE 段 64*2(cos/sin
+            # 各存一份 fp8) = 576；这里 token_stride 即每行 fp8 字节数。
             self._token_stride = self.nope_head_dim + self.rope_head_dim * 2
+            # scale 维：NoPE 按 64 分组 → 448//64=7 个 scale，+1 为 rope 段对齐 pad，
+            # 即 7 real + 1 pad。
             self._scale_dim = self.nope_head_dim // 64 + 1  # 7 real + 1 pad
         elif self.head_dim == 128:
+            # indexer 压缩 KV 路径（head_dim=128）。
             if use_fp4_cache:
                 self._quant_block = MXFP4_BLOCK_SIZE
+                # MXFP4 每元素 4 bit，故 fp4 行字节数 = 128//2 = 64。
                 self._token_stride = self.head_dim // 2
                 self._scale_dim = self.head_dim // MXFP4_BLOCK_SIZE
             else:
+                # 默认 fp8 路径：quant_block=128 恰等于 head_dim，整 head 一组量化，
+                # 单 head 1 个 fp32 scale（4 字节）。token_stride = 128(fp8 字节)。
                 self._quant_block = 128
                 self._token_stride = self.head_dim
                 self._scale_dim = 4  # single float32 scale
@@ -270,42 +327,62 @@ class DeepseekCompressor(nn.Module):
 
     def forward(
         self,
+        # kv_score: fused_wkv_wgate 投影输出，形状 [num_tokens, 2*coff*head_dim]
+        #   前半 coff*head_dim 为 kv，后半 coff*head_dim 为 score(路由权重)。
         # [num_tokens, 2 * self.coff * self.head_dim]
         kv_score: torch.Tensor,
+        # positions: 每个 token 的绝对序列位置，形状 [num_tokens]
         # [num_tokens]
         positions: torch.Tensor,
         rotary_emb,
     ) -> None:
+        # 沿特征维切成 kv 与 score，各 [num_tokens, coff*head_dim]。
+        # 输入 bf16(GEMM 输出)，下游状态缓存用 fp32 高精度。
         # Each of shape [num_tokens, coff * self.head_dim]
         # input bf16, output are fp32
         kv, score = kv_score.split(
             [self.coff * self.head_dim, self.coff * self.head_dim], dim=-1
         )
 
+        # 取当前 forward 的 attention metadata；dummy profiling run 时
+        # attn_metadata 不是 dict，直接 return 跳过实际计算。
         # Get the metadata and handle dummy profiling run.
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):
             return
 
+        # 取出本 compressor 层对应的 CompressorMetadata（含 slot_mapping/block_table）。
         state_metadata = cast(
             CompressorMetadata, attn_metadata[self.state_cache.prefix]
         )
+        # token_to_req_indices: [num_tokens] 每 token → (req_id, 局部索引)。
         token_to_req_indices = state_metadata.token_to_req_indices
+        # slot_mapping: [num_tokens] 每 token 在 state_cache 的物理槽位。
         slot_mapping = state_metadata.slot_mapping
+        # num_actual: 本步有效 token 数（剔除 padding）。
         num_actual = slot_mapping.shape[0]
+        # block_table: [num_reqs, num_blocks] 逻辑块→物理块映射（与 KV cache 共享）。
         block_table = state_metadata.block_table
         block_size = state_metadata.block_size
 
+        # ⚠️ state_cache: 真实分配的 paged 张量，形状 [num_blocks, block_size, 2*state_dim]
+        #   其中 state_dim = coff*head_dim（kv 与 score 同维）。
         # [num_blocks, block_size, kv_dim+score_dim], where kv_dim == score_dim
         state_cache = self.state_cache.kv_cache
+
+        # state_width = 单路宽度(=total//2)；前 [..,:state_width] 是 kv_state，
+        # 后 [..,state_width:] 是 score_state。
         # kv_state stored in first half, score_state stored in second half
         state_width = state_cache.shape[-1] // 2
+        # PDL(Programmatic Dependent Launch)在 ROCm/XPU 不可用；CUDA 上显式关闭，
+        # 原因见下方 NOTE（避免 RAW 竞态）。
         pdl_kwargs = (
             {}
             if current_platform.is_rocm() or current_platform.is_xpu()
             else {"launch_pdl": False}
         )
 
+        # 1️⃣第一步：把 kv/score（叠加 APE 绝对位置偏置）写入 state_cache。
         # Store the KV and score (with fused APE addition) in the state.
         # NOTE: PDL is disabled — both this kernel and the compress kernels
         # below depend on preceding kernel outputs (kv/score from the cublas
@@ -325,6 +402,7 @@ class DeepseekCompressor(nn.Module):
             pdl_kwargs=pdl_kwargs,
         )
 
+        # 2️⃣第二步：融合压缩内核 compress → RMSNorm → RoPE → FP8 quant → 写主 KV cache。
         # Fused: compress → RMSNorm → RoPE → FP8 quant → KV cache write.
         # RoPE requirements (kernel applies forward GPT-J style rotation):
         # - is_neox_style=False (interleaved pairs, NOT split-half)
@@ -333,10 +411,16 @@ class DeepseekCompressor(nn.Module):
         # - applied to LAST rope_head_dim elements of head_dim
         # - position used: (positions // compress_ratio) * compress_ratio
         cos_sin_cache = rotary_emb.cos_sin_cache
+        # 从 static_forward_context 反查主 KV cache 层，拿到真实 kv_cache 张量写入。
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
         k_cache_layer = self._static_forward_context[self.k_cache_prefix]
         kv_cache = k_cache_layer.kv_cache
 
+        # 写 cache 方式判定：
+        # - store_full_kv: head_dim=512 且 cache 非 uint8(paged) → 写连续 bf16 / 非
+        #   paged fp8 整行（仅 cutedsl 用）。
+        # - store_full_fp8: cache 是 e4m3fn 整行 fp8（非 block-scaled）。
+        # - fp8_scale: 整行 fp8 的全局 scale（仅 store_full_fp8 时非 None）。
         # Plain-row V4 reads a contiguous bf16 / per-tensor fp8 cache row; the
         # fp8_ds_mla path uses the UE8M0 paged uint8 layout.
         store_full_kv = self.head_dim == 512 and kv_cache.dtype != torch.uint8
@@ -347,6 +431,8 @@ class DeepseekCompressor(nn.Module):
             else None
         )
 
+        # 内核分派：CUDA + head_dim=512 走 cutedsl（支持 full-cache 标志）；
+        # 其余(indexer head_dim=128 / AMD / XPU)走 triton，签名不同故 extra_kwargs 为空。
         # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
         # does not, so the two callables have different signatures.
         compress_norm_rope_store_fn: Any
@@ -369,6 +455,10 @@ class DeepseekCompressor(nn.Module):
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
             extra_kwargs = {}
 
+        # 调用融合内核：state_cache(含 kv+score) → 压缩聚合成单 head 向量 →
+        # RMSNorm → RoPE(作用最后 rope_head_dim 维) → FP8 block-scaled 量化 →
+        # 按 block_table/slot_mapping 写入主 KV cache。quant_block/token_stride/
+        # scale_dim 控制量化布局（见 __init__ 注释）。
         compress_norm_rope_store_fn(
             state_cache=state_cache,
             num_actual=num_actual,

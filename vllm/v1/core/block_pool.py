@@ -641,6 +641,7 @@ class BlockPool:
         for block in blocks:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
+            # ⚠️ 如果ref_cnt == 0, 得从free queue移出
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
@@ -667,8 +668,8 @@ class BlockPool:
                     blocks_with_hash.append(block)
 
         # Blocks without hash always get evicted first - prepend them last to the tail
-        # ⚠️ 没有hash缓存的可以早点被取出使用
-        # ⚠️ 有hash缓存的可以晚点被使用，说不定被救活
+        # ⚠️ 没有hash缓存的可以早点被取出使用, partial block
+        # ⚠️ 有hash缓存的可以晚点被使用，说不定被救活， full block
         self.free_block_queue.prepend_n(blocks_without_hash)
         self.free_block_queue.append_n(blocks_with_hash)
 

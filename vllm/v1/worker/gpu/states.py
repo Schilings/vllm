@@ -25,6 +25,7 @@ class RequestState:
 
         self.req_id_to_index: dict[str, int] = {}
         self.index_to_req_id: dict[int, str] = {}
+        # ⚠️
         self.free_indices = list(range(max_num_reqs))
 
         # NOTE(woosuk): This tensor can be extremely large (e.g., several GBs)
@@ -105,7 +106,7 @@ class RequestState:
         req_idx = self.free_indices.pop()
         self.req_id_to_index[req_id] = req_idx
         self.index_to_req_id[req_idx] = req_id
-
+        #
         self.max_seq_len[req_idx] = prompt_len + max_tokens
         self.prompt_len.np[req_idx] = prompt_len
         prefill_len = len(all_token_ids)
@@ -113,7 +114,7 @@ class RequestState:
             f"prefill_len {prefill_len} < prompt_len {prompt_len}"
         )
         self.prefill_len.np[req_idx] = prefill_len
-        # start = 0
+        # 默认start = 0
         self.total_len.stage_write_elem(req_idx, prefill_len)
         self.all_token_ids.stage_write(req_idx, 0, all_token_ids)
         self.num_computed_prefill_tokens[req_idx] = num_computed_tokens

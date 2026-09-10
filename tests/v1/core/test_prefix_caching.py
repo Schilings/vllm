@@ -101,6 +101,8 @@ def make_kv_cache_manager(kv_cache_config: KVCacheConfig, **kwargs) -> KVCacheMa
     config (LCM of group block sizes) unless explicitly provided. This mirrors
     ``resolve_kv_cache_block_sizes`` for the non-context-parallel case used by
     these tests, so callers don't have to pass it at every site."""
+    # ⚠️ scheduler_block_size = 所有 group block_size 的 LCM（最小公共倍数）。
+    # 最终匹配到的prefix对齐到这个倍数
     kwargs.setdefault(
         "scheduler_block_size",
         lcm(*(g.kv_cache_spec.block_size for g in kv_cache_config.kv_cache_groups)),
@@ -225,6 +227,7 @@ def make_kv_cache_config_three_types(
 def test_prefill(hash_fn):
     block_size = 16
     manager = make_kv_cache_manager(
+        # 1 个null block + 10 个有效block
         make_kv_cache_config(block_size, 11),
         max_model_len=8192,
         enable_caching=True,
@@ -232,20 +235,32 @@ def test_prefill(hash_fn):
     )
 
     # Complete 3 blocks (48 tokens)
+    # [ 0 ... 0 1 ... 1 2 ... 2]
     common_token_ids = [i for i in range(3) for _ in range(16)]
 
     # Fully cache miss
     # Incomplete 1 block (7 tokens)
     unique_token_ids = [3] * 7
+    # 1️⃣ [ 0 ... 0 1 ... 1 2 ... 2 3 ... 3] = 48 + 7 = 55
     all_token_ids = common_token_ids + unique_token_ids
     req0 = make_request("0", all_token_ids, block_size, hash_fn)
+
+    # Request.__init__ 末尾直接调 update_block_hashes()，用构造函数传入的 _block_hasher（即 kv_cache_utils.request_block_hasher）对初始 prompt 算 hash。
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req0)
     assert len(req0.block_hashes) == 3
     assert not computed_blocks.blocks[0]
     assert num_computed_tokens == 0
+
+
+    # ⚠️ allocate_slots 在分配完、返回前会自动缓存（因为 enable_caching=True 且默认不延迟）
+    # self.coordinator.cache_blocks(request, num_tokens_to_cache)
+    # num_full_blocks = 55 // 16 = 3，所以只缓存前 3 个完整块（block 1,2,3）；第 4 块只有 7 token 是残块 → 不缓存。
     blocks = manager.allocate_slots(
+        # num_new_tokens = 55
+        # num_new_computed_tokens = 16 * 0 = 0
         req0, 55, len(computed_blocks.blocks[0]) * 16, computed_blocks
     )
+    # 分配了 55 < 16*4 = 64
     assert blocks is not None and blocks.get_block_ids() == ([1, 2, 3, 4],)
 
     # Check full block metadata
@@ -255,6 +270,7 @@ def test_prefill(hash_fn):
         block_hash = hash_block_tokens(hash_fn, parent_block_hash, block_tokens)
         blk_hash = manager.block_pool.blocks[block_id].block_hash
         assert blk_hash is not None
+        # block 1/2/3：cache_full_blocks 写入了 hash（值来自 request.block_hashes，再绑 group 0），所以非 None
         assert get_block_hash(blk_hash) == block_hash
         assert get_group_id(blk_hash) == 0
         assert manager.block_pool.blocks[block_id].ref_cnt == 1
@@ -262,19 +278,24 @@ def test_prefill(hash_fn):
 
     # Check partial block metadata
     for block_id in (4,):
+        # block 4：残块，cache_full_blocks 跳过 → 仍是初始 None。
         assert manager.block_pool.blocks[block_id].block_hash is None
         assert manager.block_pool.blocks[block_id].ref_cnt == 1
 
     # Cache hit in the common prefix when the original block is still in use.
     # Incomplete 1 block (5 tokens)
     unique_token_ids = [3] * 5
+    # 2️⃣ [ 0 ... 0 1 ... 1 2 ... 2 3 ... 3] = 48 + 5 = 53
     req1 = make_request("1", common_token_ids + unique_token_ids, block_size, hash_fn)
+    # 命中 3 个block
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req1)
     assert len(req1.block_hashes) == 3
     assert computed_blocks.get_block_ids() == ([1, 2, 3],)
     assert num_computed_tokens == 3 * 16
     num_new_tokens = 53 - 3 * 16
     blocks = manager.allocate_slots(
+        # num_new_tokens = 5
+        # num_new_computed_tokens = 16 * 3 = 48
         req1, num_new_tokens, len(computed_blocks.blocks[0]) * 16, computed_blocks
     )
     assert blocks is not None and blocks.get_block_ids() == ([5],)
@@ -285,6 +306,14 @@ def test_prefill(hash_fn):
     free_block_queue = manager.block_pool.free_block_queue
     assert free_block_queue.num_free_blocks == 5
 
+    # ⚠️ 释放了但是full block缓存还在
+    # req0 持有 [1,2,3,4]。
+    #   此时 block 1,2,3 的 ref_cnt 是 2（req0 和 req1 都引用），减 1 后变成 1 → 没到 0，不释放；
+    #   只有 block 4（ref_cnt 1→0，且无 hash）→ 进 blocks_without_hash → 前插到队首。
+    #   此刻队列：[4, 6, 7, 8, 9, 10]。
+    # req1 持有 [1,2,3,5]，逆序释放。
+    #   block 5（ref_cnt 1→0，无 hash）→ 进 without_hash → 前插 → [5, 4, 6, 7, 8, 9, 10]；
+    #   block 3,2,1（ref_cnt 1→0，有 hash）→ 进 with_hash → 后插 → [5, 4, 6, 7, 8, 9, 10, 3, 2, 1]。
     manager.free(req0)
     manager.free(req1)
 
@@ -301,6 +330,7 @@ def test_prefill(hash_fn):
     # Cache hit in the common prefix when the original block is already free.
     # Incomplete 1 block (6 tokens)
     unique_token_ids = [3] * 6
+    # 3️⃣ [ 0 ... 0 1 ... 1 2 ... 2 3 ... 3] = 48 + 6 = 54
     req2 = make_request("2", common_token_ids + unique_token_ids, block_size, hash_fn)
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req2)
     assert len(req2.block_hashes) == 3
@@ -308,8 +338,12 @@ def test_prefill(hash_fn):
     assert num_computed_tokens == 3 * 16
     num_new_tokens = 53 - 3 * 16
     blocks = manager.allocate_slots(
+        # num_new_tokens = 6
+        # num_new_computed_tokens = 16 * 3 = 48，释放了但是缓存还在
         req2, num_new_tokens, len(computed_blocks.blocks[0]) * 16, computed_blocks
     )
+    # ⚠️ block 5 比 block 4 晚释放一步（req1 在 req0 之后 free），而无 hash 块每次都前插到队首，于是 5 叠在了 4 上面 → 5 在队首。
+    # allocate_slots 取队首 → 拿到 block 5。
     assert blocks is not None and blocks.get_block_ids() == ([5],)  # reuse partial [5]
 
     # Although we only have 6 free blocks, we have 8 blocks in
@@ -318,9 +352,13 @@ def test_prefill(hash_fn):
     assert all([b.ref_cnt == 0 for b in free_block_queue.get_all_free_blocks()])
     assert len([b for b in free_block_queue.get_all_free_blocks()]) == 6
 
+    # req1 持有 [1,2,3,5]，逆序释放。
+    #   block 5（ref_cnt 1→0，无 hash）→ 进 without_hash → 前插 → [5, 4, 6, 7, 8, 9, 10]；
+    #   block 3,2,1（ref_cnt 1→0，有 hash）→ 进 with_hash → 后插 → [5, 4, 6, 7, 8, 9, 10, 3, 2, 1]。
     manager.free(req2)
 
     # Cache miss and eviction.
+    # [ 99 99 99 ... 99 ] = 160 = 16 blocks
     req3 = make_request("3", [99] * (16 * 10), block_size, hash_fn)
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req3)
     assert not computed_blocks.blocks[0]
@@ -347,6 +385,8 @@ def test_prefill(hash_fn):
 def test_prefill_hybrid_model():
     block_size = 16
     manager = make_kv_cache_manager(
+        # 20 blocks可分配，window_size = 32
+        # ⚠️ hybrid模式，[ Full0, SWA0, SWA1 ]
         make_kv_cache_config_hybrid_model(block_size, 21, 2),
         max_model_len=8192,
         enable_caching=True,
@@ -357,11 +397,13 @@ def test_prefill_hybrid_model():
 
     # Complete 3 blocks (48 tokens)
     num_full_blocks = 3
+    # [ 0 ... 0 1 ... 1 2 ... 2 ] = 48 tokens
     common_token_ids = [i for i in range(num_full_blocks) for _ in range(block_size)]
 
     # Fully cache miss
     # Incomplete 1 block (7 tokens)
     unique_token_ids = [3] * 7
+    # 1️⃣ [ 0 ... 0 1 ... 1 2 ... 2 3 ... 3 ] = 48+7 = 55 tokens
     all_token_ids = common_token_ids + unique_token_ids
     req0 = make_request("0", all_token_ids, block_size, hash_fn)
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req0)
@@ -369,8 +411,13 @@ def test_prefill_hybrid_model():
     assert not computed_blocks.blocks[0]
     assert num_computed_tokens == 0
     blocks = manager.allocate_slots(
+        # num_new_tokens = 55, nuw_new_computed_tokens = 0
         req0, 55, len(computed_blocks.blocks[0]) * 16, computed_blocks
     )
+    # hybrid模式，[ Full0, SWA0, SWA1 ]
+    # Full 0: [ 1, 2, 3, 4]
+    # SWA 0:  [ 5, 6, 7, 8]
+    # SWA 1:  [ 9, 10, 11, 12]
     assert blocks is not None and blocks.get_block_ids() == (
         [1, 2, 3, 4],
         [5, 6, 7, 8],
@@ -380,6 +427,10 @@ def test_prefill_hybrid_model():
     # Check full block metadata
     parent_block_hash = None
     for length, block_ids in zip((1, 2, 3), ((1, 5, 9), (2, 6, 10), (3, 7, 11))):
+        # hybrid模式，[ Full0, SWA0, SWA1 ]
+        # Full 0: [ 1, 2, 3, 4]
+        # SWA 0:  [ 5, 6, 7, 8]
+        # SWA 1:  [ 9, 10, 11, 12]
         block_tokens = tuple(all_token_ids[(length - 1) * 16 : length * 16])
         block_hash = hash_block_tokens(hash_fn, parent_block_hash, block_tokens)
         for group_id, block_id in enumerate(block_ids):
@@ -398,16 +449,26 @@ def test_prefill_hybrid_model():
     # Cache hit in the common prefix
     # Incomplete 1 block (5 tokens)
     unique_token_ids = [3] * 5
+    # 2️⃣ [ 0 ... 0 1 ... 1 2 ... 2 3 ... 3 ] = 48+5 = 53 tokens
     all_token_ids = common_token_ids + unique_token_ids
     req1 = make_request("1", common_token_ids + unique_token_ids, block_size, hash_fn)
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req1)
     assert len(req1.block_hashes) == 3
+    # hybrid模式，[ Full0, SWA0, SWA1 ]
+    # Full 0: [ 1, 2, 3, 4]
+    # SWA 0:  [ 5, 6, 7, 8]
+    # SWA 1:  [ 9, 10, 11, 12]
     assert computed_blocks.get_block_ids() == ([1, 2, 3], [0, 6, 7], [0, 10, 11])
     assert num_computed_tokens == 3 * 16
     num_new_tokens = 53 - 3 * 16
     blocks = manager.allocate_slots(
+        # num_new_tokens=5, num_new_computed_tokens=48
         req1, num_new_tokens, len(computed_blocks.blocks[0]) * 16, computed_blocks
     )
+    # hybrid模式，[ Full0, SWA0, SWA1 ]
+    # Full 0: [ 1, 2, 3, 13]
+    # SWA 0:  [ 0, 6, 7, 14]
+    # SWA 1:  [ 0, 10, 11, 15]
     assert blocks is not None and blocks.get_block_ids() == ([13], [14], [15])
     for block_per_group in computed_blocks.blocks:
         for block in block_per_group:
@@ -415,31 +476,49 @@ def test_prefill_hybrid_model():
                 assert block.ref_cnt == 2
 
     block_hashes = req1.block_hashes
+    # free(req0)：逐组逆序释放 [4,3,2,1] / [8,7,6,5] / [12,11,10,9]
+    #   Full0 [4,3,2,1]：只有 4 → 队首插 [4] → [4, 16,17,18,19,20]
+    #   SWA0 [8,7,6,5]：8 到 队首插；5 到 队尾插 → [8, 4, 16,17,18,19,20, 5]
+    #   SWA1 [12,11,10,9]：12 到 队首插；9 到 队尾插 → [12, 8, 4, 16,17,18,19,20, 5, 9]
+    # free(req0) 后：[12, 8, 4, 16, 17, 18, 19, 20, 5, 9]
     manager.free(req0)
+    # （此时 1,2,3,6,7,10,11 ref_cnt 都是 1，仍在队列外被 req1 占用）
+    # free(req1)：逐组逆序释放 [13,3,2,1] / [14,7,6,0] / [15,11,10,0]
+    #   Full0 [13,3,2,1]：13 到 队首插；3,2,1 到 队尾插 → [13, 12,8,4, 16,17,18,19,20, 5,9, 3,2,1]
+    #   SWA0 [14,7,6,0]：14 到 队首插；7,6 到 队尾插；block 0 是 null 跳过 → [14, 13,12,8,4, 16,17,18,19,20, 5,9, 3,2,1, 7,6]
+    #   SWA1 [15,11,10,0]：15 到 队首插；11,10 到 队尾插；block 0 跳过 → [15, 14,13,12,8,4, 16,17,18,19,20, 5,9, 3,2,1, 7,6, 11,10]
     manager.free(req1)
 
     # Evict the blocks outside sliding window, does not affect the hit length.
+    # 3️⃣ "手动删掉若干 hash → 看前缀命中还剩多长"，mock，最后恢复原样
     _test_partial_request_hit(
         manager,
         block_size,
         num_full_blocks,
         "2",
+        # req2：[ 0 ... 0 1 ... 1 2 ... 2 3 ... 3 ] = 48+5 = 53 tokens
         all_token_ids,
+        # mock删除SWA 0、SWA 1的第一块block的hash缓存，无法参与prefix caching
         [
             make_block_hash_with_group_id(block_hashes[0], 1),
             make_block_hash_with_group_id(block_hashes[0], 2),
         ],
+        # 实际还是匹配大3个block
         3,
     )
 
     # Evict the first block of full attention, makes total cache miss.
+    # 4️⃣ "手动删掉若干 hash → 看前缀命中还剩多长"，mock，最后恢复原样
     _test_partial_request_hit(
         manager,
         block_size,
         num_full_blocks,
         "3",
+        # req2：[ 0 ... 0 1 ... 1 2 ... 2 3 ... 3 ] = 48+5 = 53 tokens
         all_token_ids,
+        # mock删除Full 0的第一块block的hash缓存，无法参与prefix caching
         [make_block_hash_with_group_id(block_hashes[0], 0)],
+        # 命中0个
         0,
     )
 
@@ -449,7 +528,10 @@ def test_prefill_hybrid_model():
         block_size,
         num_full_blocks,
         "4",
+        # req2：[ 0 ... 0 1 ... 1 2 ... 2 3 ... 3 ] = 48+5 = 53 tokens
         all_token_ids,
+        # mock删除Full 0，SWA 0，SWA 1的第3块block的hash缓存，无法参与prefix caching
+        # 但是1-2block hash还在，满足短请求
         [
             make_block_hash_with_group_id(block_hashes[2], 0),
             make_block_hash_with_group_id(block_hashes[2], 1),
@@ -465,6 +547,8 @@ def test_prefill_hybrid_model():
         num_full_blocks,
         "5",
         all_token_ids,
+        # mock删除Full 0的第3块block的hash缓存，无法参与prefix caching
+        # 但是1-2block hash还在，满足短请求
         [make_block_hash_with_group_id(block_hashes[2], 0)],
         2,
     )
@@ -476,6 +560,8 @@ def test_prefill_hybrid_model():
         num_full_blocks,
         "6",
         all_token_ids,
+        # mock删除SWA 0的第3块block的hash缓存，无法参与prefix caching
+        # 但是1-2block hash还在，满足短请求
         [make_block_hash_with_group_id(block_hashes[2], 1)],
         2,
     )
@@ -487,6 +573,8 @@ def test_prefill_hybrid_model():
         num_full_blocks,
         "7",
         all_token_ids,
+        # mock删除SWA 1的第3块block的hash缓存，无法参与prefix caching
+        # 但是1-2block hash还在，满足短请求
         [make_block_hash_with_group_id(block_hashes[2], 2)],
         2,
     )
@@ -503,6 +591,7 @@ def test_prefill_hybrid_model():
         num_full_blocks,
         "8",
         all_token_ids,
+        #
         [
             make_block_hash_with_group_id(block_hashes[2], 0),
             make_block_hash_with_group_id(block_hashes[0], 1),
@@ -514,12 +603,15 @@ def test_prefill_hybrid_model():
 
 def test_prefill_hybrid_model_eagle():
     block_size = 16
+    # 30 blocks可分配，window_size = 16 * 3
+    # ⚠️ hybrid模式，[ Full0, SWA0, SWA1 ]
     kv_cache_config = make_kv_cache_config_hybrid_model(block_size, 31, 3)
     manager = make_kv_cache_manager(
         kv_cache_config,
         max_model_len=8192,
         enable_caching=True,
         hash_block_size=block_size,
+        # ⚠️ Eagle
         use_eagle=True,
     )
 
@@ -527,11 +619,13 @@ def test_prefill_hybrid_model_eagle():
 
     # Complete 6 blocks (96 tokens)
     num_full_blocks = 6
+    # [ 0 .. 0 1 ... 1 2 ... 2 3 ... 3 4 ... 4 5 ... 5 ] = 16 * 6 = 96
     common_token_ids = [i for i in range(num_full_blocks) for _ in range(block_size)]
 
     # Fully cache miss
     # Incomplete 1 block (7 tokens)
     unique_token_ids = [6] * 7
+    # 1️⃣ [ 0 .. 0 1 ... 1 2 ... 2 3 ... 3 4 ... 4 5 ... 5 6 ... 6] = 96 + 7 = 103
     all_token_ids = common_token_ids + unique_token_ids
     req0 = make_request("0", all_token_ids, block_size, hash_fn)
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req0)
@@ -541,6 +635,7 @@ def test_prefill_hybrid_model_eagle():
     blocks = manager.allocate_slots(
         req0, len(all_token_ids), num_computed_tokens, computed_blocks
     )
+    # 占 7 blocks
     block_ids = (
         [1, 2, 3, 4, 5, 6, 7],
         [8, 9, 10, 11, 12, 13, 14],
@@ -569,10 +664,13 @@ def test_prefill_hybrid_model_eagle():
     # Cache hit in the common prefix
     # Incomplete 1 block (5 tokens)
     unique_token_ids = [6] * 5
+    # 2️⃣ [ 0 .. 0 1 ... 1 2 ... 2 3 ... 3 4 ... 4 5 ... 5 6 ... 6] = 96 + 5 = 101
     all_token_ids = common_token_ids + unique_token_ids
     req1 = make_request("1", all_token_ids, block_size, hash_fn)
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req1)
     assert len(req1.block_hashes) == num_full_blocks
+    # ⚠️ Eagle 是投机解码，draft head 需要 target 模型重新计算最后一个匹配块的 hidden states 才能产出草稿。
+    # 所以这块不能从缓存"跳过"，必须当新块重算。机制就是"多查一块、再 pop 掉最后一块"：
     assert computed_blocks.get_block_ids() == (
         [1, 2, 3, 4, 5],
         [0, 0, 10, 11, 12],
@@ -603,7 +701,9 @@ def test_prefill_hybrid_model_eagle():
         block_size,
         num_full_blocks,
         "2",
+        # 3️⃣ [ 0 .. 0 1 ... 1 2 ... 2 3 ... 3 4 ... 4 5 ... 5 6 ... 6] = 96 + 5 = 101
         all_token_ids,
+        # evict SWA0与SWA1的block 0
         [
             make_block_hash_with_group_id(block_hashes[0], 1),
             make_block_hash_with_group_id(block_hashes[0], 2),
@@ -617,6 +717,7 @@ def test_prefill_hybrid_model_eagle():
         block_size,
         num_full_blocks,
         "3",
+        # 4️⃣  [ 0 .. 0 1 ... 1 2 ... 2 3 ... 3 4 ... 4 5 ... 5 6 ... 6] = 96 + 5 = 101
         all_token_ids,
         [make_block_hash_with_group_id(block_hashes[0], 0)],
         0,
@@ -753,6 +854,7 @@ def _make_hybrid_kv_cache_config(
             num_kv_heads=1,
             head_size=1,
             dtype=torch.float32,
+            # window size不一致
             sliding_window=4 * block_size,
         ),
         "mamba": lambda: MambaSpec(
@@ -864,6 +966,7 @@ def test_prefill_hybrid_model_combinations(spec_types: list[str]):
     # Complete 3 blocks (48 tokens)
     common_token_ids = [i for i in range(3) for _ in range(block_size)]
     unique_token_ids = [3] * 7
+    # 1️⃣ [ 0 ... 0 1 ... 1 2 ... 2 3 ... 3 ] = 48 + 7 = 55
     all_token_ids = common_token_ids + unique_token_ids
 
     # First request: no cache hit initially
@@ -875,6 +978,7 @@ def test_prefill_hybrid_model_combinations(spec_types: list[str]):
     assert num_computed_tokens == 0
 
     blocks = manager.allocate_slots(
+        # num_new_tokens=55, num_new_computed_tokens=0
         req0, 55, len(computed_blocks.blocks[0]) * block_size, computed_blocks
     )
     assert blocks is not None
@@ -884,6 +988,7 @@ def test_prefill_hybrid_model_combinations(spec_types: list[str]):
     manager.new_step_starts()
 
     # Second request: should hit cached blocks for common prefix
+    # 2️⃣ [ 0 ... 0 1 ... 1 2 ... 2 4 .. 4 ] = 48 + 5 = 53
     req1 = make_request("1", common_token_ids + [4] * 5, block_size, hash_fn)
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req1)
 
@@ -894,6 +999,7 @@ def test_prefill_hybrid_model_combinations(spec_types: list[str]):
     # Allocate and verify blocks for second request
     blocks = manager.allocate_slots(
         req1,
+        # num_new_tokens=5, num_new_computed_tokens=48
         len(common_token_ids) + 5 - num_computed_tokens,
         num_computed_tokens,
         computed_blocks,
@@ -941,6 +1047,7 @@ def test_prefill_hybrid_model_combinations_eagle(
     num_full_blocks = 4
     common_token_ids = [i for i in range(num_full_blocks) for _ in range(block_size)]
     unique_token_ids = [4] * 7
+    # 1️⃣ [ 0 ... 0 1 ... 1 2 ... 2 3 ... 3 4 ... 4 ] = 64 + 7 = 71
     all_token_ids = common_token_ids + unique_token_ids
 
     # First request: no cache hit initially
@@ -959,6 +1066,7 @@ def test_prefill_hybrid_model_combinations_eagle(
     assert len(blocks.get_block_ids()) == num_groups
 
     # Second request: should hit cached blocks for common prefix
+    # 2️⃣ [ 0 ... 0 1 ... 1 2 ... 2 3 ... 3 6 ... 6 ] = 64 + 5 = 69
     all_token_ids = common_token_ids + [6] * 5
     req1 = make_request("1", all_token_ids, block_size, hash_fn)
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req1)
@@ -1143,6 +1251,13 @@ def test_prefill_plp():
     2. Schedule non-plp request and validate blocks
     3. Schedule plp request; no hit should occur; validate blocks
     """
+    # ⚠️ PLP = Prompt LogProbs（提示词 log 概率），是 vLLM SamplingParams 里的一个参数（prompt_logprobs）。
+    # 普通输出只返回生成部分（你采样的 token）的 logprobs。
+    # prompt_logprobs=N 额外要求返回 prompt 本身每个位置 的 logprobs（以及 top-N 候选 token 的概率）。
+    # 举例：prompt 是 [A, B, C, D]，设 prompt_logprobs=5，模型会对位置 0~3 每个 token 都输出其条件概率分布里概率最高的 5 个候选及其 log 概率。
+    #       因为 PLP 要的是 prompt 每个位置的 logprobs，而前缀缓存命中意味着那段 prefix token 不跑 forward，就产不出那些位置的 logprobs。
+    #       所以 vLLM 在 SamplingParams 里把 plp 请求标记为 skip_reading_prefix_cache=True——强制整段重算，保证 prompt logprobs 完整。
+    #       这就是 test_prefill_plp 里 plp 请求（req0、req2）不命中缓存、非 plp 请求（req1）能命中的原因。
     block_size = 16
     manager = make_kv_cache_manager(
         make_kv_cache_config(block_size, 11),
@@ -1159,6 +1274,7 @@ def test_prefill_plp():
     # Request #0 is a prompt logprobs request
     # Fully cache miss
     # Incomplete 1 block (7 tokens)
+    # 0️⃣ normal request
     unique_token_ids = [3] * 7
     all_token_ids = common_token_ids + unique_token_ids
     req0 = make_request("0", all_token_ids, block_size, hash_fn, prompt_logprobs=5)
@@ -1192,6 +1308,7 @@ def test_prefill_plp():
     # Request #1 is a non-prompt-logprobs request:
     # Cache hit in the common prefix when the original block is still in use.
     # Incomplete 1 block (5 tokens)
+    # 1️⃣ normal non-prompt-logprobs request
     unique_token_ids = [3] * 5
     req1 = make_request("1", common_token_ids + unique_token_ids, block_size, hash_fn)
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req1)
@@ -1224,6 +1341,7 @@ def test_prefill_plp():
 
     # Request #2 is a prompt-logprobs request:
     # NO cache hit in the common prefix; duplicates request #0 cached blocks
+    # 2️⃣ prompt-logprobs request
     unique_token_ids = [3] * 6
     req2 = make_request(
         "2", common_token_ids + unique_token_ids, block_size, hash_fn, prompt_logprobs=5
@@ -1264,22 +1382,28 @@ def test_decode():
     # Fully cache miss
     # Incomplete 1 block (7 tokens)
     unique_token_ids = [3] * 7
+    # 1️⃣ [ 0 ... 0 1 ... 1 2 ... 2 3 ... 3] = 48 + 7 = 55
     req0 = make_request("0", common_token_ids + unique_token_ids, block_size, sha256)
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req0)
     assert not computed_blocks.blocks[0]
     assert num_computed_tokens == 0
     blocks = manager.allocate_slots(
+        # num_new_tokens=55, num_new_computed_tokens=0
         req0, 55, len(computed_blocks.blocks[0]) * 16, computed_blocks
     )
+    # allocate 4 blocks
     assert blocks is not None and blocks.get_block_ids() == ([1, 2, 3, 4],)
 
     # Append slots without allocating a new block.
+    # 2️⃣ [ 0 ... 0 1 ... 1 2 ... 2 3 ... 3 8 ... 8] = 48 + 7 + 4 = 59
     req0.num_computed_tokens = 55
     for _ in range(4):
         req0.append_output_token_ids(8)
     new_blocks = manager.allocate_slots(
+        # num_new_tokens=4, num_new_computed_tokens=0
         req0, 4, len(computed_blocks.blocks[0]) * 16, computed_blocks
     )
+    # allocate 0 blocks
     assert new_blocks is not None and len(new_blocks.blocks[0]) == 0
     assert (
         manager.coordinator.single_type_managers[0]
@@ -1289,6 +1413,7 @@ def test_decode():
     )
 
     # Append slots with allocating a new block.
+    # 3️⃣ [ 0 ... 0 1 ... 1 2 ... 2 3 ... 3 8 ... 8 7 ... 7] = 48 + 7 + 4 + 19 = 78
     req0.num_computed_tokens = 59
     # 9 tokens to fill the previous block, and 10 tokens to fill
     # the preallocated block.
@@ -1297,13 +1422,16 @@ def test_decode():
     new_blocks = manager.allocate_slots(
         req0, 19, len(computed_blocks.blocks[0]) * 16, computed_blocks
     )
+    # allocate 1 block
     assert new_blocks is not None and len(new_blocks.blocks[0]) == 1
+    # 倒数第二个已经full
     assert (
         manager.coordinator.single_type_managers[0]
         .req_to_blocks[req0.request_id][-2]
         .block_hash
         is not None
     )
+    # 倒数第一个还没full
     assert (
         manager.coordinator.single_type_managers[0]
         .req_to_blocks[req0.request_id][-1]
@@ -1320,7 +1448,7 @@ def test_evict():
         enable_caching=True,
         hash_block_size=block_size,
     )
-
+    # 5 full blocks + 1 partial block
     last_token_id = 5 * 16 + 7
     req0 = make_request("0", list(range(last_token_id)), block_size, sha256)
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req0)
@@ -1348,11 +1476,13 @@ def test_evict():
     # 10 - (6 + 3) == 1
     assert manager.block_pool.free_block_queue.num_free_blocks == 1
 
+    # ⚠️ partial blocks放在队头，full放在队尾
     manager.free(req0)
     # partial blocks (without hash) at head, other at tail (LRU policy):
     assert [
         b.block_id for b in manager.block_pool.free_block_queue.get_all_free_blocks()
     ] == [6, 10, 5, 4, 3, 2, 1]
+    # ⚠️ partial blocks放在队头，full放在队尾,req1都是full blocks
     manager.free(req1)
     assert manager.block_pool.free_block_queue.num_free_blocks == 10
     assert [
@@ -1378,6 +1508,7 @@ def test_hash_block_correct_reuse():
     """
     block_size = 16
     manager = make_kv_cache_manager(
+        # ⚠️ 除了null block 就一个可用的block
         make_kv_cache_config(16, 2),
         max_model_len=8192,
         enable_caching=True,
@@ -1396,6 +1527,7 @@ def test_hash_block_correct_reuse():
     assert blocks is not None and len(blocks.blocks[0]) == 1
 
     # Deallocate the block.
+    # ⚠️ full blocks 放在队尾，但是实际就剩它了
     manager.free(req)
 
     # Allocate a new block that's not full, make sure hash info on the
@@ -1409,6 +1541,7 @@ def test_hash_block_correct_reuse():
     )
     assert blocks is not None and len(blocks.blocks[0]) == 1
 
+    # ⚠️ full blocks 放在队尾，但是实际就剩它了， hash已经被清除
     assert manager.block_pool.blocks[blocks.blocks[0][0].block_id].block_hash is None
 
 
@@ -1419,6 +1552,7 @@ def test_computed_blocks_not_evicted():
     """
     block_size = 16
     manager = make_kv_cache_manager(
+        # 2 free blocks
         make_kv_cache_config(block_size, 3),
         max_model_len=8192,
         enable_caching=True,
@@ -1457,6 +1591,7 @@ def test_computed_blocks_not_evicted():
     # Now if we have a cache hit on the first block, we should evict the second
     # cached block rather than the first one.
     req2 = make_request("2", list(range(num_tokens * 2)), block_size, sha256)
+    # ⚠️ max_hit_len = num_token - 1, 因此第2个block不匹配
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req2)
     assert len(computed_blocks.blocks[0]) == 1
     assert computed_blocks.blocks[0][0].block_id == 1
@@ -1560,6 +1695,7 @@ def test_cache_blocks(hash_fn):
     blocks += [KVCacheBlock(block_id=2)]
     block_pool.cache_full_blocks(
         request=req,
+        # ⚠️ 传入的完整的blocks？
         blocks=blocks,
         num_cached_blocks=2,
         num_full_blocks=3,
@@ -1584,6 +1720,7 @@ def test_cache_blocks_multi_group():
     #  Block 1/5: [4, 5, 6, 7]
     #  Block 2/6: [8, 9, 10, 11]
     #  Block 3/7: [12, 13]
+    # ⚠️ full：allocate 4 blocks
     req = make_request("0", list(range(14)), block_size, sha256)
 
     # Cache the blocks for group 0.
@@ -1610,6 +1747,8 @@ def test_cache_blocks_multi_group():
         block_size=block_size,
         kv_cache_group_id=1,
     )
+    # ⚠️  虽然 group id不同，字典的key也不同，引用相同的block。但是不同group之间能复用吗？？！！！
+    # 实际应该是不同的kv block才对
     assert len(block_pool.cached_block_hash_to_block) == 5
     assert len(req.block_hashes) == 3
     assert all([block.block_hash is not None for block in blocks])
@@ -1641,6 +1780,7 @@ def test_cache_blocks_multi_group():
         block_pool.get_cached_block(req.block_hashes[2], kv_cache_group_ids=[1])
         is not None
     )
+    # 提供这种用法就是意味着不同group之间可以复用吗？？？
     assert (
         block_pool.get_cached_block(req.block_hashes[0], kv_cache_group_ids=[0, 1])
         is not None
@@ -1852,6 +1992,7 @@ def test_prefill_not_enough_free_blocks_with_computed_blocks():
     """
     block_size = 16
     manager = make_kv_cache_manager(
+        # 10 free blocks
         make_kv_cache_config(block_size, 11),
         max_model_len=8192,
         enable_caching=True,
@@ -1859,6 +2000,7 @@ def test_prefill_not_enough_free_blocks_with_computed_blocks():
     )
     # Complete 3 blocks (48 tokens)
     # | Common-0 | Common-1 | Common-2 | ... |
+    # [ 0 ... 0 1 ... 1 2 ... 2 ]
     common_token_ids = [i for i in range(3) for _ in range(16)]
     req0 = make_request("0", common_token_ids, block_size, sha256)
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req0)
@@ -1872,6 +2014,7 @@ def test_prefill_not_enough_free_blocks_with_computed_blocks():
     ]
 
     # | Common-0 | Common-1 | Common-2 | Req1-3 | Req1-4 | Req1-5 | ... |
+    # [ 0 ... 0 1 ... 1 2 ... 2 0 ... 0 1 ... 1 2 ... 2 ]
     req1 = make_request("1", common_token_ids * 2, block_size, sha256)
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req1)
     assert computed_blocks.blocks[0] == block_part0
@@ -1890,6 +2033,7 @@ def test_prefill_not_enough_free_blocks_with_computed_blocks():
 
     # | Common-0 | Common-1 | Common-2 | Req1-3 (F) | Req1-4 (F) |
     # | Req1-5(F)| Req2-0   | Req2-1   | ... |
+    # [ 7 ... 7 ]
     req2 = make_request("2", [7] * block_size * 2, block_size, sha256)
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req2)
     assert not computed_blocks.blocks[0]
@@ -1905,17 +2049,20 @@ def test_prefill_not_enough_free_blocks_with_computed_blocks():
     # but it cannot be allocated due to insufficient free blocks (2).
     # In this case, the ref_cnt of the computed blocks should not be changed.
     assert manager.block_pool.free_block_queue.num_free_blocks == 5
+    # [ 0 ... 0 1 ... 1 2 ... 2 0 ... 0 1 ... 1 2 ... 2 0 ... 0 1 ... 1 2 ... 2 ]
     req3 = make_request("3", common_token_ids * 3, block_size, sha256)
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req3)
     assert computed_blocks.blocks[0] == block_part1
     assert num_computed_tokens == 6 * 16
     # Req3 cannot be allocated.
     assert (
+        # ⚠️ 只剩 2 free blocks
         manager.allocate_slots(
             req3, 48, len(computed_blocks.blocks[0]) * 16, computed_blocks
         )
         is None
     )
+    # ⚠️ allocate失败，因此ref_cnt没有增加
     # Block 0-2 are used by Req 1.
     assert {block.ref_cnt for block in block_part1[:3]} == {1}
     # Block 3-5 are free.
@@ -1950,6 +2097,7 @@ def test_reset_prefix_cache():
     assert blocks is not None and blocks.get_block_ids() == ([5],)
 
     # Failed to reset prefix cache because some blocks are not freed yet.
+    # ⚠️
     assert not manager.reset_prefix_cache()
     assert manager.block_pool.cached_block_hash_to_block
 
@@ -2481,6 +2629,7 @@ def test_eagle_enabled_removes_last_block():
     req_eagle = make_request("eagle_divisible", token_ids, block_size, sha256)
     computed_blocks, num_tokens = manager.get_computed_blocks(req_eagle)
 
+    # ⚠️ max_hit_len = num_tokens - 1，命中 2 blocks，又因为开启了 eagel，又pop掉1 block，结果只剩下命中 1 block
     # Should retain 1 block:
     # 1. Original 3 blocks → pop last hash → 2 matched blocks
     # 2. drop last matched block → 1 remaining block
@@ -2555,6 +2704,9 @@ def test_eagle_with_sliding_window():
 
     # New request with Eagle enabled
     req_eagle = make_request("partial_eagle", token_ids, block_size, sha256)
+    # ⚠️ 第二次对同个req进行allocate的时候才会把窗口外的替换成 null block
+    # ⚠️ swa匹配到 不是 1 null block + 1 computed block，而是 2 full blocks
+    # eagle pop last computed block，剩下 1 full block
     computed_blocks, num_tokens = manager.get_computed_blocks(req_eagle)
     # Original match: 2 full blocks → Eagle removes 1 → 1 remaining
     assert len(computed_blocks.blocks[0]) == 1
@@ -2619,6 +2771,7 @@ def test_eagle_swa_alignment_caches_extra_block():
                     dtype=torch.float32,
                     sliding_window=block_size,
                 ),
+                #
                 is_eagle_group=True,
             ),
         ],
@@ -2647,6 +2800,9 @@ def test_eagle_swa_alignment_caches_extra_block():
     # Second request with identical prompt should find an EAGLE cache hit.
     # Without the fix, ``num_computed_tokens`` is 0; with the fix, it lands at
     # an alignment boundary (multiple of 32 tokens, minus the EAGLE drop).
+    # ⚠️ full0 : 4*block_size = 32
+    # ⚠️ swa0 : block_size = 8
+    # 按prefix caching按照 lcm(32,8) = 32
     req1 = make_request("1", token_ids, block_size, sha256)
     _, num_computed_tokens = manager.get_computed_blocks(req1)
     assert num_computed_tokens > 0, (
@@ -2782,6 +2938,8 @@ def test_different_block_size():
     block_size = 16
     # full attention and sliding window attention layers have the same page size:
     # (32 tokens/block * float16 token, vs. 16 tokens/block * float32 token)
+    # ⚠️ full 组：block_size = 32 token/块 × float16(2B) ×1头×1维 = 64 字节/页
+    # ⚠️ swa 组：block_size = 16 token/块 × float32(4B) ×1头×1维 = 64 字节/页
     kv_cache_config = KVCacheConfig(
         num_blocks=100,
         kv_cache_tensors=[],
@@ -2789,18 +2947,22 @@ def test_different_block_size():
             KVCacheGroupSpec(
                 ["layer1"],
                 FullAttentionSpec(
+                    # ⚠️ 2 x block_size
                     block_size=block_size * 2,
                     num_kv_heads=1,
                     head_size=1,
+                    # ⚠️ 2 bytes
                     dtype=torch.float16,
                 ),
             ),
             KVCacheGroupSpec(
                 ["layer2"],
                 SlidingWindowSpec(
+                    # ⚠️ 1 x block_size
                     block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
+                    # ⚠️ 4 bytes
                     dtype=torch.float32,
                     sliding_window=2 * block_size,
                 ),
@@ -2822,11 +2984,18 @@ def test_different_block_size():
     assert not computed_blocks.blocks[0]
     assert not computed_blocks.blocks[1]
     assert num_computed_tokens == 0
+
     blocks = manager.allocate_slots(
         req0, 7 * block_size, len(computed_blocks.blocks[0]) * 16, computed_blocks
     )
+    # ⚠️ 每个group的block size不一定一致！
+    # 这将导致allocate的block数量不一致，但是block pool的page size bytes固定一致的，那怎么解决呢
+    # ⚠️ OH，page bytes一样就没问题！block pool 只看page bytes，不管在不用group各自能放多少token
+    # full0: 4 x 2 x block_size > 7 x block_size
+    # swa0: 7 x block_size = 7 x block_size
     assert blocks.get_block_ids() == ([1, 2, 3, 4], [5, 6, 7, 8, 9, 10, 11])
     req1 = make_request("1", common_token_ids[: 7 * block_size + 1], block_size, sha256)
+    # ⚠️ scheduler_block_size = 2 * blocksize, prefix对齐到2xblocksize
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req1)
     assert len(computed_blocks.blocks[0]) == 3
     assert len(computed_blocks.blocks[1]) == 6
@@ -2841,7 +3010,9 @@ def test_different_block_size():
     # Evict some blocks to make sliding window cache hit length 5*16
     # But should return 4 * 16 because full attention cache hit length must be
     # a multiple of 32
+    # ⚠️ hash_block_size = swa block_size
     manager.block_pool.cached_block_hash_to_block.pop(
+        # swa的block 5-6被删掉
         make_block_hash_with_group_id(req1.block_hashes[6], 1), 11
     )
     manager.block_pool.cached_block_hash_to_block.pop(
@@ -2871,19 +3042,26 @@ def test_hybrid_cache_blocks_swa_tail_window_only():
         kv_cache_groups=[
             KVCacheGroupSpec(
                 ["layer1"],
+                # 4 x 1 = 4
                 FullAttentionSpec(
+                    # 4 x
                     block_size=4 * block_size,
                     num_kv_heads=1,
                     head_size=1,
+                    # 1 x
                     dtype=torch.float16,
                 ),
             ),
             KVCacheGroupSpec(
                 ["layer2"],
+                # 1 x 2 = 2 --> 对齐到 4，那么应该blocksize -> 2 x block_size
+                # 生产情况会调整，测试没调整
                 SlidingWindowSpec(
+                    # 1 x
                     block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
+                    # 2 x
                     dtype=torch.float32,
                     sliding_window=block_size,
                 ),
@@ -2901,6 +3079,9 @@ def test_hybrid_cache_blocks_swa_tail_window_only():
     token_ids = [i for i in range(8) for _ in range(block_size)]
     req = make_request("0", token_ids, block_size, sha256)
     computed_blocks, _ = manager.get_computed_blocks(req)
+    # full : [ 1 2 ]
+    # swa : [ 3 4 5 6 7 8 9 10]
+    # ⚠️ 一个block只有last block hash会被cached。因此对于swa，只有6和10被cached
     blocks = manager.allocate_slots(
         req,
         8 * block_size,
@@ -2914,6 +3095,9 @@ def test_hybrid_cache_blocks_swa_tail_window_only():
     # SWA group_id=1: only hash 3 and hash 7 (the last block of each
     # 32-token segment) should be cached. Hashes 0,1,2,4,5,6 cannot serve
     # a hit at any lcm-aligned length, so they must NOT be cached.
+    # ⚠️ 因为 SWA 的命中只能停在 alignment_tokens(32 token) 的整数倍边界（这是 coordinator 对齐保证的，否则两个 group 分块对不齐）。
+    # 而 sliding_window=8=block_size 意味着：在任意这样一个边界上，SWA 注意力窗口（8 token = 1 block）只覆盖该段最后那一块。
+    # ⚠️ 一个block只有last block hash会被cached。因此对于swa，只有6和10被cached，对应的顺序就是3和7
     expected_cached = {3, 7}
     for i in range(8):
         cached = pool.get_cached_block(req.block_hashes[i], kv_cache_group_ids=[1])
@@ -2932,6 +3116,7 @@ def test_hybrid_cache_blocks_clamped_to_lcm():
     caching them only pollutes the prefix-cache hash map and keeps blocks
     on the LRU list that could otherwise return to the free pool."""
     block_size = 16
+    # ⚠️ Full attn block_size=32, SWA block_size=16 -> lcm=32.
     # Full attn block_size=32, SWA block_size=16 -> lcm=32.
     kv_cache_config = KVCacheConfig(
         num_blocks=100,
@@ -2940,18 +3125,22 @@ def test_hybrid_cache_blocks_clamped_to_lcm():
             KVCacheGroupSpec(
                 ["layer1"],
                 FullAttentionSpec(
+                    # 2x
                     block_size=block_size * 2,
                     num_kv_heads=1,
                     head_size=1,
+                    # 1x
                     dtype=torch.float16,
                 ),
             ),
             KVCacheGroupSpec(
                 ["layer2"],
                 SlidingWindowSpec(
+                    # 1x
                     block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
+                    # 2x
                     dtype=torch.float32,
                     sliding_window=2 * block_size,
                 ),
@@ -2970,6 +3159,7 @@ def test_hybrid_cache_blocks_clamped_to_lcm():
     token_ids = [i for i in range(7) for _ in range(block_size)]
     req = make_request("0", token_ids, block_size, sha256)
     computed_blocks, _ = manager.get_computed_blocks(req)
+    # ⚠️ 对齐到 2x block_size，7 blocks的最后一个block，hash 6不满对齐到 2x block_size，所以不cached
     blocks = manager.allocate_slots(
         req,
         7 * block_size,
@@ -2980,6 +3170,8 @@ def test_hybrid_cache_blocks_clamped_to_lcm():
     assert len(req.block_hashes) == 7
 
     pool = manager.block_pool
+    # ⚠️ 啥意思，为什么hash 6不cached ?
+    # ⚠️ 哦对了！ 对齐到 2x block_size，7 blocks的最后一个block，hash 6不满对齐到 2x block_size，所以不cached
     # SWA group_id=1: hashes 0..5 cached (6 blocks * 16 tokens = 96), hash 6
     # spans tokens [96, 112) past the lcm boundary and must NOT be cached.
     for i in range(6):
@@ -2987,6 +3179,8 @@ def test_hybrid_cache_blocks_clamped_to_lcm():
             pool.get_cached_block(req.block_hashes[i], kv_cache_group_ids=[1])
             is not None
         ), f"SWA hash {i} should be cached"
+    # ⚠️ 啥意思，为什么hash 6不cached ?
+    # ⚠️ 哦对了！ 对齐到 2x block_size，7 blocks的最后一个block，hash 6不满对齐到 2x block_size，所以不cached
     assert pool.get_cached_block(req.block_hashes[6], kv_cache_group_ids=[1]) is None, (
         "SWA hash 6 spans tokens past the lcm boundary; should not be cached"
     )
@@ -2994,6 +3188,8 @@ def test_hybrid_cache_blocks_clamped_to_lcm():
 
 def test_hybrid_local_kv_retention_interval_aligns_in_manager(monkeypatch):
     """Verify fixed intervals retain sparse tails plus the latest replay tail."""
+    # ⚠️ 因为设了 retention_interval=64 后，SWA 的保留粒度从"每段 32 token"变粗成"每段 64 token"，
+    # block 3 所在的 32-token 边界不再是保留段边界，被稀疏掉了。
     monkeypatch.setenv("VLLM_PREFIX_CACHE_RETENTION_INTERVAL", "64")
     block_size = 8
     kv_cache_config = KVCacheConfig(
@@ -3002,6 +3198,7 @@ def test_hybrid_local_kv_retention_interval_aligns_in_manager(monkeypatch):
         kv_cache_groups=[
             KVCacheGroupSpec(
                 ["layer1"],
+                # 4 x 1 = 4
                 FullAttentionSpec(
                     block_size=4 * block_size,
                     num_kv_heads=1,
@@ -3011,6 +3208,7 @@ def test_hybrid_local_kv_retention_interval_aligns_in_manager(monkeypatch):
             ),
             KVCacheGroupSpec(
                 ["layer2"],
+                # 1 x 2 = 2
                 SlidingWindowSpec(
                     block_size=block_size,
                     num_kv_heads=1,
@@ -3025,6 +3223,7 @@ def test_hybrid_local_kv_retention_interval_aligns_in_manager(monkeypatch):
         kv_cache_config=kv_cache_config,
         max_model_len=8192,
         enable_caching=True,
+        # ⚠️
         hash_block_size=block_size,
     )
 
@@ -3035,6 +3234,10 @@ def test_hybrid_local_kv_retention_interval_aligns_in_manager(monkeypatch):
     token_ids = [i for i in range(16) for _ in range(block_size)]
     req = make_request("0", token_ids, block_size, sha256)
     computed_blocks, _ = manager.get_computed_blocks(req)
+    # full: [ 1 2 3 4 ]
+    # swa: [ 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 ]
+    # swa cached: [ 8 12 16 20 ]
+    # 但是因为设置了 64-token interval
     blocks = manager.allocate_slots(
         req,
         len(token_ids),
@@ -3529,6 +3732,7 @@ def test_cache_hit_local_and_external():
     # be handed out twice, producing duplicate block IDs / ref_cnt corruption.
     block_size = 16
     kv_cache_config = make_kv_cache_config_hybrid_model(block_size, 31, 100)
+    # 只剩下 full0 + swa0
     del kv_cache_config.kv_cache_groups[2:]
     req_id = "test"
     manager = make_kv_cache_manager(
@@ -3536,6 +3740,7 @@ def test_cache_hit_local_and_external():
         max_model_len=8192,
         enable_caching=True,
         hash_block_size=block_size,
+        #
         use_eagle=True,
     )
 
@@ -3544,17 +3749,22 @@ def test_cache_hit_local_and_external():
     for _ in range(10):
         top_blocks.append(head.next_free_block)
         head = head.next_free_block
+    # ⚠️ 模拟 5 computed blocks, full + swa 各 5 blocks
     cache_hit = KVCacheBlocks((top_blocks[:5], top_blocks[5:]))
 
     manager.allocate_slots(
         make_request(req_id, [0] * (8 * block_size), block_size, sha256),
+        # ⚠️ num_new_tokens=16, num_new_computed_tokens=90, num_external_computed_tokens=32
         16,
         5 * block_size,
         cache_hit,
         0,
+        # external computed block本地也要分配
         2 * block_size,
     )
 
+    # full : [ 1 2 3 4 5
+    # swa : [ 6 7 8 9 10
     req_blocks = manager.get_blocks(req_id)
     req_block_ids = req_blocks.get_block_ids()
     all_block_ids = req_block_ids[0] + req_block_ids[1]

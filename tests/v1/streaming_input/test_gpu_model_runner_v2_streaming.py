@@ -97,6 +97,7 @@ def test_e2e_streaming_request_update_basic_flow(
     assert req_id in req_states.req_id_to_index
     assert len(req_states.free_indices) == initial_free - 1
 
+    # ⚠️
     # Step 2: Create streaming update with extended prompt
     # The scheduler has already set prefill_token_ids to the full sequence
     # (original prompt + intermediate output + new prompt tokens)

@@ -37,17 +37,16 @@ def _select_swap_blocks_fn(
     gpu_to_cpu: bool,
 ):
     """Resolve the swap_blocks function for a handler at init time."""
-    # GPU->CPU is bandwidth-bound; the dedicated copy engine beats Triton.
+    # GPU->CPU 受带宽限制，专用拷贝引擎比 Triton 更快。
     if gpu_to_cpu:
         return ops.swap_blocks_batch
-    # Fall back to the C++ DMA path on platforms where Triton isn't usable
-    # (e.g. ROCm builds without Triton) or where GPU kernels cannot directly
-    # dereference CPU pointers (XPU lacks CUDA's unified virtual address space,
-    # so the Triton kernel's tl.load(cpu_ptr) is invalid on XPU).
+    # 在不支持 Triton 的平台（如没有 Triton 的 ROCm 构建），或 GPU kernel 无法直接
+    # 解引用 CPU 指针的平台（XPU 缺少 CUDA 的统一虚拟地址空间，Triton kernel 的
+    # tl.load(cpu_ptr) 在 XPU 上无效）回退到 C++ DMA 路径。
     if not HAS_TRITON or current_platform.is_xpu():
         return ops.swap_blocks_batch
     page_sizes = [r.page_size_bytes for g in kv_cache_groups_data_refs for r in g]
-    # Triton wins only on small, 8-byte-aligned payloads.
+    # Triton 仅在“小且 8 字节对齐”的负载上更优。
     if (
         not page_sizes
         or max(page_sizes) >= THRESHOLD_BYTES
@@ -107,7 +106,7 @@ def compute_sub_block_ptrs(
         output[:] = base_ptr + block_ids.astype(np.uint64)[:num_sub_blocks] * row_stride
         return
 
-    # Vectorized expansion for block_size_factor > 1.
+    # 向量化展开 block_size_factor > 1 的情形。
     assert tensor.shape[1] % block_size_factor == 0
     sub_block_size = tensor.shape[1] // block_size_factor
     sub_offsets = np.arange(block_size_factor, dtype=np.uint64) * sub_block_size
@@ -115,7 +114,7 @@ def compute_sub_block_ptrs(
     all_ptrs = (
         base_ptr + block_ids.astype(np.uint64)[:, np.newaxis] * row_stride
     ) + sub_offsets[np.newaxis, :]
-    # Flatten and apply skip_count / truncation
+    # 展平并按 skip_count 跳过开头、按所需数量截断
     flat = all_ptrs.ravel()
     output[:] = flat[skip_count : skip_count + num_sub_blocks]
 
@@ -195,8 +194,10 @@ class SingleDirectionOffloadingHandler:
         assert len(gpu_tensors) == len(cpu_tensors)
         assert len(gpu_tensors) > 0
 
-        # assert input tensors are as expected
+        # 校验传入的张量符合预期（int8 / 二维 / 设备与形状约束）。
         for gpu_tensor, cpu_tensor in zip(gpu_tensors, cpu_tensors):
+            # ⚠️ gpu_tensor: [ num_blocks, gpu_page_size_bytes ]
+            # ⚠️ cpu_tensor: [ num_blocks, cpu_page_size_bytes ]
             assert gpu_tensor.dtype == torch.int8
             assert gpu_tensor.ndim == 2
             assert gpu_tensor.is_cuda or gpu_tensor.is_xpu
@@ -208,6 +209,8 @@ class SingleDirectionOffloadingHandler:
             # cpu block size一定刚好是 gpu block size的整数倍
             assert cpu_page_size == gpu_page_size * block_size_factor
 
+        # 方向决定谁是源谁是目标：GPU->CPU 时 GPU 张量为源、CPU 张量为目标
+        #（CPU->GPU 时相反）。
         self.src_tensors: list[torch.Tensor] = (
             gpu_tensors if gpu_to_cpu else cpu_tensors
         )
@@ -216,26 +219,32 @@ class SingleDirectionOffloadingHandler:
         )
         self.gpu_to_cpu: bool = gpu_to_cpu
         self.kv_cache_groups_data_refs = kv_cache_groups_data_refs
+
+        # ⚠️ 初始化时即选定具体的拷贝实现（DMA op 还是 Triton kernel），
+        # 选择取决于传输方向与平台对 CPU 指针的支持情况。
         self._swap_blocks_batch = _select_swap_blocks_fn(
             kv_cache_groups_data_refs, gpu_to_cpu
         )
 
-        # GPU blocks may be smaller
-        # cpu_page_size = gpu_page_size * block_size_factor.
+        # 一个 CPU block 相当于 block_size_factor 个 GPU block 宽。
+        # 源侧永远是 GPU 粒度（factor=1）；目标侧在 GPU->CPU 时取该 factor，反之亦然。
         self.src_block_size_factor = 1 if self.gpu_to_cpu else block_size_factor
         self.dst_block_size_factor = block_size_factor if self.gpu_to_cpu else 1
 
-        # mmap_region to clean up on shutdown (gpu_to_cpu handler owns it)
+        # ⚠️ 只有 GPU->CPU（store）handler 持有 mmap region，确保 shutdown 时只清理一次。
         self._mmap_region = mmap_region
-        # job_id -> event
+
+        # ⚠️ job_id -> 完成事件，供 wait()/get_finished() 查询。
         self._transfer_events: dict[int, torch.Event] = {}
-        # queue of transfers (job_id, stream, event)
+
+        # ⚠️ 已提交传输的 FIFO 队列；队首最旧，用于保证按提交顺序完成并串联 stream 依赖。
         self._transfers: deque[Transfer] = deque()
-        # list of CUDA streams available for re-use
+
+        # 可复用的 CUDA stream 池。
         self._stream_pool: list[torch.cuda.Stream] = []
-        # list of CUDA events available for re-use
+        # 可复用的 CUDA event 池。
         self._event_pool: list[torch.Event] = []
-        # list of pinned descriptor buffer sets available for re-use
+        # 可复用的 pinned (src, dst, sizes) 描述符缓冲池。
         self._buffer_pool: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
     def transfer_async(
@@ -274,13 +283,23 @@ class SingleDirectionOffloadingHandler:
         # extract group_sizes from the GPU spec
         gpu_spec = src_spec if self.gpu_to_cpu else dst_spec
         assert isinstance(gpu_spec, GPULoadStoreSpec)
+
+        # ⚠️ GPULoadStoreSpec 把一次要搬运的所有 GPU block 扁平成 block_ids 一个列表，按 group 顺序首尾拼接。
+        # block_ids = [ g0 的 blocks ... ][ g1 的 blocks ... ][ g2 的 blocks ... ]
+        # group_sizes[i] 就是第 i 个 KV group 这一段里包含多少个 GPU block。
         group_sizes = gpu_spec.group_sizes
         assert len(group_sizes) == len(self.kv_cache_groups_data_refs)
 
         # extract block indices from the GPU spec
+        # ⚠️ block_indices[i] —— 该组第一个 GPU block 在 request 内的逻辑 block 序号
+        # （用于算出要跳过 CPU block 开头的几个子块，block_idx % block_size_factor）。
+        # block_indices[i] 是该组第一个 block 的逻辑下标，worker 据此正确跳过首个卸载块的多余部分。
         block_indices = gpu_spec.block_indices
         assert len(block_indices) == len(self.kv_cache_groups_data_refs)
 
+        # ⚠️ 拷贝操作总数 = 各 KV group 的 (group_size 个 GPU block * 该组层数) 之和。
+        # group_size = 第 i 个 KV group 本次要传输的 GPU block 个数。
+        # group_data_refs = 每个 KV cache group 所包含的"层（或层组）"的 KV 页引用列表。
         num_copy_ops = 0
         for group_size, group_data_refs in zip(
             group_sizes, self.kv_cache_groups_data_refs
@@ -296,6 +315,7 @@ class SingleDirectionOffloadingHandler:
         if batch_src.numel() < num_copy_ops:
             batch_src, batch_dst, batch_sizes = _new_descriptor_buffers(num_copy_ops)
 
+        # ⚠️ 切出本次恰好需要的 op 数量，并取 NumPy 视图，便于下方无分配地填指针。
         src = batch_src[:num_copy_ops]
         dst = batch_dst[:num_copy_ops]
         sizes = batch_sizes[:num_copy_ops]
@@ -303,9 +323,11 @@ class SingleDirectionOffloadingHandler:
         all_dst = dst.numpy()
         all_sizes = sizes.numpy()
 
+        # 逐组顺序遍历，边填指针数组边推进 src/dst block 游标与 op 游标。
         src_offset = 0
         dst_offset = 0
         op_idx = 0
+
         # count total number of bytes copied
         num_transfer_bytes = 0
         for group_size, block_idx, group_data_refs in zip(
@@ -314,11 +336,18 @@ class SingleDirectionOffloadingHandler:
             if group_size == 0:
                 continue
 
+            # 一个 CPU block 打包了 block_size_factor 个 GPU block，因此某组的
+            # 第一个 GPU block 可能落在某个 CPU block 中段；skip_count 即源/目标侧
+            # 需要跳过的开头子块数。
+            # ⚠️ src为gpu的话， = 0
             src_logical_blocks_to_skip = block_idx % self.src_block_size_factor
             dst_logical_blocks_to_skip = block_idx % self.dst_block_size_factor
+            # ⚠️
             src_logical_blocks_count = group_size + src_logical_blocks_to_skip
             dst_logical_blocks_count = group_size + dst_logical_blocks_to_skip
 
+            # ⚠️ 把（可能带部分首块的）逻辑 block 数换算成该组实际跨越的完整
+            # src/dst block ID 个数，并切片出来。
             dst_blocks_count = cdiv(
                 dst_logical_blocks_count, self.dst_block_size_factor
             )
@@ -331,6 +360,7 @@ class SingleDirectionOffloadingHandler:
             src_end_offset = src_offset + src_blocks_count
             assert src_end_offset <= num_src_blocks
 
+            # ⚠️
             group_src = src_blocks[src_offset:src_end_offset]
             group_dst = dst_blocks[dst_offset:dst_end_offset]
 
@@ -338,6 +368,8 @@ class SingleDirectionOffloadingHandler:
                 t_idx = data_ref.tensor_idx
                 end_idx = op_idx + group_size
 
+                # 为本 layer 在源/目标张量中分别计算各子块的字节指针，
+                # 并尊重 skip 偏移。
                 compute_sub_block_ptrs(
                     group_src,
                     self.src_block_size_factor,
@@ -353,6 +385,7 @@ class SingleDirectionOffloadingHandler:
                     skip_count=dst_logical_blocks_to_skip,
                 )
 
+                # 本 layer 的每个 op 都拷贝大小为 page_size_bytes 的一页。
                 all_sizes[op_idx:end_idx] = data_ref.page_size_bytes
                 num_transfer_bytes += group_size * data_ref.page_size_bytes
                 op_idx = end_idx
@@ -360,6 +393,7 @@ class SingleDirectionOffloadingHandler:
             src_offset = src_end_offset
             dst_offset = dst_end_offset
 
+        # 所有 src/dst block 与 op 都必须恰好被消费一次。
         assert src_offset == num_src_blocks
         assert dst_offset == num_dst_blocks
         assert op_idx == num_copy_ops
@@ -378,14 +412,18 @@ class SingleDirectionOffloadingHandler:
             else torch.Event(enable_timing=True)
         )
 
+        # ⚠️ store需要先等 gpu 计算完成
         if self.gpu_to_cpu:
             # wait for model computation to finish before offloading
             stream.wait_stream(current_platform.current_stream())
+
+        # ⚠️ 确保 上一次 transfer先完成
         if self._transfers:
             last_transfer: Transfer = self._transfers[-1]
             last_event = last_transfer.end_event
             # assure job will start only after the previous one completes
             stream.wait_event(last_event)
+
         # CPU->GPU reads from host pinned memory, which is never written
         # by a concurrent GPU stream, so CU_MEMCPY_SRC_ACCESS_ORDER_ANY is
         # safe and lets the driver pipeline source reads. GPU->CPU reads
@@ -396,6 +434,7 @@ class SingleDirectionOffloadingHandler:
         with current_platform.stream(stream):
             start_event.record(stream)
             if num_copy_ops > 0:
+                # ⚠️
                 self._swap_blocks_batch(
                     src,
                     dst,
@@ -404,7 +443,9 @@ class SingleDirectionOffloadingHandler:
                 )
             end_event.record(stream)
 
+        # ⚠️ 外部取出 end_event，同步即可确保 transfer 完成
         self._transfer_events[job_id] = end_event
+        # ⚠️ 追加到队尾，异步返回
         self._transfers.append(
             Transfer(
                 job_id=job_id,
@@ -422,7 +463,11 @@ class SingleDirectionOffloadingHandler:
         return True
 
     def get_finished(self) -> list[TransferResult]:
+
         results: list[TransferResult] = []
+
+        # ⚠️ 从 FIFO 队首（最旧）开始 drain 已完成的传输。
+        # query() 非阻塞 检测是否完成
         while self._transfers and self._transfers[0].end_event.query():
             transfer = self._transfers.popleft()
             transfer_time = (
@@ -436,6 +481,7 @@ class SingleDirectionOffloadingHandler:
             )
 
             results.append(result)
+            # 回收
             self._stream_pool.append(transfer.stream)
             self._event_pool.append(transfer.end_event)
             self._event_pool.append(transfer.start_event)
@@ -446,6 +492,7 @@ class SingleDirectionOffloadingHandler:
         return results
 
     def wait(self, job_ids: set[int]):
+        # 阻塞调用方，直到每个请求的 job 的 end event 都已触发。
         for job_id in job_ids:
             event = self._transfer_events.get(job_id)
             if event is not None:
@@ -476,9 +523,14 @@ class CPUOffloadingWorker(OffloadingWorker):
 
     def __init__(
         self,
+        # ⚠️ vLLM 为了高效，把一个 KV group 内形状一致的多层 KV 在 page_size 维度拼接成一个大张量 (num_blocks, page_size_bytes * num_layers)
+        # （见 base.py:424-435 的例子，32 层拼成 (num_blocks, 65536*32)）。
+        # 于是批量拷贝时，不再"一个张量 = 一层"，而是必须知道每层占哪一页、多大——CanonicalKVCacheRef 就是这层定位信息。
         kv_caches: CanonicalKVCaches,
+        # ⚠️ 说明CPU block size比GPU block size大！
         block_size_factor: int,
         num_cpu_blocks: int,
+        # ⚠️
         mmap_region: SharedOffloadRegion | None = None,
     ):
         pin_memory = PIN_MEMORY
@@ -493,8 +545,10 @@ class CPUOffloadingWorker(OffloadingWorker):
             gpu_tensor = kv_cache_tensor.tensor.view(torch.int8).view(
                 (-1, gpu_page_size_bytes)
             )
+            # 说明CPU内存block粒度更粗
             cpu_page_size_bytes = gpu_page_size_bytes * block_size_factor
 
+            # ⚠️ 说明该类负责实际的CPU 内存管理
             if mmap_region is not None:
                 cpu_tensor = mmap_region.create_next_view(cpu_page_size_bytes)
             else:
@@ -516,6 +570,7 @@ class CPUOffloadingWorker(OffloadingWorker):
             gpu_tensors.append(gpu_tensor)
             cpu_tensors.append(cpu_tensor)
 
+        # ⚠️ Store操作
         self._store_handler = SingleDirectionOffloadingHandler(
             gpu_tensors=gpu_tensors,
             cpu_tensors=cpu_tensors,
@@ -525,6 +580,7 @@ class CPUOffloadingWorker(OffloadingWorker):
             mmap_region=mmap_region,
         )
 
+        # ⚠️ Load操作
         self._load_handler = SingleDirectionOffloadingHandler(
             gpu_tensors=gpu_tensors,
             cpu_tensors=cpu_tensors,

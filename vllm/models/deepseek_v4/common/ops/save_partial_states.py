@@ -89,6 +89,7 @@ def _save_partial_states_kernel(
     kv = tl.load(kv_ptr + token_idx * kv_stride + block, mask=mask)
     tl.store(base_ptr + block, kv, mask=mask)
 
+    # ⚠️
     # Fused: score += ape[position % compress_ratio]
     position = tl.load(positions_ptr + token_idx)
     ape_row = position % COMPRESS_RATIO

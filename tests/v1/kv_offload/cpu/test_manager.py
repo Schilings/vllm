@@ -40,6 +40,8 @@ def make_cpu_manager(
     store_threshold: int = 0,
     max_tracker_size: int = 64_000,
 ) -> CPUOffloadingManager:
+    # store_threshold: 同一块被访问达到该次数后才允许真正下盘（复用过滤）
+    # max_tracker_size: 记录"待复用计数"的 tracker 容量上限（超了按 LRU 踢键）
     return CPUOffloadingManager(
         num_blocks=num_blocks,
         cache_policy=cache_policy,
@@ -116,6 +118,7 @@ def verify_events(
 
 @pytest.mark.parametrize("eviction_policy", ["lru", "arc"])
 def test_already_stored_block_not_evicted_during_prepare_store(eviction_policy):
+    # 回归测试：prepare_store 为新块腾位置时，绝不能把"已存储"的块当作 LRU 淘汰（lru/arc 都适用）
     """
     Regression test: a block that is already stored must not be evicted
     by prepare_store() when it needs to make room for new blocks.
@@ -147,6 +150,7 @@ def test_already_stored_block_not_evicted_during_prepare_store(eviction_policy):
     #   - block 2 is already stored -> filtered out of keys_to_store
     #   - block 2 must NOT be evicted even though it is the LRU candidate
     #   - block 1 (ID 0) is evicted instead; new blocks [3,4,5] get IDs 2,3,0
+    #     物理槽位复用规则：淘汰 block 1 释放槽 0；[3,4,5] 依次取空闲槽 2、3、0
     prepare_store_output = manager.prepare_store(to_keys([2, 3, 4, 5]), _EMPTY_REQ_CTX)
     verify_store_output(
         prepare_store_output,
@@ -165,6 +169,7 @@ def test_already_stored_block_not_evicted_during_prepare_store(eviction_policy):
 
 
 def test_filter_reused_manager_reports_stores_skipped_counter():
+    # 验证被 store_threshold 过滤掉的块计入 STORES_SKIPPED 指标，且 get_stats() 取一次后置零
     manager = make_cpu_manager(
         num_blocks=4,
         cache_policy="lru",
@@ -190,6 +195,7 @@ def test_filter_reused_manager_reports_stores_skipped_counter():
 
 
 def test_cpu_manager_reports_cache_usage_gauge():
+    # 验证 CPU_CACHE_USAGE_PERC 指标：分配中/空闲/已存可淘汰各阶段占用率正确
     def check_usage_stats(manager: CPUOffloadingManager, value: float):
         stats = manager.get_stats()
         assert stats is not None
@@ -225,6 +231,7 @@ def test_cpu_manager_reports_cache_usage_gauge():
 
 
 def test_cpu_manager():
+    # LRU 全链路：prepare/complete/lookup(HIT_PENDING/HIT/MISS)/淘汰/load 引用计数/失败回滚/事件
     """
     Tests CPUOffloadingManager with lru policy.
     """
@@ -275,6 +282,10 @@ def test_cpu_manager():
     verify_events(cpu_manager.take_events(), expected_evictions=({1},))
 
     # prepare store with no space
+    # ⚠️ 一个 block 只有满足 is_ready=True（已完成 complete_store）且 ref_cnt==0 才是 evictable；
+    # 而 _num_evictable_cache_blocks 只在 complete_store 成功时 +1：
+    # 需要淘汰 2 个，但可淘汰块只有 1 个 → 2 > 1 → 命中 manager.py:217 的守卫 → 返回 None
+    # 这里"不淘汰其他 block"的真正原因是：3/4/5 还在传输中（in-flight），不属于可淘汰集合，能腾出来的只有 block 2 一个，不够 2 个槽位。
     assert cpu_manager.prepare_store(to_keys([1, 6]), _EMPTY_REQ_CTX) is None
 
     # complete store [2, 3, 4, 5]
@@ -341,6 +352,7 @@ def test_cpu_manager():
 
 
 def test_prepare_load_preserves_key_order():
+    # 关键不变量：prepare_load 返回的 block_ids[i] 必须与 keys[i] 一一对应（顺序 preserved）
     """block_ids[i] must correspond to keys[i] (co-indexed invariant)."""
     manager = make_cpu_manager(num_blocks=4, cache_policy="lru")
 
@@ -393,6 +405,7 @@ class TestARCPolicy:
         return manager, policy
 
     def test_basic(self):
+        # ARC 基础：store/load/lookup 正确，且刚存入的块落在 T1（recent 列表）
         """
         Tests CPUOffloadingManager with arc policy.
         Verifies that ARC handles store, load, and lookup operations correctly.
@@ -433,6 +446,7 @@ class TestARCPolicy:
         assert len(arc_policy.t2) == 0
 
     def test_t1_to_t2_promotion(self):
+        # ARC 核心：T1 中的块被二次访问（touch）后提升到 T2（认为高频）
         """
         Tests that accessing a block in T1 promotes it to T2 (frequent).
         This is a key feature of ARC's adaptive behavior.
@@ -455,6 +469,7 @@ class TestARCPolicy:
         assert to_keys([1])[0] in arc_policy.t2
 
     def test_eviction_with_load(self):
+        # 正在被 load 的块 ref_cnt>0，prepare_store 无法腾出空间时应返回 None
         """
         Tests ARC eviction behavior similar to LRU test.
         Verifies that blocks being loaded (ref_cnt > 0) cannot be evicted.
@@ -496,6 +511,7 @@ class TestARCPolicy:
         assert len(prepare_store_output.evicted_keys) >= 1
 
     def test_adaptive_target(self):
+        # ARC 自适应：访问 B1 幽灵表里的块会增大 target_t1_size（偏向近期）
         """
         Tests ARC's adaptive target adjustment via ghost lists.
         When a block in B1 (ghost list) is accessed, target_t1_size increases.
@@ -524,6 +540,7 @@ class TestARCPolicy:
         assert arc_policy.target_t1_size > initial_target
 
     def test_t1_t2_eviction_policy(self):
+        # ARC 淘汰方向：|T1|>=target 时从 T1 淘汰，否则从 T2 淘汰
         """
         Tests that ARC evicts from T1 or T2 based on target_t1_size.
         If |T1| >= target_t1_size, evict from T1, otherwise from T2.
@@ -558,6 +575,7 @@ class TestARCPolicy:
         assert to_keys([5])[0] in arc_policy.t1
 
     def test_ghost_list_bounds(self):
+        # 幽灵表 B1/B2 容量受 cache_capacity 限制，不会无限增长
         """
         Tests that ghost lists (B1, B2) don't grow unbounded.
         They should be capped at cache_capacity.
@@ -578,6 +596,7 @@ class TestARCPolicy:
         assert len(arc_policy.b2) <= arc_policy.cache_capacity
 
     def test_touch_ordering(self):
+        # touch 正确维护 T1/T2 内部顺序：晋升/移动尾部，prepare_store 只动 T1 淘汰
         """
         Tests that touch() correctly updates access patterns.
         Similar to LRU test but verifies T1/T2 ordering.
@@ -611,6 +630,7 @@ class TestARCPolicy:
         )
 
     def test_failed_store(self):
+        # 失败 store 要清理：键不在 T1/T2，被淘汰块进入 B1 幽灵表
         """
         Tests that failed store operations clean up correctly.
         Similar to LRU test but for ARC.
@@ -640,6 +660,7 @@ class TestARCPolicy:
         assert evicted_hash in arc_policy.b1
 
     def test_full_scenario(self):
+        # ARC 综合场景：连续 store/淘汰/晋升/查找 + 事件产出
         """
         Comprehensive test covering multiple ARC operations in sequence.
         Similar to the full LRU test but adapted for ARC behavior.
@@ -680,6 +701,7 @@ class TestARCPolicy:
 
 
 def test_filter_reused_manager():
+    # store_threshold 复用过滤：计数未达阈值不存；tracker 超 max_size 按 LRU 驱逐键
     """
     Tests CPUOffloadingManager reuse filtering (store_threshold=2).
     """
@@ -729,6 +751,7 @@ def test_filter_reused_manager():
 
 
 def test_evictable_cache_block_count():
+    # 验证 _num_evictable_cache_blocks 在完整生命周期维护正确，含并发 load 不重复递减与快速短路
     """
     Verifies _num_evictable_cache_blocks is maintained correctly through the
     full store/load lifecycle, eviction, failed stores, concurrent loads,
@@ -794,6 +817,8 @@ def test_evictable_cache_block_count():
 
     # prepare_store requiring eviction must return None immediately (fast exit).
     # Spy on policy.evict to confirm the fast path short-circuits before calling it.
+    # 用 spy 验证：当 _num_evictable_cache_blocks==0 时，prepare_store 应直接在调用
+    # policy.evict() 之前短路返回 None，避免无谓的淘汰计算。
     evict_called = False
     original_evict = manager._policy.evict
 

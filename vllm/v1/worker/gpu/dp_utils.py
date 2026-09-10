@@ -32,8 +32,11 @@ def sync_cudagraph_and_dp_padding(
     group = get_dp_group().cpu_group
     tensor = torch.zeros(3, dp_size, dtype=torch.int32, device="cpu")
     tensor[0][dp_rank] = num_tokens
+    # 是否都开启cuda graph
     tensor[1][dp_rank] = desired_batch_desc.cg_mode.value
     tensor[2][dp_rank] = uniform_token_count or 0  # (0 means None)
+    # 跨 dp rank 收集  (num_tokens, cg_mode_across_dp, uniform_token_count)
+    # 收集到所有 dp ranks的值，使用 all reduce代替all gather
     dist.all_reduce(tensor, group=group)
 
     num_tokens_across_dp = tensor[0]
@@ -107,6 +110,7 @@ def dispatch_cg_and_sync_dp(
             "cudagraph_manager should only be None during profile run, "
             "where need_eager must be True"
         )
+        # 1.
         batch_desc = cudagraph_manager.dispatch(
             num_reqs,
             num_tokens,
@@ -117,6 +121,7 @@ def dispatch_cg_and_sync_dp(
     if dp_size == 1:
         return batch_desc, None
 
+    # 2.
     return sync_cudagraph_and_dp_padding(
         cudagraph_manager,
         batch_desc,

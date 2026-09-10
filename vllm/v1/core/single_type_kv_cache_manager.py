@@ -186,24 +186,8 @@ class SingleTypeKVCacheManager(ABC):
         """📖 容量预估 — 返回该请求在本 group 还需要分配多少 block。
         🔗 Scheduler → KVCacheManager → coordinator → get_num_blocks_to_allocate
           → 遍历 single_type_managers → 汇总各 group 的 block 需求
-        ⚙️ 三种路径:
-        ┌─────────────────────────────────────────────────────────────┐
-        │ ① 运行中请求 (已 track): 只需 num_required - num_req       │
-        │    (fast-path: 无新前缀命中)                                │
-        │ ② 新请求 + 无窗口淘汰:                                      │
-        │    num_new = max(required - skipped, 0)                    │
-        │ ③ 新请求 + SWA窗口淘汰:                                     │
-        │    窗口外的 block 可回收 → 减少需求                         │
-        │    num_skipped_tokens = get_num_skipped_tokens()           │
-        │    Full: 0           SWA: max(0, n - sw + 1)              │
-        │                                                             │
-        └─────────────────────────────────────────────────────────────┘
-
-        📥 apply_admission_cap: True → 启用回收感知上限（SWA/ChunkedLocal,
-            用 _max_admission_blocks_per_request 限制峰值持有量）
-        📤 int: 还需要分配的 block 数（含 evictable 前缀块）
         """
-
+        # ⚠️ 每个group的block size不一定一致！
         num_required_blocks = cdiv(num_tokens, self.block_size)
         # 防止 admission 和 pool sizer 不匹配导致死锁（issue #39734）
         # 回收感知上限：SWA/ChunkedLocal 层有 peak block 上限
@@ -289,12 +273,14 @@ class SingleTypeKVCacheManager(ABC):
         )
         num_skipped_tokens = self.get_num_skipped_tokens(num_total_computed_tokens)
         num_skipped_blocks = num_skipped_tokens // self.block_size
+        # ⚠️
         if num_skipped_blocks > 0:
             # It is possible that all new computed blocks are skipped when
             # num_skipped_blocks > len(new_computed_blocks).
             new_computed_blocks = new_computed_blocks[num_skipped_blocks:]
 
         # Touch the computed blocks to make sure they won't be evicted.
+        # ⚠️ ret_cnt += 1
         if self.enable_caching:
             self.block_pool.touch(new_computed_blocks)
         else:
@@ -343,6 +329,7 @@ class SingleTypeKVCacheManager(ABC):
             return
 
         req_blocks = self.req_to_blocks[request_id]
+        # ⚠️ external computed block要分配出来，存在本地！！！
         allocated_blocks = self.block_pool.get_new_blocks(
             cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
         )
@@ -353,23 +340,15 @@ class SingleTypeKVCacheManager(ABC):
             MLAAttentionSpec,
             HiddenStateCacheSpec,
         ):
-                # 否则即使命中，整个前缀也算不了（因为 alignment 不对齐）
-                # 首个连续 block 的尾巴必须对齐 alignment_tokens
+            # ⚠️ 用于记录此处 schedule 共分配了哪些 new block， allocate_new_blocks也会追加分配的blocks
             self.new_block_ids.extend(b.block_id for b in allocated_blocks)
 
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
     ) -> list[KVCacheBlock]:
-        """✍️ 分配全新 block — 调用链第⑤步。
-
-        ⚙️ 行为:
-        1. ceil(num_tokens / block_size) - len(req_blocks) = 还需几个
-        2. block_pool.get_new_blocks() → 新增物理 block
-        3. 追加到 new_block_ids（供 take_new_block_ids 拉取）
-
-        📤 list[KVCacheBlock]: 本次新增的 block 列表
-        """
         req_blocks = self.req_to_blocks[request_id]
+        # ⚠️ 每个group的block size不一定一致！
+        # 这将导致allocate的block数量不一致，但是block pool的page size bytes固定一致的，那怎么解决呢
         num_required_blocks = cdiv(num_tokens, self.block_size)
         num_new_blocks = num_required_blocks - len(req_blocks)
         if num_new_blocks <= 0:
@@ -383,6 +362,7 @@ class SingleTypeKVCacheManager(ABC):
                 MLAAttentionSpec,
                 HiddenStateCacheSpec,
             ):
+                # ⚠️ 用于记录此处 schedule 共分配了哪些 new block， allocate_external_computed_blocks 也会追加分配的blocks
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
             return new_blocks
 
@@ -410,21 +390,28 @@ class SingleTypeKVCacheManager(ABC):
                 boundary; a positive multiple of ``scheduler_block_size`` keeps
                 a tail once per that-sized segment. Only SWA acts on it.
         """
+        # 已缓存的块数（之前 cache_blocks 留下的进度，避免重复缓存）
         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
+        # 本次需缓存的总块数 = 总 token 数 // 本组 block_size
         num_full_blocks = num_tokens // self.block_size
 
+        # 已经全部缓存过，直接返回（幂等，decode 每步都会调用）
         if num_cached_blocks >= num_full_blocks:
             return
 
+        # 计算每块是否值得写进哈希表：
+        #   full attention → 返回 None（每块都缓存）
+        #   SWA → 稀疏 mask，只保留能在 alignment 边界上被命中命中的块
         block_mask = self.reachable_block_mask(
-            start_block=num_cached_blocks,
+            start_block=num_cached_blocks,  # 从上次停的地方继续，不重复扫
             end_block=num_full_blocks,
-            alignment_tokens=self.scheduler_block_size,
+            alignment_tokens=self.scheduler_block_size,  # lcm 对齐边界
             kv_cache_spec=self.kv_cache_spec,
-            use_eagle=self.use_eagle,
-            retention_interval=retention_interval,
-            num_prompt_tokens=request.num_prompt_tokens,
+            use_eagle=self.use_eagle,  # eagle 需多 peek 一块
+            retention_interval=retention_interval,  # 稀疏 retention 粒度
+            num_prompt_tokens=request.num_prompt_tokens,  # 精确 replay 边界
         )
+        # 把 mask 为 True 的块真正写入前缀哈希表（其余块保持可释放状态）
         self.block_pool.cache_full_blocks(
             request=request,
             blocks=self.req_to_blocks[request.request_id],
@@ -435,6 +422,7 @@ class SingleTypeKVCacheManager(ABC):
             block_mask=block_mask,
         )
 
+        # 更新缓存进度，下次调用从 num_full_blocks 起算
         self.num_cached_block[request.request_id] = num_full_blocks
 
     @classmethod
@@ -575,6 +563,7 @@ class SingleTypeKVCacheManager(ABC):
             if blocks[i] == self._null_block:
                 break
             freed.append(blocks[i])
+            # ⚠️ 替换成 null block
             blocks[i] = self._null_block
         if freed:
             self.block_pool.free_blocks(freed)
@@ -953,7 +942,15 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         Returns:
             The number of tokens that will be skipped for attention computation.
         """
-        # 只要 last token的前 window - 1 个
+        # 为什么是 window - 1（即公式里的 +1）？
+        # 下一个要算的 token（位置 num_computed_tokens）的窗口共 window 个token，其中包含它自己。
+        # attention 计算时确实会先把当前 token 的 K/V写入 cache，再统一从 cache 按窗口做计算
+        # ——所以当前 token 也在 cache里。但它是本步现算现写的，不需要从之前的步骤"保留"下来。
+        # get_num_skipped_tokens 决定的是"已存在于 cache 的旧 token 要留几个"：只需 window - 1 个，剩下一个窗口名额由本步刚写入的当前 token 占。
+        # 例：window=4, computed=7，token 7 的窗口是 [4,5,6,7]：
+        #   4,5,6 -> 旧历史需保留（3 个 = window-1）；7 -> 本步写入。
+        # 3 个旧历史 + 1 个当前 = 恰好满窗口。若不 +1（保留 3,4,5,6 共 4 个旧历史），token 7 会 attend 到 5 个 token，反而超出窗口。
+        # 这与 _contiguous_blocks_for_hit 用 cdiv(window-1, block_size)是同一个道理。
         return max(0, num_computed_tokens - self.sliding_window + 1)
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
@@ -1591,43 +1588,49 @@ def get_manager_for_kv_cache_spec(
 
 def register_all_kvcache_specs(vllm_config):
     """Built-in spec registration"""
+    # Full -> Full
     KVCacheSpecRegistry.register(
         FullAttentionSpec,
         FullAttentionManager,
         uniform_type_base_spec=FullAttentionSpec,
     )
-
+    # SWA -> SWA
     KVCacheSpecRegistry.register(
         SlidingWindowSpec,
         SlidingWindowManager,
         uniform_type_base_spec=SlidingWindowSpec,
     )
+    # SWA_MLA -> SWA_MLA
     KVCacheSpecRegistry.register(
         SlidingWindowMLASpec,
         SlidingWindowManager,
         uniform_type_base_spec=SlidingWindowMLASpec,
     )
-
+    # Mamba -> Mamba
     KVCacheSpecRegistry.register(
         MambaSpec, MambaManager, uniform_type_base_spec=MambaSpec
     )
+    # CLA -> CLA
     KVCacheSpecRegistry.register(
         ChunkedLocalAttentionSpec,
         ChunkedLocalAttentionManager,
         uniform_type_base_spec=ChunkedLocalAttentionSpec,
     )
+    # Cross -> Cross
     KVCacheSpecRegistry.register(
         CrossAttentionSpec,
         CrossAttentionManager,
         uniform_type_base_spec=CrossAttentionSpec,
     )
 
+    # Full -> TQFull
     # FullAttentionSpec subclasses — grouped with FullAttentionSpec
     KVCacheSpecRegistry.register(
         TQFullAttentionSpec,
         FullAttentionManager,
         uniform_type_base_spec=FullAttentionSpec,
     )
+    # Full -> MLA
     KVCacheSpecRegistry.register(
         MLAAttentionSpec, FullAttentionManager, uniform_type_base_spec=FullAttentionSpec
     )

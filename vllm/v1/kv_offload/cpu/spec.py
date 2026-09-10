@@ -53,7 +53,7 @@ class CPUOffloadingSpec(OffloadingSpec):
 
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig):
         super().__init__(vllm_config, kv_cache_config)
-
+        # ⚠️
         # 用户通过 kv_connector_extra_config["cpu_bytes_to_use"] 指定的、可用于
         # KV offload 的 CPU 内存总量（字节）。这是整个 CPU offload 池的容量上限。
         cpu_bytes_to_use = self.extra_config.get("cpu_bytes_to_use")
@@ -130,7 +130,7 @@ class CPUOffloadingSpec(OffloadingSpec):
 
             # Maximum entries in the internal tracker's LRU table.
             max_tracker_size = int(self.extra_config.get("max_tracker_size", 64_000))
-
+            # ⚠️
             self._manager = CPUOffloadingManager(
                 num_blocks=self.num_blocks,
                 cache_policy=self.eviction_policy,  # type: ignore[arg-type]
@@ -141,6 +141,7 @@ class CPUOffloadingSpec(OffloadingSpec):
         return self._manager
 
     def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
+        # ⚠️
         return CPUOffloadingWorker(
             kv_caches=kv_caches,
             block_size_factor=self.block_size_factor,

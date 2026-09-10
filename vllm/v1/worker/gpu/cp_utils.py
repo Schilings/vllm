@@ -49,6 +49,7 @@ def _dcp_local_seq_lens_kernel(
     seq_lens = tl.load(seq_lens_ptr + block, mask=block < num_reqs)
 
     # Distribute KV cache among different ranks, in a round-robin manner.
+    # cp_interleave每次，一个rank一次放cp_interleave个kv，交错放
     rounds = seq_lens // (dcp_size * cp_interleave)
     remainder = seq_lens % (dcp_size * cp_interleave)
 

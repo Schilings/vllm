@@ -780,6 +780,7 @@ class Scheduler(SchedulerInterface):
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
+                        # KV Connector 的 第 2️⃣ 个 Hook
                         ext_tokens, load_kv_async = (
                             self.connector.get_num_new_matched_tokens(
                                 request, num_new_local_computed_tokens
@@ -983,6 +984,7 @@ class Scheduler(SchedulerInterface):
                 # This information is used to determine if a load is
                 # needed for this request.
                 if self.connector is not None:
+                    # KV Connector 的 第 3️⃣ 个 Hook
                     self.connector.update_state_after_alloc(
                         request,
                         self.kv_cache_manager.get_blocks(request_id),
@@ -1179,6 +1181,7 @@ class Scheduler(SchedulerInterface):
         # 2. Wrap up all the KV cache load / save ops into an opaque object
         # 3. Clear the internal states of the connector
         if self.connector is not None:
+            # KV Connector 的 第 4️⃣ 个 Hook
             meta = self._build_kv_connector_meta(self.connector, scheduler_output)
             scheduler_output.kv_connector_metadata = meta
 
@@ -1196,6 +1199,7 @@ class Scheduler(SchedulerInterface):
 
         # === ⑥ 收尾: 推进 num_computed_tokens, 更新 is_prefill_chunk ===
         with record_function_or_nullcontext("schedule: update_after_schedule"):
+            # Async Scheduler的 第 1️⃣ 个 Hook
             self._update_after_schedule(scheduler_output)
         return scheduler_output
 
@@ -1587,9 +1591,11 @@ class Scheduler(SchedulerInterface):
         if self.perf_metrics and self.perf_metrics.is_enabled():
             perf_stats = self.perf_metrics.get_step_perf_stats_per_gpu(scheduler_output)
 
+        # ⚠️
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
 
+        # 1️⃣ 某些请求的 kv block transfer 失败
         failed_kv_load_req_ids = None
         if kv_connector_output and kv_connector_output.invalid_block_ids:
             # These blocks contain externally computed tokens that failed to
@@ -1600,6 +1606,7 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens,
             )
 
+        # 2️⃣ 此次调度的moe路由情况
         # Persist per-step routed experts into the scheduler-side slot
         # buffer (CPU->CPU fancy-index assign; ~few MB per step).
         # MUST precede the per-request routing reads below: stopped
@@ -1621,6 +1628,7 @@ class Scheduler(SchedulerInterface):
                 routing_offsets[rid] = offset
                 offset += num_scheduled_tokens[rid]
 
+        # 3️⃣ 处理此次调度的所有req的结果，更新状态
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
         # to avoid expensive operations inside the loop.
@@ -1628,6 +1636,7 @@ class Scheduler(SchedulerInterface):
         stopped_preempted_reqs: set[Request] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
+            # ❓❓❓ 没有完成kv transfer的req会被调度吗❓❓❓
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # skip failed or rescheduled requests from KV load failure
                 continue
@@ -1643,10 +1652,12 @@ class Scheduler(SchedulerInterface):
                 continue
 
             req_index = model_runner_output.req_id_to_index[req_id]
+            # ⚠️ 每个请求新生成的token ids
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
 
+            # ⚠️
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
@@ -1657,21 +1668,39 @@ class Scheduler(SchedulerInterface):
                 and (generated_token_ids or self.num_sampled_tokens_per_step == 0)
                 and request.async_tokens_to_discard == 0
             ):
+                # ⚠️ generated_token_ids（= sampled_token_ids[req_index]）在投机解码下
+                #     顺序为：前 num_accepted 个是对上一轮投机草稿的验证结果
+                #     （接受的草稿 + 被拒绝后恢复出的 token），最后 1 个（num_sampled
+                #     个，非 diffusion 模型为 1）才是本轮真正采样出的 bonus token。
+                #     即 accepted 在前、sampled(bonus) 在末尾——下方
+                #     `num_accepted = len(...) - num_sampled` 正是依赖这一布局。
+                #     详见 rejection_sampler.py:830-845（bonus 写在最后一位置）。
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_sampled = self.num_sampled_tokens_per_step
                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
                 num_rejected = num_draft_tokens - num_accepted
+
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
                 # tokens and rejections. If some tokens are rejected,
                 # num_computed_tokens is decreased by the number of rejected
                 # tokens.
+                # ⚠️ 因为在schedule的时候（model execute前）就已经提前更新了num_computed_tokens的值
+                # num_computed_tokens += num_new_tokens了，所以事后有出入需要更正
                 if request.num_computed_tokens > 0:
                     request.num_computed_tokens -= num_rejected
+
                 # If async scheduling, num_output_placeholders also includes
                 # the scheduled spec tokens count and so is similarly adjusted.
+                # ⚠️ 因为 Asycn Scheduler里，提前接受了所以草稿token：
+                # cur_num_spec_tokens = len(spec_decode_tokens.get(req_id, ()))
+                # request.num_output_placeholders += (
+                #     self.num_sampled_tokens_per_step + cur_num_spec_tokens
+                # )
                 if request.num_output_placeholders > 0:
                     request.num_output_placeholders -= num_rejected
+
+                # 统计spec的情况
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
@@ -1681,6 +1710,7 @@ class Scheduler(SchedulerInterface):
                 )
 
             # Free encoder inputs only after the step has actually executed.
+            # ⚠️ encoder的内容不
             if request.has_encoder_inputs:
                 self._free_encoder_inputs(request)
 
@@ -1694,6 +1724,11 @@ class Scheduler(SchedulerInterface):
 
             # Check for stop and update request status.
             if new_token_ids:
+                # Async Scheduler的第 2️⃣ 个 Hook，会重写这个函数
+                # ⚠️ Scheduler：简单的将新tokens追加到req.output_ids
+                # ⚠️ Async Scheduler：
+                #                   主要多了个修正 request.num_output_placeholders -= len(new_token_ids)
+                #                   和 kv_cache_manager.cache_blocks，需要对之前占位的token实际进行caching用于prefix caching
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids
                 )
@@ -1702,6 +1737,7 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
+            # ⚠️ 处理 structured_output_manager
             if new_token_ids and self.structured_output_manager.should_advance(request):
                 struct_output_request = request.structured_output_request
                 assert struct_output_request is not None
@@ -1728,6 +1764,7 @@ class Scheduler(SchedulerInterface):
                     request.resumable = False
                     stopped = True
 
+            # ⚠️ 如果需要返回具体的路由专家信息
             routed_experts = None
             if (
                 self.enable_return_routed_experts
@@ -1768,6 +1805,7 @@ class Scheduler(SchedulerInterface):
                         # Normal decode / re-prefill: token(s) at the END.
                         routed_experts = routing_data[end - len(new_token_ids) : end]
 
+            # ⚠️ 如果停止的请求，释放资源
             finish_reason = None
             if stopped:
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
@@ -1782,6 +1820,7 @@ class Scheduler(SchedulerInterface):
                 else:
                     stopped_preempted_reqs.add(request)
 
+            # ⚠️ 如果需要返回采样的token的logprobs
             # Extract sample logprobs if needed.
             if (
                 request.sampling_params is not None
@@ -2013,6 +2052,7 @@ class Scheduler(SchedulerInterface):
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
 
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
+        #
         for req_id, spec_token_ids in zip(
             draft_token_ids.req_ids,
             draft_token_ids.draft_token_ids,
@@ -2503,7 +2543,7 @@ class Scheduler(SchedulerInterface):
             # in order to be able to sample the next token
             if request.num_computed_tokens == request.num_tokens:
                 request.num_computed_tokens = request.num_tokens - 1
-
+        # ⚠️
         self.finished_recving_kv_req_ids.remove(request.request_id)
 
     def _try_promote_blocked_waiting_request(self, request: Request) -> bool:
@@ -2516,6 +2556,10 @@ class Scheduler(SchedulerInterface):
             # in KVConnectorOutput.finished_recving
             if request.request_id not in self.finished_recving_kv_req_ids:
                 return False
+            # ⚠️ KV transfer 什么时候"对调度器算完成"，看的是 ModelRunnerOutput（即 worker/model runner 回传给调度器的那次 output），而不是调度器自己判断的。
+            # ⚠️ KV transfer 完成由 worker 侧的 KV 连接器 agent 检测，并通过 ModelRunnerOutput.kv_connector_output.finished_recving 回传给调度器；调度器完全被动接收这个信号。
+            # model runner每次会把kv transfer完成了的请求名单传出来，scheduler会记录
+            # 等待之后调度的时候判断该请求是否在完成名单内
             self._update_waiting_for_remote_kv(request)
             if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED

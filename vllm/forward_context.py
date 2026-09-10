@@ -326,6 +326,7 @@ def set_forward_context(
         ubatch_slices=ubatch_slices,
     )
 
+    #
     forward_context = create_forward_context(
         attn_metadata,
         vllm_config,

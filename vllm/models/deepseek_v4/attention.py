@@ -191,8 +191,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self.eps = config.rms_norm_eps
         self.scale = self.head_dim**-0.5
 
+        # ⚠️
         # Padded Q head count is dictated by the platform subclass.
         self.padded_heads = self.get_padded_num_q_heads(self.n_local_heads)
+
+        # ⚠️
         # Sink padded to the same head count, initialized to -inf (no sink
         # effect). Weight loading fills the first n_local_heads slots.
         self.attn_sink = nn.Parameter(
@@ -200,17 +203,22 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             requires_grad=False,
         )
 
+        # ⚠️ 实际是ReplicatedLinear，disable_tp=True不拆分权重
         self.fused_wqa_wkv = MergedColumnParallelLinear(
             self.hidden_size,
             [self.q_lora_rank, self.head_dim],
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.fused_wqa_wkv",
+            # 不拆分权重，等同于 ReplicatedLinear
             disable_tp=True,  # fused ReplicatedLinear
         )
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
+
+        # ⚠️ 这里就拆分权重
         self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,
+            # 按列拆分，实际得到  n_local_heads * head_dim
             self.n_heads * self.head_dim,
             bias=False,
             quant_config=quant_config,
@@ -219,6 +227,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         )
 
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
+
+        # ⚠️ 权重按照列维度拆分，但是 计算的时候需要分开使用
         self.wo_a = ColumnParallelLinear(
             self.n_heads * self.head_dim // self.n_groups,
             self.n_groups * self.o_lora_rank,
@@ -227,8 +237,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             return_bias=False,
             prefix=f"{prefix}.wo_a",
         )
+        # 就是分开bmm
         self.wo_a.is_bmm = True
         self.wo_a.bmm_batch_size = self.n_local_groups
+
+        # ⚠️ 同理
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
@@ -247,10 +260,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             compress_ratio=self.compress_ratio,
         )
         self.indexer_rotary_emb = self.rotary_emb
+
+        # ⚠️ 这个buffer
         self.topk_indices_buffer = topk_indices_buffer
 
         self.indexer = None
         if self.compress_ratio == 4:
+            # ⚠️ 使用独立的stream进行indexer的计算
             # Only C4A uses sparse attention and hence has indexer.
             # aux_stream_list[2] is free here (outer GEMMs joined) for the inner
             # overlap of wq_b+fused_indexer_q_rope_quant vs compressor. None on
@@ -291,6 +307,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self._uses_fp8_ds_mla_layout(), cache_config.cache_dtype, cache_config
         )
 
+        # ⚠️
         self.swa_cache_layer = DeepseekV4SWACache(
             head_dim=self.head_dim,
             window_size=self.window_size,
@@ -307,6 +324,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             compilation_config.static_forward_context[prefix] = self
         self.kv_cache = torch.tensor([])
 
+        # ⚠️
         # Create the compressor for layers with compress_ratio > 1; after the
         # attention setup above so its KV-cache prefix (self.prefix) is set.
         self.compressor = None
@@ -329,7 +347,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     ) -> torch.Tensor:
         # Pre-allocate attention output with FlashMLA-padded head count.
         # The op writes into `o_padded`; we slice to n_local_heads after.
+        # num_tokens = N：本层参与计算的 token 数（= hidden_states 第 0 维）
         num_tokens = hidden_states.shape[0]
+        # o_padded：注意力输出预分配缓冲，形状 [N, padded_heads, head_dim]
+        # 注意用 padded_heads（>= n_local_heads，FlashMLA 要求对齐的 head 数）而非 n_local_heads，
+        # 末尾多出的 head 槽位由 attn_sink（-inf）填充，最后再切片回 n_local_heads
         o_padded = torch.empty(
             (num_tokens, self.padded_heads, self.head_dim),
             dtype=hidden_states.dtype,
@@ -339,10 +361,21 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # Metadata-independent input GEMMs + RMSNorm stay in the captured
         # graph; the metadata-dependent rest (q up-proj + kv-insert, indexer,
         # compressor, MLA attention) runs in the eager break.
+        # attn_gemm_parallel_execute 在多个 CUDA 流上并行跑输入投影（见前文 shape 注释）：
+        #   qr_kv           : [N, q_lora_rank + head_dim]（fused_wqa_wkv 输出，未拆分）
+        #   kv_score        : [N, 2*coff*head_dim]（compressor 侧 KV score 候选）
+        #   indexer_kv_score: [N, 2*coff*head_dim]（indexer 侧 KV score 候选）
+        #   indexer_weights : [N, n_head]（indexer 的 query 侧路由权重）
         qr_kv, kv_score, indexer_kv_score, indexer_weights = (
             self.attn_gemm_parallel_execute(hidden_states)
         )
+        # 把 fused 输出按最后一维切开：
+        #   qr: [N, q_lora_rank]（压缩后的 query 表示）
+        #   kv: [N, head_dim]（本层 KV 表示，待后续 compressor 压缩成 coff*head_dim）
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
+
+        # fused_q_kv_rmsnorm：对 qr、kv 分别做 RMSNorm（用 q_norm / kv_norm 权重）
+        # 输入 qr [N, q_lora_rank]、kv [N, head_dim] → 输出同形 [N, q_lora_rank]、[N, head_dim]
         qr, kv = fused_q_kv_rmsnorm(
             qr,
             kv,
@@ -354,6 +387,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # attention_impl is wrapped with @eager_break_during_capture: this is
         # where the breakable cudagraph capture breaks (the attention op runs
         # eagerly between captured graph segments).
+        # attention_impl 内部（eager break）：用 qr/kv 上投影出 q、压缩 KV 写入 cache、
+        # indexer 做稀疏路由、再跑 MLA 注意力，结果写入 o_padded [N, padded_heads, head_dim]
+        # 传入的 kv_score / indexer_kv_score / indexer_weights 即为 indexer+compressor 所需原料
         self.attention_impl(
             hidden_states,
             qr,
@@ -364,12 +400,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             positions,
             o_padded,
         )
+        # 切回真实 head 数：o [N, n_local_heads, head_dim]（丢掉 padding 的 head 槽）
         o = o_padded[:, : self.n_local_heads, :]
 
         # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).
+        # _o_proj 输入 o [N, n_local_heads, head_dim] → 输出 [N, hidden_size]
         return self._o_proj(o, positions)
 
     def attn_gemm_parallel_execute(self, hidden_states) -> tuple[Any, ...]:
+        # 约定：hidden_states 形状 [N, hidden_size]，N = 本次参与计算的 token 数。
+        # ⚠️ 使用三个不同stream并行计算
         aux_streams = self.aux_stream_list
         if aux_streams is not None:
             assert len(aux_streams) >= 3
@@ -385,6 +425,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             # Local ref so the closure keeps a non-None type for mypy.
             compressor = self.compressor
 
+            # 输入 hidden_states [N, hidden_size] × W.T，其中 W 形状 [hidden_size, 2*coff*head_dim]
+            # （fused_wkv_wgate 输出维 [coff*head_dim, coff*head_dim] 两路合并）
+            # → 输出 [N, 2*coff*head_dim]，后续按半拆分得到 kv、gate 各 [N, coff*head_dim]
             def compressor_kv_score() -> torch.Tensor:
                 return torch.mm(
                     hidden_states,
@@ -399,10 +442,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
             def indexer_weights_proj() -> torch.Tensor:
                 # ReplicatedLinear returns (output, bias); bias is None.
+                # weights_proj: [hidden_size] -> [n_head]，故
+                # 输入 [N, hidden_size] → 输出 [N, n_head]（每个 token 一个 head 权重）
+                # 这不是在算 KV，而是在算 query 侧（或 token 侧）的路由权重——"每个 token 对各 head 的重要性"，用于稀疏选择。
+                # 生成每个 head 一个标量权重——即"这个 token 应该关注哪个 head 的压缩 KV"。
                 weights, _ = indexer.weights_proj(hidden_states)
                 return weights
 
             def indexer_compressor_kv_score() -> torch.Tensor:
+                # 与 compressor_kv_score 同构：W 形状 [hidden_size, 2*coff*head_dim]
+                # 输入 [N, hidden_size] → 输出 [N, 2*coff*head_dim]
                 return torch.mm(
                     hidden_states,
                     indexer.compressor.fused_wkv_wgate.weight.T,
@@ -414,10 +463,21 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
         def fused_wqa_wkv() -> torch.Tensor:
             # MergedColumnParallelLinear returns (output, bias); bias is None.
+            # fused_wqa_wkv 输出维 [q_lora_rank, head_dim] 两路合并 → 输出 [N, q_lora_rank + head_dim]
+            # 后续拆成 qr [N, q_lora_rank] 与 kv [N, head_dim] 两段
             qr_kv, _ = self.fused_wqa_wkv(hidden_states)
             return qr_kv
 
+        # execute_in_parallel：在默认流跑 fused_wqa_wkv（最重），在 aux 流 0..2 并行跑
+        # compressor_kv_score / indexer_weights_proj / indexer_compressor_kv_score（较轻）。
+        # ROCm 下 aux_streams 为 None，退化为串行。
+        # 返回：
+        #   qr_kv          : [N, q_lora_rank + head_dim]（fused_wqa_wkv 输出，未拆分）
+        #   kv_score       : [N, 2*coff*head_dim]（compressor 侧，aux_fns[0]）
+        #   indexer_weights: [N, n_head]（indexer.weights_proj，aux_fns[1]）
+        #   indexer_kv_score:[N, 2*coff*head_dim]（indexer 内 compressor 侧，aux_fns[2]）
         qr_kv, (kv_score, indexer_weights, indexer_kv_score) = execute_in_parallel(
+            # ⚠️ 这个放在default stream执行
             fused_wqa_wkv,
             aux_fns,
             self.ln_events[0],
@@ -441,6 +501,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         positions: torch.Tensor,
         out: torch.Tensor,  # [num_tokens, padded_heads, head_dim], written in place
     ) -> None:
+        # 入参回顾（均来自 forward）：
+        #   hidden_states [N, hidden_size]、qr [N, q_lora_rank]、kv [N, head_dim]
+        #   kv_score [N, 2*coff*head_dim]（compressor 原料）、indexer_kv_score [N, 2*coff*head_dim]（indexer 原料）
+        #   indexer_weights [N, n_head]（indexer 路由权重）、positions [N]、out [N, padded_heads, head_dim]
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
 
@@ -449,6 +513,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # downstream reads q on default). Indexer/compressor go on aux for
         # overlap with default's GEMM + cache write.
         if self.indexer is not None:
+            # 有 indexer（C4A 稀疏注意力层，compress_ratio==4）：三路并行
             aux_streams = self.aux_stream_list
             indexer = self.indexer
             # Local ref so the closure keeps a non-None type for mypy.
@@ -456,7 +521,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             compressor = self.compressor
 
             def wq_b_kv_insert() -> torch.Tensor:
+                # wq_b: ColumnParallelLinear [N, q_lora_rank] -> [N, n_heads*head_dim]，TP 切分后本地得 [N, n_local_heads*head_dim]
+                # reshape -> q [N, n_local_heads, head_dim]
                 q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+                # ⚠️ _fused_qnorm_rope_kv_insert：对 q 做 per-head RMSNorm+RoPE，并把 kv 经 RoPE+量化写入 SWA KV cache；
+                #    返回 padding 到 padded_heads 的 q（末尾 head 槽补 0，供 FlashMLA 对齐）
                 q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
                 return q
 
@@ -464,9 +533,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             # wq_b+kv_insert; slot [0] runs the full indexer; slot [1] runs the
             # MLA compressor. Slot [2] is reserved for the indexer's inner
             # overlap. ROCm (aux_streams is None) falls back to sequential.
+            # 1. 默认流跑 wq_b_kv_insert；
+            # 2. aux 槽[0] 跑 indexer（消费 qr/indexer_kv_score/indexer_weights 做稀疏路由+压缩KV写入）；
+            # 3. aux 槽[1] 跑 compressor（消费 kv_score 压缩 KV 写入主 MLA cache）
             q, _ = execute_in_parallel(
+                # 1. default stream
                 wq_b_kv_insert,
                 [
+                    # 2. aux stream 0
                     lambda: indexer(
                         hidden_states,
                         qr,
@@ -475,6 +549,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                         positions,
                         self.indexer_rotary_emb,
                     ),
+                    # 3. aux stream 1
                     lambda: compressor(kv_score, positions, self.rotary_emb),
                 ],
                 self.ln_events[0],
@@ -483,6 +558,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 enable=aux_streams is not None,
             )
         elif self.compressor is not None:
+            # 有 compressor 但无 indexer（compress_ratio>1 的非 C4A 层，如 V3.2）：两路并行
             # wq_b + kv_insert on default, compressor on aux.
             aux_stream = (
                 self.aux_stream_list[0] if self.aux_stream_list is not None else None
@@ -490,6 +566,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             compressor = self.compressor
 
             def wq_b_kv_insert() -> torch.Tensor:
+                # 同上：q [N, n_local_heads, head_dim] -> padding 后 [N, padded_heads, head_dim]
                 q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
                 q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
                 return q
@@ -503,11 +580,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             )
         else:
             # SWA-only layer: no compressor, no overlap.
+            # 既无 indexer 也无 compressor（compress_ratio==1 且非稀疏）：直接串行，q 形状同上 [N, padded_heads, head_dim]
             q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
             q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
 
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, padded_heads, head_dim]).
+        # forward_mqa：平台相关 MLA 注意力（FlashMLA/FlashInfer 等），读 q/padding 后 [N, padded_heads, head_dim]
+        # 与 kv cache，计算注意力并就地写入 out [N, padded_heads, head_dim]；下游 forward 再切片回 n_local_heads
         self.forward_mqa(q, kv, positions, out)
 
     def _fused_qnorm_rope_kv_insert(
@@ -519,10 +599,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None
         ),
     ) -> torch.Tensor:
+        # 本函数 = 融合算子：对 q 做"per-head RMSNorm + GPT-J RoPE"并把 q padding 到 padded_heads；
+        # 同时对 kv 做"GPT-J RoPE + 量化"并写入 SWA（滑动窗口）KV cache。
+        # 入参 shape：q [N, n_local_heads, head_dim]、kv [N, head_dim]、positions [N]
+        # 返回：处理完（含 padding/量化）的 q，供后续 forward_mqa 使用。
         if not isinstance(attn_metadata, dict):
+            # Profile run（构图/占位阶段）：没有真实 metadata，kernel 不真正触发；
+            # 直接返回一个 padding 好形状的 q，让下游 FlashMLA 拿到正确 shape 即可。
             # Profile run: kernel doesn't fire; produce a padded tensor so
             # downstream FlashMLA gets the right shape.
             if self.n_local_heads < self.padded_heads:
+                # 在 head 维（dim=1）末尾补 (padded_heads - n_local_heads) 个 0 槽：q -> [N, padded_heads, head_dim]
                 return F.pad(
                     q,
                     (0, 0, 0, self.padded_heads - self.n_local_heads),
@@ -530,6 +617,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 )
             return q
 
+        # 真实推理路径：取本层 SWA cache 的元数据（slot_mapping 等）
         swa_metadata = cast(
             "DeepseekSparseSWAMetadata | None",
             attn_metadata.get(self.swa_cache_layer.prefix),
@@ -544,13 +632,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         cache_dtype = swa_kv_cache.dtype
 
         # kv is unchanged; attention reads kv solely via swa_kv_cache.
+        # kv 本身不被修改，注意力计算只通过 swa_kv_cache 读取（这里把它写进去）
         if cache_dtype == torch.uint8:
             # fp8_ds_mla UE8M0 paged path. Horizontally fused:
             #   Q side:  per-head RMSNorm (no weight) + GPT-J RoPE, zero-filling
             #            the padding head slots; the kernel allocates and returns
             #            the padded q tensor.
             #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert.
+            # fp8_ds_mla 布局（uint8 打包的 UE8M0 block-scaled fp8）：把 SWA cache 展平成 2D 以便按页写入
             swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
+            # 一次 kernel 同时完成：q 的 RMSNorm+RoPE+padding，kv 的 RoPE+UE8M0量化+分页写入 cache；
+            # 返回 padding 后的 q [N, padded_heads, head_dim]
             return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
                 q,
                 kv,
@@ -567,9 +659,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # row in its element dtype (no Q padding). bf16 rewrites q in place;
         # per-tensor fp8 writes a separately-allocated fp8 q and quantizes the
         # KV row.
+        # 普通行布局路径：cache 形状 [num_blocks, block_size, 512]，KV 按元素类型直接存（q 不在此 padding）
         block_size = swa_metadata.block_size
+        # 把 cache 视成 [num_blocks*?, block_size, head_dim] 的 3D，便于按 block 写入
         swa_kv_cache_3d = swa_kv_cache.view(-1, block_size, self.head_dim)
         if cache_dtype == torch.bfloat16:
+            # bf16 路径：q 原地改写（RMSNorm+RoPE），kv 做 RoPE 后按原 dtype 写入 cache；返回原 q（已是 [N, n_local_heads, head_dim]）
             torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
                 q,
                 kv,
@@ -583,6 +678,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             return q
 
         # per-tensor fp8 (torch.float8_e4m3fn)
+        # per-tensor fp8 路径：需另分配一个 fp8 的 q 缓冲（q_fp8），kernel 内部把 q 量化成 fp8 并 RoPE，
+        # 同时把 kv RoPE 后按 fp8 写入 cache；返回 fp8 的 q（形状同 q，dtype=float8_e4m3fn）
         q_fp8 = torch.empty_like(q, dtype=torch.float8_e4m3fn)
         torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert(
             q,
@@ -603,20 +700,29 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         return self.backend_cls
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        # ⚠️ 
         if (
             self.compress_ratio <= 1
         ):  # SWA part. Allocated separately as DeepseekV4SWACache.
             return None
-        # fp8_ds_mla is a UE8M0 block-scaled uint8 layout and needs 576B
-        # alignment; plain bf16 / per-tensor fp8 rows use natural element-size
-        # pages.
+        # fp8_ds_mla 是 UE8M0 block-scaled uint8 布局（DeepSeek-V4 主 KV cache 用）。
+        # 单 token 实际占用 = 448B(NoPE: nope_head_dim=448 个 fp8) + 128B(RoPE:
+        # rope_head_dim=128 个 fp8) + 8B(8 个 fp32 scale，见下方说明) = 584B。
+        # paged KV cache 要求每页按 alignment 字节对齐，584 向上对齐到 64B 边界
+        # 得 576B（=64*9，覆盖 584 且能被 64 整除）。plain bf16 / per-tensor fp8
+        # 行用自然元素大小 512B 对齐即可。
         uses_fp8_ds_mla_layout = self.kv_cache_dtype == "fp8_ds_mla"
+        # 主 KV 会传 cache_dtype_str=self.kv_cache_dtype（在 FLASHMLA_SPARSE 后端下
+        # 已被改写为 "fp8_ds_mla"），因此走 584B/token 分支 → 37440 / 1728。
         return MLAAttentionSpec(
+            # ⚠️C4: (256 / 4 ) × 584 = 37376 → 37440
+            # ⚠️C128: (256 / 128 ) × 584 = 1168 → 1728
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=torch.uint8 if uses_fp8_ds_mla_layout else self.kv_cache_torch_dtype,
             compress_ratio=self.compress_ratio,
+            # 传入"fp8_ds_mla"
             cache_dtype_str=self.kv_cache_dtype,
             alignment=576 if uses_fp8_ds_mla_layout else 512,
             model_version="deepseek_v4",
@@ -634,6 +740,7 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         compress_ratio: int = 1,
     ):
         super().__init__()
+        # ⚠️ 这个也什么时候注入？
         self.kv_cache = torch.tensor([])
         self.head_dim = head_dim
         self.prefix = prefix
@@ -649,7 +756,10 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         # head_dim already carries the fp8 scale padding
         # compress_ratio=1 for V3.2, >1 for DeepseekV4; both use the same cache layout.
         uses_fp8_ds_mla_layout = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
+        # ⚠️ 此处 MLAAttentionSpec 确实没有传 cache_dtype_str（默认 None），
+        # 故 real_page_size_bytes 不走 584 分支，走通用公式 64×132×1=8640。
         return MLAAttentionSpec(
+            # ⚠️C4: (256 / 4 ) × 132=8448 → 对齐576 → 8640
             block_size=self.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
@@ -714,7 +824,10 @@ class DeepseekV4Indexer(nn.Module):
         self.softmax_scale = self.head_dim**-0.5
 
         self.scale_fmt = "ue8m0"
+
+        # ⚠️ 量化的block size
         self.quant_block_size = 128  # TODO: get from config
+        # ⚠️
         self.topk_indices_buffer = topk_indices_buffer
 
         self.max_model_len = (
@@ -731,6 +844,12 @@ class DeepseekV4Indexer(nn.Module):
         # head_dim bytes = 128 fp8 + 4 fp32 scale = 132.
         # For FP4 indexer cache, we still allocate the same amount of memory as FP8,
         # but only use the first half of the memory.
+        # 展开上面 132 的组成：indexer 的 head_dim=128，量化格式为 fp8(uint8)，
+        # 故 K/V 各 128 字节；量化 scale 用 fp32 存储，每 head 1 个 scale（4 字节），
+        # 于是单 head 实际字节 = 128(fp8) + 4(fp32 scale) = 132。
+        # quant_block_size=128 恰好等于 head_dim=128：即每个 head 单独做一组
+        # block-scaled 量化（block 粒度就是整 head），所以每 head 只需 1 个 scale。
+        # 下面 k_cache_head_dim 在 128 基础上再加 (128//128)*4 = 4 字节 scale 空间。
         k_cache_head_dim = self.head_dim + self.head_dim // self.quant_block_size * 4
         self.k_cache = DeepseekV4IndexerCache(
             head_dim=k_cache_head_dim,
@@ -739,6 +858,8 @@ class DeepseekV4Indexer(nn.Module):
             cache_config=cache_config,
             compress_ratio=self.compress_ratio,
         )
+
+        # ⚠️
         self.compressor = DeepseekCompressor(
             vllm_config=vllm_config,
             compress_ratio=self.compress_ratio,

@@ -254,6 +254,7 @@ def _prepare_pos_seq_lens_kernel(
 ):
     req_id = tl.program_id(0)
     num_reqs = tl.num_programs(0) - 1
+    # 多出来的最后一个thread block
     if req_id == num_reqs:
         # Pad unused seq_lens as 0 for full CUDA graphs.
         for i in tl.range(num_reqs, max_num_reqs, BLOCK_SIZE):
@@ -269,6 +270,7 @@ def _prepare_pos_seq_lens_kernel(
     end = tl.load(query_start_loc_ptr + req_id + 1)
     query_len = end - start
 
+    # 填 sel_len
     seq_len = num_computed_tokens + query_len
     tl.store(seq_lens_ptr + req_id, seq_len)
 
@@ -276,6 +278,7 @@ def _prepare_pos_seq_lens_kernel(
         block = i + tl.arange(0, BLOCK_SIZE)
         mask = block < query_len
         pos = num_computed_tokens + block
+        # 填 positions
         tl.store(pos_ptr + start + block, pos, mask=mask)
 
 
@@ -325,6 +328,7 @@ def _combine_sampled_and_draft_tokens_kernel(
     num_draft_tokens = num_logits - NUM_NEW_SAMPLED_TOKENS
 
     # Compute the logits indices.
+    # 只计算尾部部分的logits，记录尾部的indices
     block = tl.arange(0, BLOCK_SIZE)
     query_end = tl.load(query_start_loc_ptr + batch_idx + 1)
     logits_start = query_end - num_logits
@@ -342,12 +346,14 @@ def _combine_sampled_and_draft_tokens_kernel(
 
     # Keep prompt-tail slots intact; only rewrite generated-token slots.
     first_logit_seq_pos = seq_len - num_logits
+    # 把生成 token（last_sampled_tokens） 填进 input_ids
     if NUM_NEW_SAMPLED_TOKENS > 0 and first_logit_seq_pos >= prefill_len:
         # Write the last sampled token ID to input_ids.
         last_token_id = tl.load(last_sampled_tokens_ptr + req_state_idx)
         tl.store(input_ids_ptr + logits_start, last_token_id)
 
     # Write the draft tokens (if any) to input_ids.
+    # 把生成 draft tokens 填进 input_ids
     if num_draft_tokens > 0:
         mask = block < num_draft_tokens
         draft_tokens = tl.load(

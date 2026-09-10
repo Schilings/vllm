@@ -135,6 +135,7 @@ class FlashAttentionBackend(AttentionBackend):
     def get_kv_cache_stride_order(
         include_num_layers_dimension: bool = False,
     ) -> tuple[int, ...]:
+
         # `stride_order` indicates the permutation that gets
         # us from `get_kv_cache_shape` to the actual memory layout we want.
         cache_layout = get_kv_cache_layout()
@@ -378,6 +379,10 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         )
         self.max_cudagraph_size = self.compilation_config.max_cudagraph_capture_size
 
+        # FA3 AOT (ahead-of-time) 调度预分配：启用 full CUDA graph 且后端为 FA3 时，
+        # 必须在 builder 构造期（而非每步 build）就预分配 scheduler_metadata 并固定
+        # max_num_splits 上界，使捕获出的图对任意重放都安全（中间 buffer 规模恒定）。
+        # 对应 attn_metadata.md §3.3。
         if self.use_full_cuda_graph and self.aot_schedule:
             # FA3 scheduler_metadata size: 1 + round_up(batch_size, 4) * 4
             # The +1 is for the tile_count_semaphore (synchronization).
@@ -435,6 +440,10 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         fast_build disables AOT scheduling, used when there will be few
         iterations i.e. spec-decode
         """
+        # 把"共享的 CommonAttentionMetadata"翻译为"FlashAttention 专属的 kernel 指令"：
+        # 仅从通用载体取出本后端关心的字段（query/seq_lens/block_table/slot/causal 等），
+        # 模型/组专属常量（头数、block_size、DCP/CP 配置、R-SWA 持久 buffer）由 builder
+        # 自身持有。对应 attn_metadata.md §4.4。
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         max_query_len = common_attn_metadata.max_query_len
@@ -977,6 +986,7 @@ class FlashAttentionImpl(AttentionImpl):
                 )
                 return output
 
+
         # Cascade attention (rare case).
         cascade_attention(
             output[:num_actual_tokens],
@@ -1468,16 +1478,20 @@ def cascade_attention(
     assert num_common_kv_blocks > 0
     descale_shape = (cu_prefix_query_lens.shape[0] - 1, key_cache.shape[-2])
 
+    # 1️⃣ Common prefix
     # Process shared prefix.
     prefix_output, prefix_lse = flash_attn_varlen_func(
         q=query,
         k=key_cache,
         v=value_cache,
         cu_seqlens_q=cu_prefix_query_lens,
+        # ⚠️
         seqused_k=prefix_kv_lens,
         max_seqlen_q=num_tokens,
+        # 限制 seqlen_k
         max_seqlen_k=common_prefix_len,
         softmax_scale=softmax_scale,
+        # 不用 mask
         causal=False,
         window_size=list(sliding_window),
         block_table=block_table[:1],
@@ -1496,12 +1510,14 @@ def cascade_attention(
 
     descale_shape = (cu_query_lens.shape[0] - 1, key_cache.shape[-2])
 
+    # 2️⃣ Different suffix
     # Process suffix per query.
     suffix_output, suffix_lse = flash_attn_varlen_func(
         q=query,
         k=key_cache,
         v=value_cache,
         cu_seqlens_q=cu_query_lens,
+        # ⚠️
         seqused_k=suffix_kv_lens,
         max_seqlen_q=max_query_len,
         max_seqlen_k=max_kv_len - common_prefix_len,
@@ -1519,5 +1535,6 @@ def cascade_attention(
         num_splits=1 if envs.VLLM_BATCH_INVARIANT else max_num_splits,
     )
 
+    # 3️⃣ Merge
     # Merge prefix and suffix outputs, and store the result in output.
     merge_attn_states(output, prefix_output, prefix_lse, suffix_output, suffix_lse)

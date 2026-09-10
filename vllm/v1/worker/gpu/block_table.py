@@ -40,7 +40,7 @@ class BlockTables:
         self.num_kv_cache_groups = len(self.block_sizes)
         assert len(max_num_blocks_per_group) == self.num_kv_cache_groups
 
-        # 按照不同的kernel block size，实际进一步拆分block size
+        # ⚠️ 按照不同的kernel block size，实际进一步拆分block size
         self.blocks_per_kv_block = [
             bs // kbs for bs, kbs in zip(block_sizes, kernel_block_sizes)
         ]

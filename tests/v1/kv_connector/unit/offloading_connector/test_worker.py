@@ -25,6 +25,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingSpec,
 )
 
+# 测试用的统一超参：10 个 block、block_size=16、4 个 KV head、head_size=64、fp16。
 NUM_BLOCKS = 10
 BLOCK_SIZE = 16
 NUM_KV_HEADS = 4
@@ -32,7 +33,8 @@ HEAD_SIZE = 64
 DTYPE = torch.float16
 DEVICE_TYPE = current_platform.device_type
 
-# Attention backends to test
+# 要在哪些注意力后端上跑测试（不同后端的 KV cache 重塑/布局不同，
+# 需逐一验证规范化结果一致）。
 ATTN_BACKENDS: list[str] = []
 if current_platform.is_cuda():
     ATTN_BACKENDS = [
@@ -62,11 +64,14 @@ def _allocate_and_reshape_kv_caches(
     """
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
-    # Some backends (e.g. FlashAttention) query the KV cache layout during
-    # reshape, which ultimately calls get_current_vllm_config(). Setting
-    # the layout override avoids needing a full VllmConfig context.
+    # 某些后端（如 FlashAttention）在重塑 KV cache 时会查询布局，最终调到
+    # get_current_vllm_config()。这里用 set_kv_cache_layout("NHD") 覆盖布局，
+    # 避免为了造几个张量而搭建完整的 VllmConfig 上下文。
     set_kv_cache_layout("NHD")
     try:
+        # 用 object.__new__ 绕过 GPUModelRunner.__init__（它要建完整模型/通信等），
+        # 只手动塞入本测试需要的字段，然后调用真实的张量分配+重塑方法。
+        # 这样 offloading 规范化拿到的张量形状与真实 model runner 初始化时一致。
         runner = object.__new__(GPUModelRunner)
         runner.device = device
         runner.runner_only_attn_layers = set()
@@ -82,6 +87,7 @@ def _allocate_and_reshape_kv_caches(
         runner.kv_caches = []
 
         kernel_block_sizes = [BLOCK_SIZE] * len(kv_cache_config.kv_cache_groups)
+        # 直接复用真实路径：分配 GPU 张量并按注意力组重塑成各层视图。
         return runner.initialize_kv_cache_tensors(kv_cache_config, kernel_block_sizes)
     finally:
         set_kv_cache_layout(None)
@@ -95,6 +101,9 @@ def _make_worker(kv_cache_config: KVCacheConfig):
         OffloadingConnectorWorker,
     )
 
+    # OffloadingSpec 与真正的传输 worker（负责 DMA 的部分）全部用 Mock 替代，
+    # 这样测试只验证 register_kv_caches 的"规范化"逻辑，不触发真实 KV 搬运。
+    # spec.get_worker 被替换为 Mock，稍后通过 call_args 取出规范化产物做断言。
     spec = MagicMock(spec=OffloadingSpec)
     spec.kv_cache_config = kv_cache_config
     spec.vllm_config = MagicMock()
@@ -211,6 +220,11 @@ def test_register_kv_caches(backend):
         aligned_mamba_layer_names,
     ]
 
+    # 模拟真实 kv_cache_utils 的分配：第 i 个 KVCacheTensor 被"每个组的第 i 层"
+    # 共享（shared_by）。即多个 layer 指向同一块物理张量——这正是
+    # worker.py 去重分支（225-279 行）要处理的场景。
+    # 注意：aligned_mamba 组只有 GROUP_SIZE-1=2 层，所以它的第 2 层不参与共享，
+    # 第 3 个 tensor（tensor index 2）只被 attn/mla/unaligned_mamba 共享。
     kv_cache_tensors: list[KVCacheTensor] = []
     for i in range(GROUP_SIZE):
         shared_by: list[str] = []
@@ -263,13 +277,13 @@ def test_register_kv_caches(backend):
             ),
         ]
     ]
-
+    #
     kv_cache_config = KVCacheConfig(
         num_blocks=NUM_BLOCKS,
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=kv_cache_groups,
     )
-
+    #
     kv_caches = _allocate_and_reshape_kv_caches(
         kv_cache_config,
         attn_groups,
@@ -279,11 +293,15 @@ def test_register_kv_caches(backend):
     worker, spec = _make_worker(kv_cache_config)
     worker.register_kv_caches(kv_caches)
 
+    # register_kv_caches 内部会把规范化结果传给 spec.get_worker（此处为 Mock），
+    # 通过 call_args 取出产出的 CanonicalKVCaches 做断言。
     canonical = spec.get_worker.call_args[0][0]
     assert isinstance(canonical, CanonicalKVCaches)
 
     # -- Expected block tensors ----------------------------------------------
-    # All tensors have the same padded page size (PAGE_SIZE_BYTES).
+    # 去重后应有 3 个物理张量（因为 aligned_mamba 比其它组少一层，第 3 个 tensor
+    # 只被 attn/mla/unaligned_mamba 共享，aligned_mamba 不参与）。
+    # 所有 tensor 的 padded 页大小都是 PAGE_SIZE_BYTES。
     # Tensor 0: shared by attn[0], mla[0], mamba_unaligned[0], mamba_aligned[0]
     # Tensor 1: shared by attn[1], mla[1], mamba_unaligned[1], mamba_aligned[1]
     # Tensor 2: shared by attn[2], mla[2], mamba_unaligned[2]
@@ -323,6 +341,8 @@ def test_register_kv_caches(backend):
     ]
 
     # Verify block tensors
+    # 校验去重后的物理张量：数量对、形状为 (num_blocks, page_size)、dtype 为 int8
+    # （offloading 按字节寻址的视图）、page_size_bytes 与预期一致。
     assert len(canonical.tensors) == len(expected_tensors)
     for block_tensor, (exp_num_blocks, exp_page_size) in zip(
         canonical.tensors, expected_tensors
@@ -333,6 +353,8 @@ def test_register_kv_caches(backend):
         assert block_tensor.page_size_bytes == exp_page_size
 
     # Verify group data refs
+    # 校验每个 KV group 的引用表：层数对，且每层指向正确的 tensor_idx 与
+    # （未 padding 的）真实页大小。unaligned_mamba 用更小的真实页，其它组用满页。
     assert len(canonical.group_data_refs) == len(expected_group_refs)
     for actual_refs, exp_refs in zip(canonical.group_data_refs, expected_group_refs):
         assert len(actual_refs) == len(exp_refs)
@@ -357,6 +379,7 @@ def test_register_kv_caches_uniform_type(backend):
 
     layer_a = "model.layers.0.self_attn"
     layer_b = "model.layers.1.self_attn"
+    # 两个注意力层用同一后端，但 num_kv_heads 不同（4 vs 8）→ 每页字节数不同。
     spec_a = FullAttentionSpec(
         block_size=BLOCK_SIZE,
         num_kv_heads=NUM_KV_HEADS,
@@ -371,11 +394,14 @@ def test_register_kv_caches_uniform_type(backend):
     )
     assert spec_a.page_size_bytes != spec_b.page_size_bytes
 
+    # 同组但逐层 spec 不同 → 用 UniformTypeKVCacheSpecs 包起来（worker.py 里会走
+    # per_layer_specs 分支取各自的 spec），验证每层的真实页大小能被正确保留。
     uniform_spec = UniformTypeKVCacheSpecs(
         block_size=BLOCK_SIZE,
         kv_cache_specs={layer_a: spec_a, layer_b: spec_b},
     )
 
+    # 两层各自独占一个 KVCacheTensor（互不相同），因此规范化后应有 2 个物理张量。
     kv_cache_config = KVCacheConfig(
         num_blocks=NUM_BLOCKS,
         kv_cache_tensors=[
@@ -429,6 +455,8 @@ def test_register_kv_caches_uniform_type(backend):
         assert block_tensor.tensor.dtype == torch.int8
 
     # Single group with refs from both layers
+    # ⚠️ 仅 1 个 KV group，但包含 2 层；规范化后应去重出 2 个物理张量，
+    # 且每层的 page_size_bytes 与各自 spec 的真实页大小严格对应。
     assert len(canonical.group_data_refs) == 1
     group_refs = canonical.group_data_refs[0]
     assert len(group_refs) == 2
@@ -439,6 +467,7 @@ def test_register_kv_caches_uniform_type(backend):
     assert canonical.tensors[0].tensor.shape == (NUM_BLOCKS, spec_a.page_size_bytes)
     assert canonical.tensors[1].tensor.shape == (NUM_BLOCKS, spec_b.page_size_bytes)
 
+    # 引用表顺序：layer_a → tensor 0（其页大小），layer_b → tensor 1（其更大页大小）。
     assert group_refs[0] == CanonicalKVCacheRef(
         tensor_idx=0, page_size_bytes=spec_a.page_size_bytes
     )

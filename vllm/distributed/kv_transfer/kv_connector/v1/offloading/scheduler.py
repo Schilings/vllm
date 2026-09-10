@@ -223,6 +223,7 @@ class SchedulerOffloadConfig(NamedTuple):
 
 @dataclass
 class RequestGroupState:
+    # ⚠️
     offload_keys: list[OffloadKey] = field(default_factory=list)
     block_ids: list[int] = field(default_factory=list)
     # index of next block (of size offloaded_block_size) to offload
@@ -252,6 +253,7 @@ class RequestOffloadState:
     transfer_jobs: set[int] = field(default_factory=set)
 
     def __post_init__(self) -> None:
+        # ⚠️
         self.group_states = tuple(
             RequestGroupState() for _ in self.config.kv_group_configs
         )
@@ -506,6 +508,7 @@ class OffloadingConnectorScheduler:
             # the last prompt token has to be recomputed to get the logprobs
             # for sliding window attention, we must reduce by 1 to make sure
             # we still have a hit after reduction
+            # ⚠️ 减1
             max_hit_size_tokens -= 1
             if self._mamba_align_size is not None:
                 # Constrain hit-window to the mamba block size.
@@ -697,6 +700,10 @@ class OffloadingConnectorScheduler:
 
     def on_new_request(self, request: Request) -> None:
         """Called when a new request is added to the scheduler."""
+        """1️⃣ Scheduler: 新请求加入调度（``add_request``）时调用。
+        把 request 注册进 ``OffloadingConnectorScheduler``，使其后续在
+        ``get_num_new_matched_tokens`` 中能查到 offload tier 上的外部 KV 命中。
+        """
         # Context 1
         req_context = _create_req_context(request)
         # Context 2
@@ -732,6 +739,12 @@ class OffloadingConnectorScheduler:
                   should query for this request again later.
                 - `True` if tokens will be loaded asynchronously
                   (between scheduler steps).
+        """
+        """2️⃣ Scheduler: ``schedule()`` 评估每个待调度请求时调用。
+
+        返回 ``(num_external_tokens, load_kv_async)``：从 offload tier 还能加载多少token 的 KV。
+        返回 ``None`` 表示连接器还没算完，Scheduler 会把这个请求推迟到下一步再查。
+        结果用于计算 ``num_external_computed_tokens``。
         """
         # 准备进行ext prefix caching，先清空
         req_status = self._req_status[request.request_id]
@@ -772,6 +785,11 @@ class OffloadingConnectorScheduler:
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
     ):
+        """"""
+        """3️⃣ Scheduler: 给请求分配 KV block（allocate/append slots）之后调用。
+        转发给 ``OffloadingConnectorScheduler.update_state_after_alloc``，
+        记录哪些block 将接收外部加载的 KV，并据此决定是否触发一次 load。
+        """
         if num_external_tokens == 0:
             return
 
@@ -780,7 +798,7 @@ class OffloadingConnectorScheduler:
         num_locally_computed_tokens = req_status.num_locally_computed_tokens
         num_cached_tokens = num_locally_computed_tokens + num_external_tokens
 
-        # 记录当前request哪些block hash，需要从cpu load
+        # ⚠️ 记录当前request哪些block hash，需要从cpu load
         keys_to_load: list[OffloadKey] = []
         #
         dst_block_ids: list[int] = []
@@ -801,14 +819,14 @@ class OffloadingConnectorScheduler:
             offloaded_block_size = group_config.offloaded_block_size
             offload_keys = group_state.offload_keys
 
-            # prefix cache要存放在gpu block数，前一半在gpu，后一半需要从cpu load
+            # ⚠️ prefix cache要存放在gpu block数，前一半在gpu，后一半需要从cpu load
             num_gpu_blocks = cdiv(num_cached_tokens, gpu_block_size)
 
             assert len(group_blocks) >= num_gpu_blocks
             num_locally_computed_gpu_blocks = num_gpu_blocks
             # Skip null placeholder blocks (used for sliding window or mamba padding).
             # prefix cache要存放在gpu block数，前一半在gpu，后一半需要从cpu load
-            # 遍历找到前一半在gpu的block边界，前一半在gpu的block数
+            # ⚠️ 遍历找到前一半在gpu的block边界，前一半在gpu的block数
             for i, block in enumerate(group_blocks[:num_gpu_blocks]):
                 if not block.is_null and block.block_hash is None:
                     num_locally_computed_gpu_blocks = i
@@ -818,7 +836,7 @@ class OffloadingConnectorScheduler:
                 num_locally_computed_tokens
                 <= num_locally_computed_gpu_blocks * gpu_block_size
             )
-            # 后一半需要从cpu load的block数
+            # ⚠️ 后一半需要从cpu load的block数
             num_pending_gpu_blocks = num_gpu_blocks - num_locally_computed_gpu_blocks
 
             if group_config.sliding_window_size_in_blocks is not None:
@@ -835,17 +853,19 @@ class OffloadingConnectorScheduler:
                 start_block_idx = (
                     num_locally_computed_gpu_blocks // self.config.block_size_factor
                 )
-                # 确定需要从cpu load的block hash
+                # ⚠️ 确定需要从cpu load的block hash
                 keys_to_load.extend(offload_keys[start_block_idx:num_blocks])
 
-            # 目标是 后半部分的空的gpu blocks
+            # ⚠️ 目标是 后半部分的空的gpu blocks
             dst_block_ids.extend(
                 block.block_id
                 for block in group_blocks[
                     num_locally_computed_gpu_blocks:num_gpu_blocks
                 ]
             )
+            # ⚠️ 后一半的gpu blocks数：每个group有几个gpu block需要从cpu reload之后存放
             group_sizes.append(num_pending_gpu_blocks)
+            # ⚠️ 前一半的gpu blocks数
             block_indices.append(num_locally_computed_gpu_blocks)
 
             # Skip prefix-hit blocks for block-level policy; for
@@ -854,13 +874,13 @@ class OffloadingConnectorScheduler:
             if req_status.offloading_context.policy == OffloadPolicy.BLOCK_LEVEL:
                 group_state.next_stored_block_idx = num_blocks
 
-        # 来源是 后半部分对应的cpu blocks
+        # ⚠️ 来源是 后半部分对应的cpu blocks
         src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
         dst_spec = GPULoadStoreSpec(
             dst_block_ids, group_sizes=group_sizes, block_indices=block_indices
         )
 
-        # 提交传输任务
+        # ⚠️ 提交传输任务
         load_job_id = self._generate_job_id()
         self._current_batch_load_jobs[load_job_id] = TransferJob(
             req_id=request.request_id,
@@ -868,7 +888,7 @@ class OffloadingConnectorScheduler:
             dst_spec=dst_spec,
         )
         # a load can only be issued when no other jobs are pending.
-        # 同一个Request的传输任务，有且同时只能有一个，不管是是load还是store
+        # ⚠️ 同一个Request的传输任务，有且同时只能有一个，不管是是load还是store
         assert not req_status.transfer_jobs
         req_status.transfer_jobs.add(load_job_id)
         self._jobs[load_job_id] = TransferJobStatus(
@@ -878,7 +898,7 @@ class OffloadingConnectorScheduler:
             is_store=False,
         )
 
-        # 记录哪些cpu block正常load中
+        # ⚠️ 记录哪些cpu block正在load中
         if self._blocks_being_loaded is not None:
             self._blocks_being_loaded.update(keys_to_load)
 
@@ -892,8 +912,10 @@ class OffloadingConnectorScheduler:
         # Used to detect sliding window blocks that got re-allocated.
         new_block_ids_end: dict[str, tuple[int, ...]] = {}
 
+        # ⚠️ 遍历所有调度的请求 (请求id，调度新分配的blocks，是否从被抢占状态恢复的)
         for req_id, new_block_id_groups, preempted in yield_req_data(scheduler_output):
             req_status = self._req_status[req_id]
+            # ⚠️ 更新 cpu block hash
             req_status.update_offload_keys()
 
             if preempted:
@@ -937,18 +959,26 @@ class OffloadingConnectorScheduler:
         self,
         scheduler_output: SchedulerOutput,
     ) -> dict[int, TransferJob]:
+        # 本函数：遍历本步被调度的所有请求，为每个请求构造"把 GPU KV 存到 CPU offload tier"的 store 任务。
+        # 输出 store_jobs 会被 build_connector_meta 收集并下发给 worker 执行。
         block_size_factor = self.config.block_size_factor
         store_jobs: dict[int, TransferJob] = {}
+
+        # ⚠️ 只遍历本步实际被调度的请求（有 num_scheduled_tokens 才算这一步行进过）
         for req_id in scheduler_output.num_scheduled_tokens:
             req_status = self._req_status.get(req_id)
+            # 未被 offloading 跟踪的请求（如未启用 offload 的请求）直接跳过
             if req_status is None:
                 continue
             req = req_status.req
 
+            # ⚠️ 计算本步结束后该请求已算出的 token 数，并夹到真实总 token 数以内
+            # （异步调度下 num_computed_tokens 可能短暂超前于实际已算 token，需 min 兜底）
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
             num_tokens_after_batch = req.num_computed_tokens + num_scheduled_tokens
             # with async scheduling, some tokens may be missing
             num_offloadable_tokens = min(num_tokens_after_batch, req.num_tokens)
+            # 用户可通过 kv_transfer_params["max_offload_tokens"] 限制最多 offload 多少 token
             max_offload_tokens = req_status.max_offload_tokens
             if max_offload_tokens is not None:
                 num_offloadable_tokens = min(num_offloadable_tokens, max_offload_tokens)
@@ -957,6 +987,8 @@ class OffloadingConnectorScheduler:
             # prefill (prompt) blocks become eligible for store. next_stored_idx
             # never advances past this boundary, so decode blocks are never
             # queued in this or any later step.
+            # offload_prompt_only=True 时，只 offload prefill（prompt）阶段的 block，
+            # decode 阶段的 block 永不入队（next_stored_idx 不越过 prompt 边界）。
             if self.config.offload_prompt_only:
                 num_offloadable_tokens = min(
                     num_offloadable_tokens, req.num_prompt_tokens
@@ -964,23 +996,38 @@ class OffloadingConnectorScheduler:
 
             # Filter out blocks skipped due to sliding window attention / SSM
             # or unreachable by the load path's alignment constraints.
+            # 第一遍：确定本步"有哪些 offloaded block 的 key 需要被 store"。
+            # 仅做 key 筛选（不构造 block_id 列表），因为还要问 manager 这些 key 是否真值得存。
+            # ⚠️ 需要确定哪些cpu bloch hash用来进行store
+            # 每个 kv group都不一样
             new_offload_keys: list[OffloadKey] = []
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
             ):
+                # ⚠️ 本 group 能 offload 的 block 数 = 可 offload token 数 // 该 group 的 offloaded_block_size（CPU 粒度）
                 num_blocks = num_offloadable_tokens // group_config.offloaded_block_size
+                # EAGLE/MTP draft 组的最后一个 block 是易变的（无稳定 hash），排除掉
                 if group_config.is_eagle_group:
                     num_blocks = max(0, num_blocks - 1)
 
+                # 记录了store的进度
+                # ⚠️  next_stored_block_idx 记录"上次已 offload 到第几个 offloaded block"，本次从它继续（增量、幂等）
                 start_block_idx = group_state.next_stored_block_idx
+                # 本次没有新 block 需要 offload，跳过该 group
                 if num_blocks <= start_block_idx:
                     continue
+
+                # ⚠️ 取出 [start_block_idx, num_blocks) 区间内的 offload key（每个 offloaded block 一个 key）
+                # ⚠️ CPU block hash！！
                 offload_keys = group_state.offload_keys[start_block_idx:num_blocks]
+
                 # For each block to offload, take the last corresponding GPU block.
                 # e.g. if block size factor is 3 and GPU block IDs are
                 # 1 5 6 7 2 4 9 3 8 then we'll take blocks 6 4 8.
                 # A block_id of 0 means either a sliding window / SSM skip
                 # or a stale entry that was zeroed out — skip it either way.
+                # ⚠️ 每个 offloaded block 由 factor 个 GPU 子块组成；这里按"代表子块"取样——
+                # ⚠️ 取每个 offloaded block 内的最后一个 GPU 子块（下标 = start*block_size_factor + block_size_factor - 1，步长 block_size_factor）
                 offload_block_ids = group_state.block_ids[
                     start_block_idx * block_size_factor
                     + block_size_factor
@@ -988,12 +1035,15 @@ class OffloadingConnectorScheduler:
                 ]
                 assert len(offload_keys) == len(offload_block_ids)
 
+                # SWA 对齐优化相关：本 group 一个 alignment segment 含多少 offloaded block；tail 为滑动窗口大小（block 数）
                 alignment_block_count = group_config.alignment_block_count
                 tail = group_config.sliding_window_size_in_blocks
 
+                # ⚠️
                 for key_idx, (offload_key, block_id) in enumerate(
                     zip(offload_keys, offload_block_ids)
                 ):
+                    # 代表子块为 null（block_id==0）说明该 offloaded block 整体是 skip/null，直接跳过不存
                     if block_id == 0:
                         continue
                     # Skip SWA blocks that can never serve a load hit:
@@ -1001,18 +1051,24 @@ class OffloadingConnectorScheduler:
                     # trailing `tail` blocks are reachable by
                     # _sliding_window_lookup. For DeepSeek V4 with 100K
                     # tokens this reduces SWA stores by ~78%.
+                    # 滑窗组优化：只有每个对齐段末尾 tail 个 block 才可能被 load 命中，其余段内靠前的 block 永不命中，跳过不存
                     if alignment_block_count is not None:
                         assert tail is not None
                         abs_block_idx = start_block_idx + key_idx
                         pos_in_segment = abs_block_idx % alignment_block_count
                         if pos_in_segment < alignment_block_count - tail:
                             continue
+                    # ⚠️ 需要确定哪些cpu bloch hash用来进行store
+                    # 通过全部过滤的 key 进入"候选 store key"列表
                     new_offload_keys.append(offload_key)
 
+            # 没有任何候选 key，推进进度指针后跳过本请求（不构造 job）
             if not new_offload_keys:
                 req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
 
+            # ⚠️ 需要确定哪些cpu bloch hash用来进行store
+            # 把候选 key 交给 manager（如 LMCache/本地池），由其决定真正要存的 key 集合（去重、容量、是否已存在等）
             store_output = self.manager.prepare_store(
                 new_offload_keys, req_status.req_context
             )
@@ -1020,14 +1076,18 @@ class OffloadingConnectorScheduler:
                 logger.warning("Request %s: cannot store blocks", req_id)
                 continue
 
+            # manager 返回的 keys_to_store 可能比候选少（例如已存在/被策略拒绝）；为空则同样推进进度跳过
             if not store_output.keys_to_store:
                 req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
 
+            # ⚠️ 刷新这些 key 的 LRU（标记为最近使用，避免被淘汰）
             self._touch(req_status)
 
+            # 转成集合便于 O(1) 查找
             keys_to_store = set(store_output.keys_to_store)
 
+            # ⚠️ 第二遍：基于 manager 最终认可的 keys_to_store，逐 group 构造真实的 src_spec（GPU 子块列表）
             group_sizes: list[int] = []
             block_indices: list[int] = []
             src_block_ids: list[int] = []
@@ -1036,17 +1096,24 @@ class OffloadingConnectorScheduler:
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
             ):
+                # 滑窗组 vs 全注意力组的区别仅在于"block 被跟踪淘汰的时机"（见 _block_id_to_pending_jobs 逻辑）
                 is_sliding_window = (
                     group_config.sliding_window_size_in_blocks is not None
                 )
+                # ⚠️ cpu block
                 num_blocks = num_offloadable_tokens // group_config.offloaded_block_size
+                # ⚠️ cpu block
                 start_block_idx = group_state.next_stored_block_idx
                 block_ids = group_state.block_ids
                 num_group_blocks = 0
+                # ⚠️ cpu block --> gpu block
+                # 记录本 group 第一个"有效（非 null）GPU 子块"的绝对下标，用于 block_indices
                 start_gpu_block_idx: int | None = None
+                # 遍历本 group 本次要 offload 的 offloaded block 区间
                 for idx, offload_key in enumerate(
                     group_state.offload_keys[start_block_idx:num_blocks]
                 ):
+                    # manager 不认可的 key 跳过（不搬该 block）
                     if offload_key not in keys_to_store:
                         continue
 
@@ -1056,31 +1123,60 @@ class OffloadingConnectorScheduler:
                         req, group_config, offloaded_block_idx, offload_key
                     )
 
+                    # ⚠️ 把 offloaded block 下标换算成它在 GPU 子块序列里的起点下标
                     gpu_block_idx = offloaded_block_idx * block_size_factor
+                    # 展开该 offloaded block 内的 factor 个 GPU 子块，逐个处理
                     for i in range(block_size_factor):
                         block_id = block_ids[gpu_block_idx + i]
+                        # null 子块（padding/skip）跳过：不加入 src、不占目的端槽位
                         if block_id == 0:
                             continue
+
+                        # ⚠️记录第一个有效子块的下标（仅首遇时），即本 group 的 block_indices
                         if start_gpu_block_idx is None:
                             start_gpu_block_idx = gpu_block_idx + i
+                        # 有效 GPU 子块加入源列表（物理已剔除 null，干净列表）
                         src_block_ids.append(block_id)
                         num_group_blocks += 1
+                        # 按组类型分别记录，供后续"被抢占/回收时 flush 该 job"使用
                         if is_sliding_window:
                             sliding_window_block_ids.append(block_id)
                         else:
                             non_sliding_window_block_ids.append(block_id)
 
+                # 本 group 实际有效子块数
                 group_sizes.append(num_group_blocks)
+                # ⚠️ block_indices[i] = 第 i 个 group 的第一个有效 GPU 子块相对于"该 group 逻辑连续 GPU 子块序列起点"的偏移。
+                # ⚠️ 想象一个 group：逻辑 GPU 子块 [B0, B1, B2, B3, B4, B5]（factor=3，对应 2 个 CPU block）。
+                # 其中 B0 和 B4 是 null：
+                #   剔除后 src_block_ids = [B1, B2, B3, B5]，num_group_blocks=4。
+                #   start_gpu_block_idx = 1（第一个非 null 是 B1，绝对下标 1）。
+                #   block_indices = 1。
+                # worker 写 CPU：第 0 个 CPU block 从槽位 1 % 3 = 1 开始 → [空, B1, B2]；第 1 个 CPU block [B3, B5, 空]。
+                # block_indices=1 保证了 B1 不会被写到 CPU 第 0 槽（那样就错位了），而是对齐到它在逻辑序列里本该在的槽位。
+                # 那些 null 子块（B0、B4）对应的 CPU 槽位保持原值（padding），未来 load 回来时同样按 block_indices 跳过这些槽。
+                #
+                # ⚠️ 一句话总结
+                #   src_block_ids：剔除 null 后的有效 GPU 子块扁平列表（物理已干净）。
+                #   group_sizes：每个 group 的有效子块数。
+                #   block_indices[i]：第 i 个 group 第一个有效 GPU 子块的逻辑起始下标，用途是让 worker 在**目的端（CPU）**按 block_idx % factor 偏移对齐写入，补偿"源端剔除了 null 子块"造成的位置错位。它不是源端再 skip 一次，而是目的端对齐声明。
+
+                # 若本 group 没有任何有效子块，退化为 0（worker 端按 block_idx%factor 对齐也不会出错）
                 block_indices.append(start_gpu_block_idx or 0)
+                # 推进该 group 的 offload 进度指针到 num_blocks，保证下次从新位置增量构造
                 group_state.next_stored_block_idx = num_blocks
 
+            # 组装源 spec：GPU 子块列表 + 各 group 子块数 + 各 group 首个有效子块偏移
             src_spec = GPULoadStoreSpec(
                 src_block_ids, group_sizes=group_sizes, block_indices=block_indices
             )
+            # 目的 spec 由 manager 提供（已含 CPU block 布局/分配），store 路径下 worker 据此写入
             dst_spec = store_output.store_spec
 
+            # 生成本次 job 的唯一 id
             job_id = self._generate_job_id()
             # a store can only be issued when no load is pending.
+            # 同一请求同时只能有一个方向在飞；若有在飞任务则必为 store（load 与 store 互斥，详见 update_state_after_alloc 注）
             if req_status.transfer_jobs:
                 any_jid = next(iter(req_status.transfer_jobs))
                 assert self._jobs[any_jid].is_store
@@ -1088,11 +1184,14 @@ class OffloadingConnectorScheduler:
 
             # Watch sliding window blocks as they may get evicted
             # before the request finishes
+            # 滑窗 block 可能在请求结束前就被回收（滑动窗口推进），注册到 _block_id_to_pending_jobs，
+            # 一旦该 block_id 被重新分配即触发 flush，确保 store 在其被覆盖前完成
             for bid in sliding_window_block_ids or ():
                 self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
 
             # the non-sliding window blocks will be watched only
             # when the request finishes
+            # 非滑窗 block 在请求运行期由 ref_cnt 保护，只在请求结束时才登记以保护 store 完成
             self._jobs[job_id] = TransferJobStatus(
                 req_id=req_id,
                 pending_count=self.config.num_workers,
@@ -1102,6 +1201,7 @@ class OffloadingConnectorScheduler:
                 sliding_window_block_ids=sliding_window_block_ids or None,
             )
 
+            # 记录 job 供 build_connector_meta 下发
             store_jobs[job_id] = TransferJob(
                 req_id=req_id, src_spec=src_spec, dst_spec=dst_spec
             )
@@ -1119,14 +1219,23 @@ class OffloadingConnectorScheduler:
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
+        """"""
+        """4️⃣ Scheduler: ``schedule()`` 末尾调用，构造下发 worker 的 metadata。
+        构造 ``OffloadingConnectorMetadata`` 并挂到 ``scheduler_output.kv_connector_metadata``，下发给 worker。
+        注意：此调用会**重置**连接器 scheduler 侧的状态（每个 step 一次）。
+        """
+
+        # ⚠️
         self._update_req_states(scheduler_output)
         schedule_end_context = ScheduleEndContext(
             new_req_ids=[req.req_id for req in scheduler_output.scheduled_new_reqs],
             preempted_req_ids=scheduler_output.preempted_req_ids or (),
         )
+        # ⚠️
         self.manager.on_schedule_end(schedule_end_context)
 
         # Flush jobs for preempted requests.
+        # ⚠️ 处理被抢占的请求：阻塞确保其store任务已经完成
         for req_id in scheduler_output.preempted_req_ids or ():
             req_status = self._req_status.get(req_id)
             if req_status is None or not req_status.transfer_jobs:
@@ -1149,9 +1258,13 @@ class OffloadingConnectorScheduler:
                 for jid in self._block_id_to_pending_jobs[bid]
             )
 
+        # ⚠️
         meta = OffloadingConnectorMetadata(
+            # 此次调度需要进行的 load 任务
             load_jobs=self._current_batch_load_jobs,
+            # ⚠️
             store_jobs=self._build_store_jobs(scheduler_output),
+            #
             jobs_to_flush=self._current_batch_jobs_to_flush,
         )
         self._current_batch_load_jobs = {}

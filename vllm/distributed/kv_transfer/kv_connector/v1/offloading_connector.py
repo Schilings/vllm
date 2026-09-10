@@ -86,9 +86,9 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         if self.connector_scheduler is not None:
             self.connector_scheduler.shutdown()
 
-    # ⑤ Worker 侧（WORKER 角色）：收到 scheduler 下发的 metadata 后，在 forward 前后被调用。
+    # 5️⃣ Worker 侧（WORKER 角色）：收到 scheduler 下发的 metadata 后，在 forward 前后被调用。
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
-        """⑤ Worker: 初始化时注册各层 KV cache 张量（仅一次）。
+        """5️⃣ Worker: 初始化时注册各层 KV cache 张量（仅一次）。
 
         转发给 ``OffloadingConnectorWorker.register_kv_caches``。
         仅当连接器未使用跨层 block（``prefer_cross_layer_blocks`` 为 False）时走这里。
@@ -109,8 +109,7 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         self.connector_worker.register_cross_layers_kv_cache(kv_cache, attn_backend)
 
     def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata):
-        """⑤ Worker: 请求被抢占或 block 即将被淘汰/覆盖前调用。
-
+        """5️⃣ Worker: 请求被抢占或 block 即将被淘汰/覆盖前调用。
         转发给 ``OffloadingConnectorWorker.handle_preemptions``，用于在 block 被
         覆盖前保全尚未完成的异步 save 数据。``kv_connector_metadata`` 必须是
         ``OffloadingConnectorMetadata``。
@@ -120,8 +119,7 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         self.connector_worker.handle_preemptions(kv_connector_metadata)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
-        """⑤ Worker: forward 前调用，异步把外部 KV 载入分页 buffer。
-
+        """5️⃣ Worker: forward 前调用，异步把外部 KV 载入分页 buffer。
         转发给 ``OffloadingConnectorWorker.start_kv_transfers``，使用当前绑定好的
         ``OffloadingConnectorMetadata``（由 scheduler 的 ``build_connector_meta`` 下发）。
         """
@@ -149,8 +147,7 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         pass
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
-        """⑤ Worker: 回报完成异步传输的 req id，并把 store 任务排队到下一步。
-
+        """5️⃣ Worker: 回报完成异步传输的 req id，并把 store 任务排队到下一步。
         转发给 ``OffloadingConnectorWorker``：
         1. ``prepare_store_kv`` 先把本步需要落盘的 KV 排进下一步的
            ``start_kv_transfers``（放在这里而非 ``wait_for_save``，保证即便
@@ -163,12 +160,13 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         # Defer store jobs to the next step's start_kv_transfers. Done here
         # (rather than wait_for_save) so stores are queued even on steps where
         # wait_for_save is skipped.
+        #
         self.connector_worker.prepare_store_kv(self._connector_metadata)
-
+        #
         return self.connector_worker.get_finished(finished_req_ids)
 
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
-        """⑤ Worker: 把 worker 侧状态回传给 scheduler（对应 ⑥ ``update_connector_output``）。
+        """5️⃣ Worker: 把 worker 侧状态回传给 scheduler（对应 ⑥ ``update_connector_output``）。
 
         转发给 ``OffloadingConnectorWorker.build_connector_worker_meta``；若当前是
         scheduler 角色实例（无 worker）则返回 ``None``。
@@ -179,7 +177,7 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
 
     # ①–④、⑥–⑨ Scheduler 侧（SCHEDULER 角色）：由 scheduler 主循环按序调用。
     def on_new_request(self, request: "Request") -> None:
-        """① Scheduler: 新请求加入调度（``add_request``）时调用。
+        """1️⃣ Scheduler: 新请求加入调度（``add_request``）时调用。
 
         把 request 注册进 ``OffloadingConnectorScheduler``，使其后续在
         ``get_num_new_matched_tokens`` 中能查到 offload tier 上的外部 KV 命中。
@@ -190,7 +188,7 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int | None, bool]:
-        """② Scheduler: ``schedule()`` 评估每个待调度请求时调用。
+        """2️⃣ Scheduler: ``schedule()`` 评估每个待调度请求时调用。
 
         返回 ``(num_external_tokens, load_kv_async)``：从 offload tier 还能加载多少
         token 的 KV。返回 ``None`` 表示连接器还没算完，Scheduler 会把这个请求推迟到
@@ -204,7 +202,7 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
-        """③ Scheduler: 给请求分配 KV block（allocate/append slots）之后调用。
+        """3️⃣ Scheduler: 给请求分配 KV block（allocate/append slots）之后调用。
 
         转发给 ``OffloadingConnectorScheduler.update_state_after_alloc``，记录哪些
         block 将接收外部加载的 KV，并据此决定是否触发一次 load。
@@ -217,7 +215,7 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
-        """④ Scheduler: ``schedule()`` 末尾调用，构造下发 worker 的 metadata。
+        """4️⃣ Scheduler: ``schedule()`` 末尾调用，构造下发 worker 的 metadata。
 
         构造 ``OffloadingConnectorMetadata`` 并挂到
         ``scheduler_output.kv_connector_metadata``，下发给 worker。注意：此调用会

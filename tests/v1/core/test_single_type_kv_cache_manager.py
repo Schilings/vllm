@@ -139,6 +139,7 @@ def test_sliding_window_possible_cached_prefix():
     )
     manager = get_sliding_window_manager(sliding_window_spec, block_pool)
 
+    # ⚠️
     def run_one_case(block_is_cached, expect_length):
         block_hash_list = [
             BlockHash(str(i).encode()) for i in range(len(block_is_cached))
@@ -159,6 +160,7 @@ def test_sliding_window_possible_cached_prefix():
         computed_blocks = manager.find_longest_cache_hit(
             block_hashes=block_hash_list,
             max_length=len(block_hash_list) * block_size,
+            # ⚠️ 传入kv_cache_group_ids，一次性多组匹配
             kv_cache_group_ids=[0],
             block_pool=block_pool,
             kv_cache_spec=sliding_window_spec,
@@ -167,6 +169,18 @@ def test_sliding_window_possible_cached_prefix():
         )[0]
         assert len(computed_blocks) == expect_length
 
+        # ⚠️  窗口之外的前缀块用 null_block 占位，不需要真实 KV。
+        # 对 SWA 来说，"前缀命中 L 个 token"的真正含义是：下一个 token 计算时只 attend 最近 sliding_window 个 token。
+        # 所以只要窗口内（最后 2 块）的 KV 在缓存里，前面那些块的 KV 根本不会被读——它们物理上不需要存在。
+        # single_type_kv_cache_manager.pyL792-L795
+        # computed_blocks = tuple(
+        #     [block_pool.null_block] * max_num_blocks
+        #     for _ in range(len(kv_cache_group_ids))
+        # )
+        # 初始化时整个列表全填 null_block（一个 block_id=0 的全局哑块）；
+        # 然后从右往左扫（809 行），每命中一块就把对应位置换成真实 block；
+        # 一旦连续命中数达到 sliding_window_contiguous_blocks（=2）就 early break（826-835 行）——更左边的块连查都不查，保持 null。
+        # 所以返回结果形如 [NULL, NULL, ..., NULL, real, real]：只有最后 2 个是真实缓存块。
         assert all(
             block == block_pool.null_block
             for block in computed_blocks[: expect_length - 2]
@@ -181,6 +195,7 @@ def test_sliding_window_possible_cached_prefix():
     run_one_case([True, False], 1)
     run_one_case([True, True], 2)
     run_one_case([True, True, False], 2)
+    # 虽然窗口只有2个block，但是返回的len是3，是因为，前面已经被窗口淘汰过了的，都默认匹配
     run_one_case([True, True, True], 3)
     run_one_case([True, True, True, False], 3)
     run_one_case(
@@ -300,17 +315,22 @@ def test_sliding_window_remove_skipped_blocks():
     block_table = id_to_block_table(original_block_ids)
     manager.req_to_blocks["test"] = block_table
 
+    # ⚠️  传入0，没有可以skip的
     manager.remove_skipped_blocks("test", 0)
     assert_block_id(block_table, original_block_ids)
 
     # 4 tokens are computed. Only token 0 is out of the sliding window. As
     # block 1000 also contains token 1 that is in the sliding window, block 1000
     # cannot be removed.
+    # ⚠️ 窗口4 tokens = 2 blocks，窗口外无token
+    # 但是只保留window-1,即要删除1个，不满一个block
     manager.remove_skipped_blocks("test", 4)
     assert_block_id(block_table, original_block_ids)
 
     # 5 tokens are computed. Token 0 & 1 are out of the sliding window.
     # Block 1000 can be removed.
+    # ⚠️ 窗口4 tokens = 2 blocks，窗口外无token
+    # 但是只保留window-1,即要删除2个，满一个block
     manager.remove_skipped_blocks("test", 5)
     assert_block_id(block_table, [null_block_id] + original_block_ids[1:])
 
@@ -429,6 +449,8 @@ def test_evictable_cached_blocks_not_double_allocated():
     request_id = "req"
     evictable_block = block_pool.blocks[1]  # ref_cnt == 0, eviction candidate
 
+    # allocate_new_blocks 是按 num_tokens 算要建几块，不是按 num_blocks_to_allocate。
+    # 一句话：这个返回值的唯一归宿，是 allocate_slots 里和 get_num_free_blocks() 比较做准入门禁
     num_blocks_to_allocate = manager.get_num_blocks_to_allocate(
         request_id=request_id,
         num_tokens=2 * block_size,
@@ -436,10 +458,14 @@ def test_evictable_cached_blocks_not_double_allocated():
         total_computed_tokens=block_size,
         num_tokens_main_model=2 * block_size,
     )
+    # ⚠️ 因为 computed block的ret cnt=1，分配block+1，需要从free queue拯救出来
+    # 空闲总量 = free_queue 里的块。如果容量检查不把这块算进去，调度器会以为"空闲池还够"，继续多接请求；
+    # 等这些请求一个个 touch 掉各自的 evictable 块时，free queue 实际缩水的速度比调度器假设得快 → 可能接了过多请求 → 中途 OOM 或死锁。
     # Free capacity check should count evictable cached blocks, but allocation
     # should only allocate the truly new block.
     assert num_blocks_to_allocate == 2
 
+    # ⚠️ 拯救
     manager.add_local_computed_blocks(
         request_id,
         [evictable_block],
@@ -519,6 +545,7 @@ def test_predictor_matches_allocator_blocks_calculation_with_admission_cap():
     # Walk through request forward steps. Check num_blocks returned by
     # `get_num_blocks_to_allocate` matches what `allocate_new_blocks` pulls
     for num_tokens in (4, 8, 12, 16):
+        # block_size=2
         predicted = manager.get_num_blocks_to_allocate(
             request_id=request_id,
             num_tokens=num_tokens,

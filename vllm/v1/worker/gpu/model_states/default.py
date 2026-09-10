@@ -32,6 +32,7 @@ class DefaultModelState(ModelState):
     ):
         super().__init__(vllm_config, model, encoder_cache, device)
 
+        # 默认只管理 rope state？
         self.rope_state = get_rope_state(
             self.model_config,
             model,
@@ -47,6 +48,7 @@ class DefaultModelState(ModelState):
         )
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
+        # 新请求入 batch:初始化 RoPE 的 prefill 位置(若有 rope_state)。
         if self.rope_state is not None:
             assert new_req_data.prefill_token_ids is not None
             self.rope_state.init_prefill_positions(
@@ -57,6 +59,7 @@ class DefaultModelState(ModelState):
             )
 
     def apply_staged_writes(self) -> None:
+        # 把 RoPE 暂存的位置更新刷入实际状态(与 get_mm_embeddings 的 EVS 重算联动)。
         if self.rope_state is not None:
             self.rope_state.apply_staged_writes()
 
@@ -70,6 +73,7 @@ class DefaultModelState(ModelState):
         input_batch: InputBatch,
         req_states: RequestState,
     ) -> torch.Tensor:
+        # 1) 准备并(按需)执行多模态 encoder,产出视觉等 embedding。
         mm_hashes, mm_kwargs = self.encoder_runner.prepare_mm_inputs(
             scheduled_encoder_inputs
         )
@@ -77,17 +81,22 @@ class DefaultModelState(ModelState):
             # Execute the multimodal encoder.
             encoder_outputs = self.encoder_runner.execute_mm_encoder(mm_kwargs)
             # Cache the encoder outputs by mm_hash
+            # 按 mm_hash 缓存 encoder 输出,相同输入可复用,避免重复编码。
             self.encoder_cache.encoder_outputs.update(zip(mm_hashes, encoder_outputs))
 
+        # 2) 取出缓存的多模态 embedding(基类从 encoder_cache 按位置 gather)。
         mm_embeds, is_mm_embed = super().gather_mm_embeddings(input_batch)
         if self.mm_pruner is not None and mm_embeds:
             # EVS: recompute mrope positions for pruned media.
+            # EVS(可跳过视觉 token)场景下,剪枝后需要重算 mRoPE 位置。
             mm_embeds = self.mm_pruner.recompute(mm_embeds, input_batch, req_states)
             # We must flush the staged rope updates for prepare_inputs() to pick up.
+            # 位置变了,必须先把暂存的 RoPE 更新刷入,prepare_inputs 才能读到新位置。
             self.apply_staged_writes()
 
         # Use unpadded input_ids to match is_mm_embed size (num_tokens).
         # input_batch.input_ids may be padded for CUDA graphs.
+        # 3) 把文本 embedding 与多模态 embedding 合并成 inputs_embeds。
         input_ids_unpadded = input_batch.input_ids[: input_batch.num_tokens]
         inputs_embeds = self.encoder_runner.get_inputs_embeds(
             input_ids_unpadded, mm_embeds, is_mm_embed
@@ -108,8 +117,9 @@ class DefaultModelState(ModelState):
     def prepare_inputs(
         self, input_batch: InputBatch, req_states: RequestState
     ) -> dict[str, torch.Tensor | None]:
+        # 把非注意力状态(本类主要是 RoPE 位置)覆盖式注入模型输入。
         if self.rope_state is None:
-            return {}  # Common case (1D positions).
+            return {}  # Common case (1D positions). 常见情况用 1D positions,无需特殊处理。
 
         self.rope_state.prepare_positions(
             input_batch.idx_mapping,
@@ -141,10 +151,12 @@ class DefaultModelState(ModelState):
     ) -> dict[str, Any]:
         if cudagraph_mode == CUDAGraphMode.FULL:
             # Use padded sizes - padding is handled by model_runner.prepare_attn.
+            # FULL 图模式下用 padded 形状(与捕获时一致,保证重放形状严格匹配)。
             num_reqs = input_batch.num_reqs_after_padding
             num_tokens = input_batch.num_tokens_after_padding
         else:
             # For piecewise cudagraphs and eager, use unpadded sizes.
+            # 分段图 / eager 用未 padded 的真实形状。
             num_reqs = input_batch.num_reqs
             num_tokens = input_batch.num_tokens
         query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
@@ -152,8 +164,11 @@ class DefaultModelState(ModelState):
         seq_lens_cpu_upper_bound = input_batch.seq_lens_cpu_upper_bound
         if for_capture:
             # Capture with worst-case max_seq_len so the graph is valid at any replay.
+            # 捕获阶段用最坏情况 max_seq_len(=max_model_len),保证任意重放都合法。
             max_seq_len = self.max_model_len
         else:
+            # 正式服务时，不用capture
+            # 实际服务时取真实上界,缓冲区刚好够用,省显存。
             max_seq_len = seq_lens_cpu_upper_bound[:num_reqs].max().item()
         req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None
         if (
@@ -161,11 +176,13 @@ class DefaultModelState(ModelState):
             and self.encoder_cache is not None
             and self.model_config.is_mm_prefix_lm
         ):
+            # 多模态 prefix-LM:计算请求内各文档/媒体段的范围,供注意力区分处理。
             req_doc_ranges = compute_mm_prefix_ranges(
                 req_ids=input_batch.req_ids,
                 mm_features=self.encoder_cache.mm_features,
                 sliding_window=self.model_config.get_sliding_window(),
             )
+        # ⚠️ 调用 build_attn_metadata 产出 {layer_name: metadata}
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
             num_reqs=num_reqs,

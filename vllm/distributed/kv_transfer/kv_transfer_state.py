@@ -89,6 +89,7 @@ def ensure_kv_transfer_initialized(
 
         _KV_CONNECTOR_AGENT = KVConnectorFactory.create_connector(
             config=vllm_config,
+            #
             role=KVConnectorRole.WORKER,
             kv_cache_config=kv_cache_config,
         )

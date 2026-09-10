@@ -50,19 +50,24 @@ class OffloadingConnectorWorker:
     def register_kv_caches(
         self, kv_caches: dict[str, torch.Tensor | list[torch.Tensor]]
     ):
-        # 把 attention backend 在 GPU 上分配好的 KV cache 规范化（canonicalize）
-        # 成统一的形状 (num_blocks, page_size_bytes) 的 int8 视图，交给 worker
-        # 做 GPU<->CPU 的 KV 传输。本函数不分配新显存，只是重新 view 已有存储。
+        """"""
+        """5️⃣ Worker: 初始化时注册各层 KV cache 张量（仅一次）。
+        转发给 ``OffloadingConnectorWorker.register_kv_caches``。
+        仅当连接器未使用跨层 block（``prefer_cross_layer_blocks`` 为 False）时走这里。
+        """
+        # 把 attention backend 在 GPU 上分配好的 KV cache 规范化（canonicalize）成统一的形状 (num_blocks, page_size_bytes) 的 int8 视图，
+        # 交给 worker做 GPU<->CPU 的 KV 传输。
+        # 本函数不分配新显存，只是重新 view 已有存储。
         kv_cache_config = self.spec.kv_cache_config
         num_blocks = kv_cache_config.num_blocks
 
-        # 判断每个 layer 是否使用了 packed 布局（如 DeepSeek-v4）。
-        # Packed 布局会设置 block_stride > 0，其张量 stride(0) 等于一个
-        # manager-block 的总字节数；普通布局则按 page_size_bytes 对齐。
         # Packed layouts (e.g. DSv4) set block_stride > 0; their tensors use
         # stride(0) as the manager-block stride (equals total_num_bytes_per_block).
         # General (non-packed) layouts size the tensor at page_size_bytes per
         # manager block, so page_size_bytes is the correct offloading stride.
+        # 判断每个 layer 是否使用了 packed 布局（如 DeepSeek-v4）。
+        # Packed 布局会设置 block_stride > 0，其张量 stride(0) 等于一个
+        # manager-block 的总字节数；普通布局则按 page_size_bytes 对齐。
         layer_is_packed: dict[str, bool] = {
             ln: bool(kv_tensor.block_stride)
             for kv_tensor in kv_cache_config.kv_cache_tensors
@@ -79,14 +84,14 @@ class OffloadingConnectorWorker:
         unpadded_page_size_bytes: dict[str, int] = {}
         # layer_name -> size of page in bytes
         page_size_bytes: dict[str, int] = {}
+
         # 遍历所有 KV cache group 的每一层，构造规范化的 (num_blocks, page) 视图。
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             group_layer_names = kv_cache_group.layer_names
             group_kv_cache_spec = kv_cache_group.kv_cache_spec
-            # 非均匀 group（如混合架构中同组各层 page_size/dtype 不同）才有逐层
-            # spec 字典；均匀 group 所有层共用 group 级 spec，此时 per_layer_specs
-            # 留空。下面用 .get(layer_name, group_kv_cache_spec) 兜底：查得到就取
-            # 逐层 spec，查不到（含空字典情况）就回退到 group 级 spec。
+            # 非均匀 group（如混合架构中同组各层 page_size/dtype 不同）才有逐层 spec 字典；
+            # 均匀 group 所有层共用 group 级 spec，此时 per_layer_specs留空。
+            # 下面用 .get(layer_name, group_kv_cache_spec) 兜底：查得到就取逐层 spec，查不到（含空字典情况）就回退到 group 级 spec。
             if isinstance(group_kv_cache_spec, UniformTypeKVCacheSpecs):
                 per_layer_specs = group_kv_cache_spec.kv_cache_specs
             else:
@@ -96,7 +101,7 @@ class OffloadingConnectorWorker:
                     layer_name, group_kv_cache_spec
                 )
                 if isinstance(layer_kv_cache_spec, AttentionSpec):
-                    # 普通 attention 层：拿到该层在 GPU 上的 KV cache 张量（单个 Tensor）
+                    # ⚠️ 普通 attention 层：拿到该层在 GPU 上的 KV cache 张量（单个 Tensor）
                     layer_kv_cache = kv_caches[layer_name]
                     assert isinstance(layer_kv_cache, torch.Tensor)
 
@@ -116,33 +121,27 @@ class OffloadingConnectorWorker:
                     # 关键：不拷贝数据，仅用 .set_() 在已有 storage 上重新解释为
                     # (num_blocks, page) 的 int8 视图；步长保证跨 block 寻址正确。
                     #
-                    # 思路：把一层 KV cache 底层那块原始显存，重新看成一个
-                    # (num_blocks, page_size_bytes) 的 int8 矩阵——每块一行、
-                    # 每元素一个字节，使后面的 DMA 拷贝引擎能用"字节指针+每
-                    # 块字节数"直接搬，而不用关心 KV 原本是 fp16/bf16 还是哪种
-                    # attention 布局。
+                    # 思路：把一层 KV cache 底层那块原始显存，重新看成一个(num_blocks, page_size_bytes) 的 int8 矩阵
+                    # ——每块一行、每元素一个字节，使后面的 DMA 拷贝引擎能用"字节指针+每块字节数"直接搬，而不用关心 KV 原本是 fp16/bf16 还是哪种attention 布局。
                     tensors_per_block[layer_name] = (
                         # 载体张量：[] 只是占位哑元，内容会被 set_ 覆盖；
-                        # dtype=int8 才能按"字节"寻址（每元素=1 字节,故列数=
-                        # 每 block 字节数）；device 必须与原 KV cache 同设备。
+                        # dtype=int8 才能按"字节"寻址（每元素=1 字节,故列数=每 block 字节数）；
+                        # device 必须与原 KV cache 同设备。
                         torch.tensor(
                             [],
                             dtype=torch.int8,
                             device=layer_kv_cache.device,
                         ).set_(
-                            # storage: 原 KV 张量底层字节级缓冲区(untyped_storage
-                            # 抹掉 dtype)，新张量直接挂上去 -> 零拷贝。
+                            # storage: 原 KV 张量底层字节级缓冲区(untyped_storage抹掉 dtype)，新张量直接挂上去 -> 零拷贝。
                             layer_kv_cache.untyped_storage(),
-                            # storage_offset: 本层数据在该共享 storage 内的起始
-                            # 字节偏移(=storage_offset()*elem_size)，多层共享
-                            # 同一 storage 时定位本层起点。
+                            # storage_offset: 本层数据在该共享 storage 内的起始字节偏移(=storage_offset()*elem_size)，
+                            # 多层共享同一 storage 时定位本层起点。
                             byte_offset,
                             # size: 新形状 (num_blocks, page)。num_blocks=block
                             # 总数(行)；page=每 block 字节数(列,int8 下即字节)。
                             (num_blocks, page),
                             # stride: 行/列步长(以 1 字节为单位)。
-                            #  block_stride_bytes: 相邻 block 间字节间隔
-                            #   (packed 布局下含 padding 更大,普通布局=page);
+                            #  block_stride_bytes: 相邻 block 间字节间隔 (packed 布局下含 padding 更大,普通布局=page);
                             #  1: 同 block 内相邻字节列步长。
                             (block_stride_bytes, 1),
                         ),
@@ -346,12 +345,14 @@ class OffloadingConnectorWorker:
             assert success
         self._unsubmitted_store_jobs.clear()
 
+        #
         if kv_connector_metadata.jobs_to_flush:
             self.worker.wait(kv_connector_metadata.jobs_to_flush)
 
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
         assert self.worker is not None
         for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
+            #
             success = self.worker.submit_store(job_id, src_spec, dst_spec)
             assert success
         self._unsubmitted_store_jobs.clear()
@@ -359,6 +360,7 @@ class OffloadingConnectorWorker:
         for job_id, entry in metadata.load_jobs.items():
             self._load_jobs[job_id] = entry.req_id
             assert isinstance(entry.dst_spec, GPULoadStoreSpec)
+            #
             success = self.worker.submit_load(job_id, entry.src_spec, entry.dst_spec)
             assert success
 
@@ -368,6 +370,7 @@ class OffloadingConnectorWorker:
             # engine step, so that offloading starts AFTER transfers related
             # to token sampling, thereby avoiding delays to token generation.
             assert isinstance(entry.src_spec, GPULoadStoreSpec)
+            #
             self._unsubmitted_store_jobs.append(
                 (job_id, entry.src_spec, entry.dst_spec)
             )
@@ -401,7 +404,7 @@ class OffloadingConnectorWorker:
                     transfer_result.transfer_size,
                     transfer_result.transfer_time,
                 )
-
+            #
             self._connector_worker_meta.mark_completed(job_id)
             req_id = self._load_jobs.pop(job_id, None)
             if req_id is not None:

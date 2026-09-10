@@ -164,6 +164,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.pp_handler: PPHandler | None = None
 
         # Persistent buffer for intermediate tensors (non-first PP ranks).
+        # ⚠️
         self.intermediate_tensors: IntermediateTensors | None = None
 
         # Data parallelism.
@@ -181,6 +182,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.supports_mm_inputs = self.mm_registry.supports_multimodal_inputs(
             self.model_config
         )
+        # ⚠️
         self.encoder_cache = None
         if self.supports_mm_inputs and self.is_first_pp_rank:
             self.encoder_cache = EncoderCache()
@@ -203,6 +205,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     )
 
         # Draft tokens propagation - for spec-dec + struct outputs.
+        # ⚠️
         self.draft_tokens_handler = DraftTokensHandler(self.device)
 
         # Pooling models.
@@ -210,7 +213,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.pooling_runner: PoolingRunner | None = None
 
         # General request states.
-        # 请求状态表（固定大小，每请求一个固定行）
+        # ⚠️ 请求状态表（固定大小，每请求一个固定行）
         self.req_states = RequestState(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
@@ -219,7 +222,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             vocab_size=self.vocab_size,
             device=self.device,
         )
-        # 输入gpu buffers（预分配）: input_ids,positions,query_start_loc,is_padding,seq_lens,dcp_local_seq_lens
+        # ⚠️ 输入gpu buffers（预分配）: input_ids,positions,query_start_loc,is_padding,seq_lens,dcp_local_seq_lens
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
@@ -398,7 +401,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return torch.cuda.current_stream(self.device)
 
     def get_kv_cache_spec(self):
-        # 返回字典{ layer_name -> KVCacheSpec }
+        # ⚠️ 返回字典{ layer_name -> KVCacheSpec }
+        # EngineCore需要每个worker自己收集所有的{ layer_name -> KVCacheSpec }
         return get_kv_cache_spec(self.vllm_config)
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
@@ -415,7 +419,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 getattr(self.model_config.hf_config, "max_source_positions", 0),
             )
 
-        # Hybrid Attention，已经分组完成。例如[ Full 0, SWA 0, SWA 1 ]
+        # 1️⃣ Hybrid Attention，已经分组完成。例如[ Full 0, SWA 0, SWA 1 ]
         block_sizes = []
         max_num_blocks_per_group = []
         for kv_cache_group in kv_cache_config.kv_cache_groups:
@@ -424,8 +428,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # When using DCP, each request's KV cache is sharded among different ranks.
             # As a result, one block on the current rank covers `block_size * cp_size`
             # tokens in the full, global (unsharded) sequence.
-            # 如果开启了DCP，那么实际的block_size = block_size * cp_size
-            # 一个请求需要匹配的token数 = block_size * cp_size，才是表示匹配了一个block
+            # ⚠️ 如果开启了DCP，那么实际的block_size = block_size * cp_size
+            # ⚠️ 一个请求需要匹配的token数 = block_size * cp_size，才是表示匹配了一个block
             max_num_blocks = cdiv(
                 block_table_max_model_len, spec.block_size * self.dcp_size
             )
@@ -441,10 +445,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 ) + spec.num_speculative_blocks
             max_num_blocks_per_group.append(max_num_blocks)
 
+        # 2️⃣ attn_groups ： [ num_kv_cache_groups , num_attn_groups]
+        # 每个kv cache group，按照key = (attn_backend, layer_kv_cache_spec, num_heads_q)分出不同的attn groups
         self.attn_groups, attn_cg_support, self.kernel_block_sizes = init_attn_backend(
             self.kv_cache_config, self.vllm_config, self.device
         )
-        # 每组各自维护自己的 block table
+        # 3️⃣ 每组各自维护自己的 block table
         self.block_tables = BlockTables(
             # block_sizes: 每个组的block_size，例如[ Full 0, SWA 0, SWA 1 ]
             block_sizes=block_sizes,
@@ -488,6 +494,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.model_state, self.kv_cache_config, self.block_tables
             )
 
+        # 4️⃣非常重要的函数，涉及到实际kv cache的物理显存分配和绑定
         self.kv_caches: list[torch.Tensor] = []
         kv_caches_dict = init_kv_cache(
             self.kv_caches,
@@ -499,6 +506,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kernel_block_sizes,
             self.vllm_config,
         )
+
+        # 5️⃣
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
     def _init_kv_zero_meta(self) -> None:
@@ -784,10 +793,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Streaming input update: request already exists from a prior
             # chunk. Remove old state so it can be cleanly re-added below
             # with the updated prompt_token_ids and mm_features.
+            # ⚠️ 模拟「流式输入的第二个 chunk 到了」——也就是我们前面聊的「同一个 req_id 带着更长的序列重新进来」的场景
+            # ⚠️ 当同一个 req_id 以「更长的 prompt / 更多 mm_features」的更新 chunk 再次进入 add_requests 时，
+            # GPUModelRunner 会先 _remove_request 拆掉旧状态（且不泄漏 slot、不重复占 index），
+            # 再用更新后的 prefill_token_ids 和 mm_features 干净重建所有 GPU 侧状态（token 镜像、位置、encoder 缓存、block table）
             self._remove_request(req_id)
 
             prompt_len = len(new_req_data.prompt_token_ids)
             sampling_params = new_req_data.sampling_params
+            # ⚠️
             self.req_states.add_request(
                 req_id=req_id,
                 prompt_len=prompt_len,
@@ -797,13 +811,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             req_index = self.req_states.req_id_to_index[req_id]
 
+            # ⚠️
             if self.encoder_cache is not None:
                 self.encoder_cache.add_request(req_id, new_req_data.mm_features)
 
+            # ⚠️
             self.model_state.add_request(req_index, new_req_data)
+
+            # ⚠️
             self.block_tables.append_block_ids(
                 req_index, new_req_data.block_ids, overwrite=True
             )
+            # ⚠️
             self.lora_state.add_request(req_id, req_index, new_req_data.lora_request)
 
             if self.is_last_pp_rank and new_req_data.sampling_params is not None:
@@ -826,6 +845,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Add new blocks and update num_computed_tokens for the existing requests.
         reqs = scheduler_output.scheduled_cached_reqs
         num_computed_tokens_np = self.req_states.num_computed_tokens_np
+        # ⚠️ 调度了running requests，增量更新
         for req_id, num_computed_tokens, req_new_block_ids in zip(
             reqs.req_ids, reqs.num_computed_tokens, reqs.new_block_ids
         ):
@@ -867,10 +887,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Decode first, then prefill.
         # batch_idx -> req_id
+        # ⚠️ list[str]: decode优先，token越少排前。 按 token 数升序排好的 req_ids
         req_ids = sorted(num_tokens_per_req, key=num_tokens_per_req.get)  # type: ignore[arg-type]
+        # map(迭代器),按 req_ids 顺序取 token 数
         numtoks_iter = map(num_tokens_per_req.get, req_ids)
+        # np.ndarray(CPU): 相当于重排序后 batch_id -> 本步要算的 token 数
         num_scheduled_tokens = np.fromiter(numtoks_iter, dtype=np.int32, count=num_reqs)
 
+        # ⚠️ 重排序后，相当于 batch_id -> req_state_idx
         idx_mapping_iter = map(self.req_states.req_id_to_index.get, req_ids)
         idx_mapping_np = np.fromiter(idx_mapping_iter, dtype=np.int32, count=num_reqs)
         idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
@@ -929,6 +953,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Get prefill tokens if any.
         if np.any(is_prefilling_np):
+            # ⚠️ prefill：需要把 prompt ids 拷贝到 input_ids
             prepare_prefill_inputs(
                 self.input_buffers.input_ids,
                 self.req_states.next_prefill_tokens,
@@ -940,6 +965,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         # Prepare positions and seq_lens.
+        # ⚠️ 往input_buffers里填 positions, seq_lens
         prepare_pos_seq_lens(
             idx_mapping,
             query_start_loc,
@@ -952,6 +978,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         dcp_local_seq_lens = None
         if self.use_dcp:
             # Prepare dcp local seq_lens.
+            # ⚠️ 所有 rank 喂进相同的 seq_lens(全局总长),但各自按自己的 dcp_rank 算出不同的 dcp_local_seq_lens(本 rank 持有的 KV 段长),
+            # ⚠️ 跨 rank 求和还原成完整序列长度。无需通信,各 rank 独立从"总长 + 自己 rank 号"推出自己的分片。
             prepare_dcp_local_seq_lens(
                 self.input_buffers.dcp_local_seq_lens,
                 self.input_buffers.seq_lens,
@@ -964,13 +992,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Some input token ids are directly read from the last sampled tokens
         # and draft tokens. Also, get the logits indices to sample tokens from.
+        # ⚠️ decode： 把生成 token（last_sampled_tokens + draft tokens） 填进 input_ids
         logits_indices = combine_sampled_and_draft_tokens(
             self.input_buffers.input_ids,
             idx_mapping,
             self.req_states.last_sampled_tokens,
             query_start_loc,
             seq_lens,
+            # ⚠️
             self.req_states.prefill_len.gpu,
+            # ⚠️
             self.req_states.draft_tokens,
             cu_num_logits,
             total_num_logits,
@@ -1038,6 +1069,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.idx_mapping,
             num_reqs_padded=input_batch.num_reqs_after_padding,
         )
+
         # Slot mappings: [num_kv_cache_groups, num_tokens_padded].
         # Kernel pads beyond num_tokens with PAD_SLOT_ID.
         slot_mappings = self.block_tables.compute_slot_mappings(
@@ -1131,16 +1163,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        # ⚠️
         if not dummy_run:
             # Update the request states.
+            # 1.
             self.update_pp_decode_requests()
+            # 2. 处理 finished_req_ids,preempted_req_ids
             self.finish_requests(scheduler_output)
+            # 3. 处理 free_encoder_mm_hashes
             self.free_states(scheduler_output)
+            # 4. 处理 scheduled_new_reqs
             self.add_requests(scheduler_output)
+            # 5. 处理 scheduled_cached_reqs
             self.update_requests(scheduler_output)
+
             self.block_tables.apply_staged_writes()
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
+                # 🌟
                 empty_output = self.kv_connector.no_forward(scheduler_output)
                 return empty_output
 
@@ -1148,6 +1188,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_reqs = len(scheduler_output.num_scheduled_tokens)
         num_toks = scheduler_output.total_num_scheduled_tokens
         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
+        # 如果此次调度的所有请求 需要计算的token数完全一致，则 uniform_tok_count = max_query_len， 否则 None
         uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
 
         num_active_loras = 0
@@ -1164,11 +1205,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
+        # 1️⃣ 处理DP
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
             num_reqs,
             num_toks,
             uniform_tok_count,
+            # 如果此次调度的所有请求 需要计算的token数完全一致，则 uniform_tok_count = max_query_len， 否则 None
             self.dp_size,
             self.dp_rank,
             need_eager=is_profile or skip_compiled,
@@ -1177,18 +1220,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
+            # 🌟
             empty_output = self.kv_connector.no_forward(scheduler_output)
             return empty_output
 
         if not dummy_run:
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
+            # 2️⃣ 将 调度的请求 增量填进 InputBuffers，打包返回InputBatch
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+            # 3️⃣ 取出此处调度对应的块表 Block tables: num_kv_cache_groups x [num_reqs_padded, max_num_blocks]
+            #    和 新生成的 token 应该存放的 slot 位置 Slot mappings: [num_kv_cache_groups, num_tokens_padded].
+            # ⚠️ DCP情况，每个cp rank仅存放自己负责的token
             block_tables, slot_mappings = self.prepare_attn(input_batch)
+
+
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
             # boundary reset is visible to the attention metadata.
+            # 1️⃣ 默认空实现
             self.model_state.preprocess_state(
                 input_batch,
                 block_tables,
@@ -1225,10 +1276,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         slot_mappings_by_layer = None
         if not (dummy_run and skip_attn_for_dummy_run):
             assert slot_mappings is not None
+            # layer_name -> slot_mappings
             slot_mappings_by_layer = build_slot_mappings_by_layer(
                 slot_mappings, self.kv_cache_config
             )
             assert block_tables is not None
+            # 2️⃣ 创建{ layer_name -> attn_metadata }
             attn_metadata = self.model_state.prepare_attn(
                 input_batch,
                 batch_desc.cg_mode,
@@ -1272,6 +1325,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             "intermediate_tensors": None,
             # NOTE: Values returned by `prepare_inputs` will override the default
             # values above.
+            # 3️⃣
             **self.model_state.prepare_inputs(input_batch, self.req_states),
         }
         if not self.is_first_pp_rank:
@@ -1293,6 +1347,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             del intermediate_tensors
 
         # Update the EPLB meta.
+        # 4️⃣
         self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
 
         # Run model.
@@ -1301,6 +1356,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
             # because they are already copied to the CUDA graph input buffers.
             assert self.cudagraph_manager is not None
+            # 🌟
             self.kv_connector.pre_forward(scheduler_output)
             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
@@ -1311,6 +1367,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_active_loras=batch_desc.num_active_loras,
             )
 
+            # 5️⃣
             with set_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -1322,6 +1379,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 skip_compiled=skip_compiled,
                 is_padding=input_batch.is_padding,
             ):
+                # 🌟
                 self.kv_connector.pre_forward(scheduler_output)
                 if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
                     # Run the PIECEWISE graph (compiled PW cudagraph or breakable
@@ -1397,6 +1455,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.model_state.postprocess_state(input_batch.idx_mapping, 0)
 
             # Post-step KV connector related operations.
+            # 🌟
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
@@ -1500,6 +1559,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         # Post-step KV connector related operations.
+        # 🌟
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.kv_connector_output = kv_connector_output
 
@@ -1521,6 +1581,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.execute_model_state = None
 
         # Post-step KV connector related operations.
+        # 🌟
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
 
         if not self.is_last_pp_rank:

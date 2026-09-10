@@ -400,6 +400,10 @@ class CommonAttentionMetadata:
     For many of the tensors we keep both GPU and CPU versions.
     """
 
+    # 设计要点:大量字段同时保留 GPU 版与 CPU 版。GPU 版给真正需要逐行精确值的
+    # attention kernel 用;CPU 版(如 query_start_loc_cpu / seq_lens_cpu_upper_bound)
+    # 只在 host 端做规模估算/分支判断,刻意避免 GPU→CPU 同步,以支撑全异步调度。
+
     query_start_loc: torch.Tensor
     query_start_loc_cpu: torch.Tensor
     """(batch_size + 1,), the start location of each request in query Tensor"""
@@ -598,6 +602,10 @@ class AttentionCGSupport(Enum):
 
 
 class AttentionMetadataBuilder(ABC, Generic[M]):
+    # 每个 AttentionGroup 持有一个(或 ubatch 数个)builder 实例;builder 负责把
+    # 共享的 CommonAttentionMetadata 加工成"该组每层可消费的专属 metadata"(类型 M)。
+    # 三个构建入口:build(常规)、build_for_cudagraph_capture(图捕获,用 padded 形状)、
+    # build_for_drafting(投机 draft 步)。
     # Does this backend/builder support CUDA Graphs for attention (default: no).
     # Do not access directly. Call get_cudagraph_support() instead.
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER

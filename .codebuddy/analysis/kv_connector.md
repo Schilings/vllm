@@ -14,6 +14,7 @@
 - [3. Layer 2：配置层 KVTransferConfig 与桥接](#3-layer-2配置层-kvtransferconfig-与桥接)
 - [4. Layer 3：注册表 + 工厂（可插拔解耦的核心）](#4-layer-3注册表--工厂可插拔解耦的核心)
 - [5. Layer 4：Scheduler 侧集成点](#5-layer-4scheduler-侧集成点)
+- [5.2 前缀缓存写入时机：三条 cache_blocks 路径](#52-前缀缓存写入时机三条-cache_blocks-路径)
 - [6. Layer 5：Worker / ModelRunner 侧集成点](#6-layer-5worker--modelrunner-侧集成点)
 - [7. Layer 6：全局单例 _KV_CONNECTOR_AGENT（跨进程粘合）](#7-layer-6全局单例-_kv_connector_agent跨进程粘合)
 - [8. 案例：OffloadingConnector 如何复用这套框架](#8-案例offloadingconnector-如何复用这套框架)
@@ -282,6 +283,78 @@ if kv_transfer_config is not None:
 
 > **边界/陷阱**：`get_num_new_matched_tokens` 返回 `None` 时，Scheduler 不是报错，而是把请求放入 `step_skipped_waiting` 推迟到下一步重试（`:789`）。这是 offload/远程 KV 异步性的核心入口（详见 `kv_cache_offloading.md` §8）。
 
+### 5.2 前缀缓存写入时机：三条 cache_blocks 路径
+
+> 常见误解：在 `scheduler.py` 主流程里搜 `cache_blocks`，只看到 `_update_waiting_for_remote_kv`（`:2530`）这一处，于是以为"正常请求的 block 只能在那儿缓存"。**这是错觉**——正常请求（本地计算、prefix caching 开启）的缓存写入被封装在 `allocate_slots()` 内部，根本不出现在 scheduler 主流程里。
+
+#### 5.2.1 正常本地计算：cache_blocks 在 allocate_slots 内部自动触发
+
+调度任一步、给请求分配 KV block 时，都会进入 `KVCacheManager.allocate_slots()`（`vllm/v1/core/kv_cache_manager.py`）。分配完新 block 后，它**顺手**把"本次计算出的 block"写进前缀哈希表：
+
+```python
+# kv_cache_manager.py:487-504
+487:        # P/D: delay caching blocks if we have to recv from
+488:        # remote. Update state for locally cached blocks.
+489:        if not self.enable_caching or delay_cache_blocks:
+490:            return self.create_kv_cache_blocks(new_blocks)   # ← 不缓存（关 prefix / 远端未到）
+491:
+492:        # NOTE(woosuk): We want to commit (cache) up to num_local_computed_tokens
+493:        # + num_external_computed_tokens + num_new_tokens, but must exclude
+494:        # "non-committable" tokens (e.g., draft tokens that could be rejected).
+495:        # Therefore, we cap the number at `request.num_tokens`, ensuring only
+496:        # "finalized" tokens are cached.
+497:        # 5️⃣
+498:        num_tokens_to_cache = min(
+499:            total_computed_tokens + num_new_tokens,
+500:            request.num_tokens,                       # 封顶到"已定稿"token 数
+501:        )
+502:        self.coordinator.cache_blocks(request, num_tokens_to_cache)
+503:
+504:        return self.create_kv_cache_blocks(new_blocks)
+```
+
+关键点：
+
+- **调用方（scheduler 主流程）看不到 `cache_blocks`**——它藏在 `allocate_slots()` 里，每次调度分配 block 时自动执行。这就是"搜不到"的原因。
+- **`enable_caching=False`（没开 prefix caching）→ 跳过**（`:489`）。
+- **`delay_cache_blocks=True`（P/D 分离，本地 block 还要从远端 recv）→ 跳过**（`:489`），等远端到了再在 §5.2.3 的路径缓存。
+- **封顶到 `request.num_tokens`**（`:500`）：只缓存"已定稿"token。草稿 token（spec decode）可能被拒绝，不能提前进 cache。
+
+#### 5.2.2 三路调用点全景
+
+| 路径 | 位置 | 触发时机 | 适用场景 |
+|---|---|---|---|
+| **① 正常本地计算** | `kv_cache_manager.py:502` | `allocate_slots()` 分配 block 后 | 绝大多数请求（prefill + decode），prefix caching 开启 |
+| **② KV Connector 异步收远端 KV** | `scheduler.py:2520` / `:2530` | `_update_waiting_for_remote_kv()` 远端 KV 到位后 | P/D、offloading 等需要 `delay_cache_blocks` 的场景 |
+| **③ Async scheduler 收尾缓存** | `async_scheduler.py:94` | `update_from_output` 后 | async 模式下把新 token 的 block 标缓存；PREEMPTED（不再 RUNNING）的请求跳过 |
+
+> 路径 ② 与 ③ 都和"异步"强相关：block 在结果回来之前就已分配/占位，所以缓存动作被推迟到 output 回来或远端到位之后。路径 ① 则在分配当下同步完成。
+
+#### 5.2.3 路径 ② 详解：为什么 KV Connector 要单独调一次
+
+`_update_waiting_for_remote_kv`（`scheduler.py:2505-2537`）处理的是"请求状态为 `WAITING_FOR_REMOTE_KV`、远端 KV 已 recv 完成"的收尾：
+
+```python
+# scheduler.py:2527-2535
+2527:        else:
+2528:            # Now that the blocks are ready, actually cache them.
+2529:            # This will cache the blocks iff caching is enabled.
+2530:            self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
+2531:
+2532:            # on a full prompt hit, we need to re-compute the last token
+2533:            # in order to be able to sample the next token
+2534:            if request.num_computed_tokens == request.num_tokens:
+2535:                request.num_computed_tokens = request.num_tokens - 1
+```
+
+注意 `:2534-2535` 的微调：若整段 prompt 全命中（KV 全从远端来，`num_computed_tokens == num_tokens`），调度器要回退 1 个 token——因为要采样"下一个 token"必须先重算最后一个 token 的 KV（避免采样自身）。这是 prefix caching + 远程 KV 叠加时的特殊修正。
+
+> 对比 §5.2.1 的 `:500` 封顶逻辑：本地路径靠 `min(..., request.num_tokens)` 防止缓存未定稿 token；远端路径则靠 `:2534` 的回退 1 处理"全命中"边界。两条路径的封顶/回退策略不同，但目标一致：**进 cache 的必须是可安全复用的已定稿 KV**。
+
+#### 5.2.4 一句话总结
+
+正常请求**不需要**在 scheduler 主流程显式调 `cache_blocks`——它封装在 `allocate_slots()`（`kv_cache_manager.py:502`）里，每次分配 KV block 时自动把本次计算的 block 写入前缀哈希表（`enable_caching=True` 且非 `delay_cache_blocks`）。`scheduler.py:2530` 只是 KV Connector 异步收远端 KV 这条**平行**路径，与本地缓存不是唯一入口的关系，而是"本地同步缓存 vs 远端异步缓存"的两条独立通道。
+
 ---
 
 ## 6. Layer 5：Worker / ModelRunner 侧集成点
@@ -505,6 +578,57 @@ sequenceDiagram
     Sch->>C: update_connector_output (:2553)
     C-->>Sch: 提升 WAITING_FOR_REMOTE_KVS 请求
 ```
+
+### 6.1 调度器对 KV 完成信号是「纯被动接收」
+
+整条回报链路的要害在于：**调度器从不主动轮询"传完了没"，它只能在 `update_from_output` 这个固定回灌点，从 `ModelRunnerOutput.kv_connector_output.finished_recving` 里读完成信号**。
+
+完整路径（worker 侧 → 调度器侧）：
+
+1. **worker 每步 forward 后收集**（`v1/worker/gpu/model_runner.py:1457`）
+   ```python
+   kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+   ```
+2. **`post_forward` 去问连接器谁传完了**（`v1/worker/gpu/kv_connector.py:91-99`）
+   ```python
+   output = KVConnectorOutput()
+   ...
+   output.finished_sending, output.finished_recving = (
+       self.kv_connector.get_finished(finished_req_ids))
+   ```
+   `get_finished` 返回的是底层连接器 agent 在做异步收发时自己记录的完成集合
+   （如 `v1/offloading/worker.py:389` 把本步 load 完成的 `req_id` 加入
+   `finished_recving`；`mooncake_connector.py:1746` 的 `fetch_finished_recving_reqs()`）。
+3. **挂进 `ModelRunnerOutput` 回传**（`v1/worker/gpu_model_runner.py:4676`）
+   ```python
+   output = ModelRunnerOutput(..., kv_connector_output=kv_connector_output, ...)
+   ```
+4. **调度器被动接收并推进**（`v1/core/sched/scheduler.py:2551-2567`）
+   ```python
+   for req_id in kv_connector_output.finished_recving or ():
+       self.finished_recving_kv_req_ids.add(req_id)
+   ```
+   之后下一次 `schedule()` 才把请求从 `WAITING_FOR_REMOTE_KVS` 提升进 running。
+
+> 含义：KV transfer 何时算"完成"，由 **worker 侧 KV 连接器 agent 异步检测**，
+> 但"把这个完成告诉调度器"的动作只发生在 **`ModelRunnerOutput` 回传时**。
+> 调度器是纯消费者，不轮询、不查状态。
+
+### 6.2 测试印证：空 output 不推进
+
+`tests/v1/core/test_scheduler.py` 的 `_step_until_kv_transfer_finished` 把
+"调度"和"回灌信号"拆成两次，恰好印证了上面的被动性：
+
+- 第一次 `schedule()`：请求被标 `WAITING_FOR_REMOTE_KVS`，不调度计算（`running==0`）。
+- 接着 `update_from_output(output, EMPTY_OUTPUT)`——**空 output 没有
+  `finished_recving`**。于是第二次 `schedule()` 时调度器仍只看到
+  `WAITING_FOR_REMOTE_KVS`，`running` 依然是 0（请求继续赖在 waiting）。
+- 直到 `update_from_output` 带上
+  `KVConnectorOutput(finished_recving=req_ids)`（`:1580`），请求才进入
+  `finished_recving_kv_req_ids`，**下一次 `schedule()` 才真正提升进 running**。
+
+这说明：哪怕你调了 N 次 `schedule()`，只要 `update_from_output` 没把
+`finished_recving` 信号喂回来，请求就不会被推进——调度器完全依赖 worker 的回报。
 
 ---
 

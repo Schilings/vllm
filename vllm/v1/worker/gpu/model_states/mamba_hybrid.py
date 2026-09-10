@@ -33,6 +33,10 @@ from vllm.v1.worker.utils import AttentionGroup
 
 @dataclass
 class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
+    # 注入到 attention metadata 的 Mamba 专属字段:
+    #  - is_prefilling: 区分 prefill / decode 行(部分 kernel 据此走不同路径)
+    #  - num_accepted_tokens / num_decode_draft_tokens_cpu: 投机解码接受计数,
+    #    用于 spec-decode 行的注意力长度计算。
     is_prefilling: torch.Tensor
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None

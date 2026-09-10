@@ -22,6 +22,7 @@ def test_initialize_kv_cache_for_kv_sharing_different_attn_groups():
     Layers in the same KV cache group might be placed in different attn groups
     if they have different attention backends.
     """
+    # layer去共复用其他layer的kv cache
     shared_kv_cache_layers = {
         "model.layers.2": "model.layers.0",
         "model.layers.3": "model.layers.1",
@@ -34,6 +35,8 @@ def test_initialize_kv_cache_for_kv_sharing_different_attn_groups():
         KVCacheGroupSpec(["model.layers.0", "model.layers.1"], new_kv_cache_spec()),
     ]
 
+    # KVCacheGroupSpec的layer name 追加上
+    # 但单单如此不代表就复用了啊
     add_kv_sharing_layers_to_kv_cache_groups(
         shared_kv_cache_layers=shared_kv_cache_layers,
         kv_cache_groups=kv_cache_groups,

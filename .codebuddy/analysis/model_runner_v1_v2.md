@@ -8,6 +8,7 @@
 2. [全景架构概览：Model Runner 在 vLLM 中的位置](#2-全景架构概览model-runner-在-vllm-中的位置)
 3. [V1 GPUModelRunner 深度解剖](#3-v1-gpumodelrunner-深度解剖)
 4. [V2 GPUModelRunner 深度解剖](#4-v2-gpumodelrunner-深度解剖)
+   - [4.5 模块化的核心：ModelState 抽象](#45-模块化的核心modelstate-抽象官方变化)
 5. [V1 vs V2 核心对比](#5-v1-vs-v2-核心对比)
 6. [关键创新详解](#6-关键创新详解)
 7. [完整调用链时序图](#7-完整调用链时序图)
@@ -53,6 +54,17 @@ vLLM 团队在 V1 的实践中发现了以下**根本性设计缺陷**：
 │    从设计之初消除同步点，而非事后修补              │
 └─────────────────────────────────────────────────┘
 ```
+
+> **官方出处对齐**：本文（MRV2）的权威来源是 vLLM 官方博客 **《Model Runner V2: A Modular and Faster Core for vLLM》**（https://vllm.ai/blog/mrv2，发布于 2026-03-24，作者 vLLM Team）。下面 §4~§6 的"四大主要变化"均与该博客逐项对齐，并附 vLLM 当前分支（`comments-on-v0.25.1`）的真实源码行号，便于回源码核对。
+
+### 1.4 官方博客的"四大主要变化"（与源码逐项对齐）
+
+| # | 官方命名 | 核心内容 | 本文对应章节 + 源码 |
+| --- | --- | --- | --- |
+| ① | 更好的持久 Batch + GPU 原生输入准备 | 持久状态与单步输入解耦，固定大小状态表按请求分配**稳定行（stable row）**，每步用 GPU gather 抽出有序输入；`input_ids`/`positions`/`seq_lens` 等由 Triton kernel 在 GPU 上直接构建 | §4.1、§6.1、§6.3（`states.py:9`、`input_batch.py` Triton kernel） |
+| ② | 异步优先（Async-First） | 异步调度成为核心假设，目标 CPU↔GPU **零同步**；GPU 准备 kernel 直接消费 GPU 端拒绝采样结果；每步输出经**独立 CUDA stream** 异步回传 CPU | §4.2、§6.4、`async_utils.py` |
+| ③ | Triton 原生采样器 | Gumbel-Max（无状态 in-kernel RNG，避免显式 softmax 物化）、更高效 top-k logprobs、更省显存的 prompt logprobs、更好的投机兼容性（kernel 内用 `idx_mapping` 而非扩展请求状态） | §6.5（`sample/sampler.py:30`、`sample/gumbel.py`） |
+| ④ | 更强模块化 | 引入 `ModelState` 抽象（ABC）隔离模型专属逻辑；原 6700+ 行单文件拆成最大不超过 1300 行的模块 | §4.4（`model_states/interface.py`） |
 
 ---
 
@@ -216,7 +228,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):  # 仅一个 Mixin！
 
 ```mermaid
 flowchart TD
-    START["execute_model(scheduler_output)"] --> UPDATE["① 更新请求状态<br/>finish_requests → free_states → add_requests → update_requests"]
+    START["execute_model(scheduler_output)"] --> UPDATE["① 更新请求状态<br/>finish_requests(:764) → free_states(:772) → add_requests(:785) → update_requests(:842)<br/>（以上均为 model_runner.py 方法，非 states.py）"]
     UPDATE --> APPLY["② block_tables.apply_staged_writes()<br/>一次性应用所有 StagedWriteTensor diff"]
     APPLY --> CHECK_TOKENS{"total_num_scheduled_tokens > 0?"}
     CHECK_TOKENS -->|No| EMPTY["返回 kv_connector.no_forward()"]
@@ -282,9 +294,11 @@ vllm/v1/worker/gpu/
 │   ├── prompt_logprob.py   # Prompt logprobs (260 行)
 │   └── ...
 ├── model_states/           # 模型状态管理 (接口 + 多种实现)
+│   ├── interface.py        # ModelState ABC 抽象（隔离模型专属逻辑）
 │   ├── default.py          # 默认 ModelState
 │   ├── encoder_decoder.py  # Encoder-decoder
 │   ├── mamba_hybrid.py     # Mamba hybrid
+│   ├── mm_pruning.py       # 多模态剪枝
 │   └── ...
 ├── mm/                     # 多模态
 │   ├── encoder_cache.py    # Encoder cache
@@ -292,6 +306,33 @@ vllm/v1/worker/gpu/
 ├── spec_decode/            # 投机解码 speculator
 └── pool/                   # Pooling 模型 runner
 ```
+
+### 4.5 模块化的核心：`ModelState` 抽象（官方变化④）
+
+MRV2 把"模型专属逻辑"（多模态嵌入、额外输入、注意力元数据构建、CUDA Graph 捕获）从主 runner 抽离到一个抽象基类 `ModelState`（`gpu/model_states/interface.py`）。**主 runner 只负责通用执行路径**，模型差异全部下沉到 `ModelState` 的各实现。官方博客给出的接口签名：
+
+```python
+# vllm/v1/worker/gpu/model_states/interface.py  (MRV2 抽象基类，对应源码)
+class ModelState(ABC):
+    def add_request(self, ...): ...           # 请求加入时的状态初始化
+    def remove_request(self, ...): ...        # 请求移除时的清理
+    def get_mm_embeddings(self, ...): ...     # 多模态嵌入提取
+    def prepare_inputs(self, ...): ...        # 构建模型专属输入
+    def prepare_attn(self, ...): ...          # 构建注意力元数据
+    def prepare_dummy_inputs(self, ...): ...  # dummy_run / warmup 用输入
+    # ... 其余模型特定钩子
+```
+
+**具体实现**（按模型架构分文件，职责单一）：
+
+| 实现文件 | 适用模型 |
+| --- | --- |
+| `model_states/default.py` | 默认（标准 decoder-only Transformer） |
+| `model_states/encoder_decoder.py` | Encoder-Decoder（如 T5、Whisper） |
+| `model_states/mamba_hybrid.py` | Mamba / 混合架构（需对齐隐性状态） |
+| `model_states/mm_pruning.py` | 多模态剪枝变体 |
+
+> 这正是 MRV2 能把核心 `model_runner.py` 从 6800 行压到 1609 行、且"最大文件不超过 1300 行"的根本原因——模型差异被 `ModelState` 吸收，主流程保持精简、可读、可维护。
 
 ---
 
@@ -453,13 +494,25 @@ states = tmp_states.to("cuda", non_blocking=True)    # 安全并行拷贝
 
 通过每次分配新的 pinned memory buffer 进行 GPU 拷贝，而非复用持久化的 pinned buffer，从根本上消除了 CPU 与 GPU 之间的竞态条件。
 
-### 6.5 Triton-Native 采样器
+### 6.5 Triton-Native 采样器（官方变化③）
+
+**文件**：`vllm/v1/worker/gpu/sample/sampler.py:30`（`class Sampler`，普通 class 而非 `nn.Module`，聚合 penalties/logit_bias/bad_words/logprobs 各状态）；Gumbel kernel 在 `vllm/v1/worker/gpu/sample/gumbel.py`（`@triton.jit def _temperature_kernel` + `gumbel_sample` 入口）。
+
+官方博客列出的四个具体改进，**源码逐条对应**：
+
+| 官方要点 | 说明 | 源码落点 |
+| --- | --- | --- |
+| **Gumbel-Max 采样** | 用 kernel 内 **无状态 in-kernel RNG** 做 Gumbel-Max，避免显式 softmax 物化（不再物化 vocab_size 大小的完整分布），显著降低峰值显存 | `sampler.py:198 sample()` → 非 FlashInfer 路径调 `gumbel_sample(...)`（Triton，`sampler.py:235-243`）；FlashInfer 路径 `sampler.py:232` |
+| **更高效 top-k logprobs** | 先找 top-k logits，再**仅对选中候选**计算 logprobs，而非对全词表算 | `sample/logprob.py`（Top-K logprobs 实现） |
+| **更省显存的 prompt logprobs** | 更细粒度分块（包括单 prompt 内分块），减少临时 buffer | `sample/prompt_logprob.py` |
+| **更好投机解码兼容性** | kernel 内使用**间接映射 `idx_mapping`**，而非扩展请求状态去匹配每个 logits 向量——异步/投机下 logits 与请求顺序错位时也能正确对齐 | `sample/sampler.py` 全程基于 `idx_mapping` 索引；与 §4.2 的 GPU gather 同源 |
 
 ```python
 # V1: PyTorch softmax → top-k → sample
 #     需要物化完整的 softmax 分布（vocab_size 大小）
 
-# V2: Triton Gumbel kernel
+# V2: Triton Gumbel kernel（gumbel.py）
+#     @triton.jit def _temperature_kernel(...)
 #     使用 kernel 内 RNG，避免显式 softmax 物化
 #     显著降低峰值显存占用
 ```
@@ -574,7 +627,7 @@ sequenceDiagram
 | 数据结构 | 文件/行号 | 关键字段 | 作用 |
 |---------|----------|---------|------|
 | `GPUModelRunner` | `gpu/model_runner.py:120` | `req_states`, `input_buffers`, `block_tables`, `cudagraph_manager`, `execute_model_state` | 核心执行器（~1609 行） |
-| `RequestState` | `gpu/states.py:9` | `req_id_to_index`, `free_indices`, `all_token_ids (StagedWriteTensor)`, `num_computed_tokens (StagedWriteTensor)`, `last_sampled_tokens`, `draft_tokens` | 固定大小状态表 |
+| `RequestState` | `gpu/states.py:9` | `req_id_to_index`, `free_indices`, `all_token_ids (StagedWriteTensor, UVA, :36)`, `num_computed_tokens (StagedWriteTensor, :65)`, `last_sampled_tokens (torch.zeros, :73)`, `draft_tokens (:82)`；`add_request (:97)` / `remove_request (:133)` 在 states.py；`free_states (:772)` / `update_requests (:842)` 在 model_runner.py | 固定大小状态表，按 slot 管理，增删只动 `free_indices` |
 | `InputBuffers` | `gpu/input_batch.py:12` | `input_ids`, `positions`, `is_padding`, `query_start_loc`, `seq_lens`, `dcp_local_seq_lens` | 预分配 GPU buffers |
 | `InputBatch` | `gpu/input_batch.py:37` | `req_ids`, `idx_mapping`, `num_scheduled_tokens`, `query_start_loc`, `seq_lens`, `input_ids`, `positions`, `logits_indices` | 单步输入批次（dataclass） |
 | `StagedWriteTensor` | `gpu/buffer_utils.py:114` | `gpu`, `_staged_write_*`, `stage_write()`, `apply_write()` | 增量写入 GPU 张量 |
@@ -583,8 +636,8 @@ sequenceDiagram
 | `ModelCudaGraphManager` | `gpu/cudagraph_utils.py` | `run_fullgraph()`, `run_pw_graph()` | 显式 CUDA Graph 管理 |
 | `BatchExecutionDescriptor` | `gpu/cudagraph_utils.py` | `num_reqs`, `num_tokens`, `cg_mode`, `num_active_loras` | 批次执行描述 |
 | `ExecuteModelState` | `gpu/model_runner.py:1602` | `input_batch`, `attn_metadata`, `hidden_states`, `aux_hidden_states`, `finished_req_ids` | 两阶段状态传递 |
-| `Sampler` | `gpu/sample/sampler.py` | Triton Gumbel kernel, Top-K logprobs | Triton-native 采样器 |
-| `ModelState` | `gpu/model_states/interface.py` | `prepare_inputs()`, `prepare_attn()`, `get_mm_embeddings()`, `postprocess_state()` | 模型特定行为抽象 |
+| `Sampler` | `gpu/sample/sampler.py:30` | `apply_sampling_params (:146)`, `sample (:198)` → `gumbel_sample` (Triton, :235-243) | Triton-native 采样器 |
+| `ModelState` | `gpu/model_states/interface.py` | `add_request/remove_request`, `prepare_inputs()`, `prepare_attn()`, `get_mm_embeddings()`, `prepare_dummy_inputs()` | 模型特定行为抽象（ABC） |
 
 ---
 
@@ -606,15 +659,35 @@ sequenceDiagram
 
 > `all_token_ids` 是 `max_num_reqs × max_model_len` 的 int32 张量。以 1024 reqs × 131072 tokens 为例，占用 512 MB GPU 显存。使用 UVA 后，GPU kernel 可以直接访问 CPU 内存中的这个张量，节省了这部分 GPU 显存。
 
-**Q5: V2 比 V1 快多少？**
+**Q5: V2 比 V1 快多少？（官方精确数据）**
 
-> 官方 benchmark（GB200 平台）：Qwen3-0.6B、Llama3-8B 等模型上吞吐量提升 **55%-56%**，推测解码场景 TPOT 降低 **6.3%**，GPU 利用率从 ~45% 提升到 78%，内存碎片率从 35% 降至 8% 以下。
+> 官方博客（https://vllm.ai/blog/mrv2，2026-03-24）给出的两组 benchmark：
+> - **小模型高主机开销场景**：Qwen3-0.6B × 1×GB200，吞吐 **16K → 25K output tok/s（+56.2%）**（特意选小模型以放大主机侧开销占比）。
+> - **投机解码延迟**：GLM-4.7-FP8 + MTP=1 × 4×GB200，平均 **TPOT 降低 6.3%**（跨请求率）；改善来自零同步设计消除了 CPU–GPU 同步点。
+> 注：文档旧版写的"GPU 利用率 45%→78%、碎片率 35%→8%"等数字为估算口径，官方博客未给出，请以官方两组数字为准。
 
 **Q6: V2 的模块化拆分会不会增加代码复杂度？**
 
-> 从行数看确实更多（6800 → 15000+），但核心 `model_runner.py` 从 6800 行缩减到 1609 行。每个子模块职责单一、边界清晰，反而更容易理解和维护。类比：一个 6800 行的巨型类 vs 81 个平均 200 行的小模块，后者更符合单一职责原则。
+> 从行数看确实更多（6800 → 15000+），但核心 `model_runner.py` 从 6800 行缩减到 1609 行（且 MRV2 最大文件不超过 1300 行）。每个子模块职责单一、边界清晰，反而更容易理解和维护。类比：一个 6800 行的巨型类 vs 81 个平均 200 行的小模块，后者更符合单一职责原则。
+
+**Q7: MRV2 当前（v0.18.0 实验阶段）不支持哪些功能？**
+
+> 官方限制列表（与当前分支 `comments-on-v0.25.1` 一致）：
+> - **线性注意力模型**（如 Qwen3.5、Nemotron 3 Super）
+> - 除 **Eagle / Eagle3 / MTP** 之外的其他投机解码方法
+> - **EPLB** 和 **DBO**
+> - **Logits processors**
+> - **LoRA**
+>
+> 其中 **EPLB（Expert Parallelism Load Balancer）暂不支持** 这一点，正好与我们另一份报告 `expert_parallel.md` 关联：EPLB 是 EP 的负载均衡配套机制，MRV2 尚未接入，意味着在 MRV2 路径下跑大规模 MoE（如 DeepSeek-V3 256 专家）的 EP 部署时，暂时无法使用动态专家重排。
+
+**Q8: 如何启用 MRV2？官方来源是？**
+
+> 启用：`export VLLM_USE_V2_MODEL_RUNNER=1`（无需任何 API 变更）；部分非 MoE / 特定架构（DeepseekV2、Qwen2Moe、GraniteMoe）已默认启用，遇到不兼容特性（prefill context parallelism、stock torch.compile、sequence parallelism、ngram speculative decoding 等）会自动回退 V1。
+> 官方来源：vLLM Blog《Model Runner V2: A Modular and Faster Core for vLLM》——https://vllm.ai/blog/mrv2（2026-03-24）。
 
 ---
 
 *报告生成日期: 2026年7月*
 *分析的代码基线: vllm-project/vllm v0.25.1*
+*官方对齐: 与 https://vllm.ai/blog/mrv2 (2026-03-24) 逐项核对*

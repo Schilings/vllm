@@ -754,6 +754,11 @@ def get_attention_context(
     """
     forward_context: ForwardContext = get_forward_context()
     attn_metadata_raw = forward_context.attn_metadata
+    # 消费 attention metadata 的核心分发点。execute_model 通过 set_forward_context
+    # 把一个 dict[layer_name -> AttentionMetadata]（投机解码时为 list[dict]）注入全局
+    # forward_context；每个 Attention 层在这里按自己的 layer_name 取出专属的那一份元数据，
+    # 再交给对应的 impl.forward。这印证了 "一个 dict 按 layer_name 分发" 的统一消费模式
+    # （详见 attn_metadata.md §5.2）。
     attn_metadata: AttentionMetadata
     if isinstance(attn_metadata_raw, dict):
         attn_metadata = attn_metadata_raw[layer_name]

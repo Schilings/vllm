@@ -51,7 +51,10 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
     # 返回字典{ layer_name -> KVCacheSpec }
     kv_cache_spec: dict[str, KVCacheSpec] = {}
     layer_type = cast(type[Any], AttentionLayerBase)
+
+    # ⚠️ AttentionLayerBase类很重要啊！
     attn_layers = get_layers_from_vllm_config(vllm_config, layer_type)
+
     for layer_name, attn_module in attn_layers.items():
         # 该layer复用其他layer的KV cache，则跳过
         if getattr(attn_module, "kv_sharing_target_layer_name", None):
@@ -97,6 +100,7 @@ def init_attn_backend(
         get_shared_kv_cache_layers(vllm_config), kv_cache_config.kv_cache_groups
     )
 
+    # 1️⃣
     # Phase 1: discover attention groups for each kv cache group.
     for kv_cache_group_id, kv_cache_group_spec in enumerate(
         kv_cache_config.kv_cache_groups
@@ -133,10 +137,12 @@ def init_attn_backend(
 
         attn_groups.append([group_map[key] for key in group_order])
 
+    # 2️⃣
     # Phase 2: pick a kernel block size per kv cache group that is supported
     # by all backends within that group.
     kernel_block_sizes = prepare_kernel_block_sizes(kv_cache_config, attn_groups)
 
+    # 3️⃣
     # Phase 3: create metadata builders and determine cudagraph support.
     attn_backend_workspace: torch.Tensor | None = None
     min_cg_support = AttentionCGSupport.ALWAYS
@@ -532,19 +538,27 @@ def init_kv_cache(
     kernel_block_sizes: list[int],
     vllm_config: VllmConfig,
 ) -> dict[str, Any]:
+    # 获取哪些layer需要复用别的layer的kv cache
+    # { attn_layer -> target_attn_layer }
     shared_kv_cache_layers = get_shared_kv_cache_layers(vllm_config)
+    # ⚠️ 按照kv_cache_config.kv_cache_tensors进行allocate显存
+    # 得到 { attn_layer -> raw_kv_cache }
     kv_cache_raw_tensors = _allocate_kv_cache(
         kv_cache_config, shared_kv_cache_layers, device
     )
+    # ⚠️
     flattened_attn_groups = list(group for groups in attn_groups for group in groups)
     kv_caches = _reshape_kv_cache(
         attn_groups=flattened_attn_groups,
+        #  { attn_layer -> raw_kv_cache }
         kv_cache_raw_tensors=kv_cache_raw_tensors,
         kernel_block_sizes=kernel_block_sizes,
         cache_dtype=cache_dtype,
+        # { attn_layer -> target_attn_layer }
         shared_kv_cache_layers=shared_kv_cache_layers,
         kv_cache_config=kv_cache_config,
     )
+    # ⚠️
     bind_kv_cache(kv_caches, forward_context, runner_kv_caches)
     return kv_caches
 

@@ -808,7 +808,7 @@ def test_metrics_empty_stats():
 def test_get_kv_cache_configs_multiple_workers():
     model_config = ModelConfig(max_model_len=16)
     vllm_config = VllmConfig(model_config=model_config)
-
+    #
     ref_kv_cache_spec = new_kv_cache_spec()
     same_kv_cache_specs = [
         {
@@ -1315,6 +1315,7 @@ def test_merge_kv_cache_spec():
 
 
 def test_is_kv_cache_spec_uniform():
+    #
     kv_cache_spec = {
         "layer_1": new_kv_cache_spec(num_kv_heads=32),
         "layer_2": new_kv_cache_spec(num_kv_heads=32),
@@ -1596,6 +1597,7 @@ def test_get_kv_cache_config_one_worker():
             KVCacheTensor(size=mem_per_block_per_layer * 32, shared_by=["layer_2"]),
         ],
         kv_cache_groups=[
+            #
             KVCacheGroupSpec(
                 ["layer_1", "layer_2"], new_kv_cache_spec(sliding_window=1)
             ),
@@ -1611,6 +1613,7 @@ def test_get_kv_cache_config_one_worker():
     kv_cache_config_hybrid = get_kv_cache_configs(
         vllm_config, [kv_cache_specs_hybrid], [mem_per_block_per_layer * 2 * 32]
     )[0]
+    #
     assert kv_cache_config_hybrid == KVCacheConfig(
         num_blocks=64,
         kv_cache_tensors=[
@@ -1757,6 +1760,7 @@ def test_get_kv_cache_config_one_worker():
     )
 
     # different hidden size but same type, use UniformTypeKVCacheSpecs
+    # ⚠️
     kv_cache_specs_hybrid = {
         "layer_1": new_kv_cache_spec(head_size=128),
         "layer_2": new_kv_cache_spec(head_size=64),
@@ -1781,6 +1785,7 @@ def test_get_kv_cache_config_one_worker():
     )
 
     # Different hidden size and different type, align by different block size
+    # ⚠️
     kv_cache_specs_hybrid = {
         "layer_1": new_kv_cache_spec(head_size=64),
         "layer_2": new_sliding_window_spec(head_size=32),
@@ -1798,11 +1803,13 @@ def test_get_kv_cache_config_one_worker():
         kv_cache_groups=[
             KVCacheGroupSpec(["layer_1"], new_kv_cache_spec(head_size=64)),
             KVCacheGroupSpec(
+                # block_size = 32
                 ["layer_2"], new_sliding_window_spec(head_size=32, block_size=32)
             ),
         ],
     )
 
+    # ⚠️
     # different hidden size that cannot be aligned by using different block size,
     # but can be aligned by padding the smaller physical page.
     swa_spec = new_sliding_window_spec(head_size=96, indexes_kv_by_block_stride=True)
@@ -1818,6 +1825,7 @@ def test_get_kv_cache_config_one_worker():
     assert kv_cache_config_hybrid == KVCacheConfig(
         num_blocks=42,
         kv_cache_tensors=[
+            # ⚠️
             KVCacheTensor(size=padded_page_size * 42, shared_by=["layer_1", "layer_2"]),
         ],
         kv_cache_groups=[
@@ -1901,6 +1909,7 @@ def test_generate_uniform_type_kv_cache_specs():
         block_size=16, kv_cache_specs=kv_cache_specs
     )
 
+    # ⚠️
     # different block sizes, cannot be merged
     kv_cache_specs = {
         "layer_1": new_kv_cache_spec(block_size=16),
@@ -1912,6 +1921,7 @@ def test_generate_uniform_type_kv_cache_specs():
 
 def test_generate_scheduler_kv_cache_config():
     kv_cache_specs = {
+        # head_size=64
         "layer_1": new_kv_cache_spec(),
         "layer_2": new_kv_cache_spec(head_size=128),
     }
@@ -1933,6 +1943,7 @@ def test_generate_scheduler_kv_cache_config():
     assert scheduler_kv_cache_config == KVCacheConfig(
         num_blocks=10,
         kv_cache_tensors=[],
+        # ？
         kv_cache_groups=[KVCacheGroupSpec(["layer_1", "layer_2"], new_kv_cache_spec())],
     )
 
@@ -2418,6 +2429,7 @@ def test_unify_kv_cache_page_size_padding_requires_backend_support():
 
 
 def test_unify_hybrid_kv_cache_specs():
+    # ⚠️
     # 1. has_full_attention and has_sliding_window
     before_spec_1 = new_kv_cache_spec()
     before_spec_2 = new_sliding_window_spec(

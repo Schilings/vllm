@@ -115,13 +115,16 @@ def execute_in_parallel(
         if fn is None:
             continue
         with torch.cuda.stream(aux_streams[i]):
+            # 并行，只需要看start event就好了
             start_event.wait()
             aux_results[i] = fn()
+            # 在stream record自己的event，标记完成
             done_events[i].record()
         pending.append(done_events[i])
 
     default_result = default_fn()
 
+    # 同步等待完成
     for ev in pending:
         ev.wait()
 

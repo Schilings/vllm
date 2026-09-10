@@ -1012,6 +1012,8 @@ def _get_kv_cache_groups_uniform_spec(
         The generated KVCacheGroupSpecs
     """
 
+    # list(kv_cache_specs.keys()) => 所有layer分到一个group里
+    # 返回一个 [ KVCacheGroupSpec ]
     return create_kv_cache_group_specs(kv_cache_specs, [list(kv_cache_specs.keys())])
 
 
@@ -1077,6 +1079,7 @@ def unify_kv_cache_spec_page_size(
         if layer_spec.page_size_bytes == max_page_size:
             new_kv_cache_spec[layer_name] = layer_spec
         else:
+            # ⚠️ 如果page size不一致
             layer_page_size = layer_spec.page_size_bytes
             if max_page_size % layer_page_size == 0:
                 ratio = max_page_size // layer_page_size
@@ -1235,19 +1238,83 @@ def _bucket_layers_by_page_size(
     Layers from different groups at the same ``slot_idx`` share an underlying tensor
     (they have independent block tables so block-id namespaces never collide).
     """
+    """
+    1️⃣假设有 2 个 group，layer 的 page_size 如下：
+        Group 0:  L0(大=100)  L1(小=20)  L2(大=100)
+                   ↑           ↑         ↑
+        Group 1:  L3(大=100)  L4(小=20)  L5(大=100)  L6(小=20)
+    2️⃣buckets = {
+                100: [ [L0, L3],     # slot 0：两个 group 的"第1个大页 layer"
+                       [L2, L5] ],   # slot 1：两个 group 的"第2个大页 layer"
+                20: [ [L1, L4],     # slot 0：两个 group 的"第1个小页 layer"
+                      [L6]     ],   # slot 1：只有 Group1 有第2个小页 layer
+              }
+    3️⃣一个物理 block 的内存布局（block_stride = 各桶尺寸之和）：
+     ┌──────────100─────────┬──────────100─────────┬────20───┬────20───┐
+     │  buckets[100][0]     │  buckets[100][1]     │ [20][0] │ [20][1] │
+     │  L0/L3 共享           │  L2/L5 共享           │ L1/L4   │  L6     │
+     └──────────────────────┴──────────────────────┴─────────┴─────────┘
+     offset=0               offset=100             offset=200 offset=220
+
+    [L0, L3] 为什么能挤进同一段内存而不冲突？
+    因为所有 group 共用同一个全局 BlockPool，block-id 全局唯一：任一 id
+    同一时刻只属于一个 group（总需求 = 各组之和，见 coordinator 的
+    get_num_blocks_to_allocate）。L0(Group0) 只写自己领到的那些行，
+    L3(Group1) 只写另一批行——同一张量、行集合互斥，物理上永不相撞。
+    反过来，同一个 group 内的两个大页 layer（L0、L2）不能共享同一 slot：
+    它们共用一张 block table，同一个 block-id 对两层意味着同一段字节，
+    会互相覆盖，所以被排到 slot 0 和 slot 1 两个不同的桶。
+
+    ============================================================
+    ⚠️ DeepSeek-V4 真实示例（这才是 packed 布局的主力场景）
+    ============================================================
+    区别: DeepSeek-V4 只有 2 个 group, 但每个 group 是
+    UniformTypeKVCacheSpecs —— 同一个 group 内部各 layer 的 page_size 不同
+    取 n_c4=2, n_c128=1, n_swa=3 (n_swa = n_c4 + n_c128,
+    SWA 组层数与 MLA 组的 c4+c128 层数一一对应; page_size 单位: 字节):
+        Group 0 (mla_group):
+            c4_mla.0 (37440)  c4_idx.0 (8640)
+            c4_mla.1 (37440)  c4_idx.1 (8640)
+            c128_mla.0 (1728)
+        Group 1 (swa_group):
+            swa.0 (37440)     swa.1 (37440)     swa.2 (37440)
+
+    最终 buckets:
+        37440: [ [c4_mla.0, swa.0],    # slot0: 跨 group 共享
+                 [c4_mla.1, swa.1],    # slot1: 跨 group 共享
+                 [swa.2] ]             # slot2: 只有 Group1 (第3个大页)
+         8640: [ [c4_idx.0],           # slot0: 只有 Group0
+                 [c4_idx.1] ]          # slot1: 只有 Group0
+         1728: [ [c128_mla.0] ]        # slot0: 只有 Group0
+
+        ⚠️ 一个物理 block 的内存布局 ==> 放了所有layer同个block的kv cache
+        (block_stride = 37440*3 + 8640*2 + 1728 = 131328):
+         ┌────37440─────┬────37440─────┬───37440─────┬──8640───┬──8640───┬─1728─┐
+         │ [37440][0]   │ [37440][1]   │[37440][2]   │[8640][0]│[8640][1]│[1728]│
+         │c4_mla.0/swa.0│c4_mla.1/swa.1│ swa.2       │c4_idx.0 │c4_idx.1 │c128.0│
+         └──────────────┴──────────────┴─────────────┴─────────┴─────────┴──────┘
+         off=0          off=37440       off=74880    off=112320 off=120960 off=129600
+        
+         ⚠️ 这里是 c4_mla.0/swa.0 是 或 的关系，不是 和 的关系！！！！！！ 
+    """
+    # ⚠️ result[page_size][slot_idx] = [能共用同一块底层张量的 layer 名单]
     buckets: dict[int, list[list[str]]] = defaultdict(list)
     for group in kv_cache_groups:
         spec = group.kv_cache_spec
+        # ⚠️ 统计这个group的不同layer的采取的page size的频数
         slot_count: dict[int, int] = defaultdict(int)
         for layer_name in group.layer_names:
             if isinstance(spec, UniformTypeKVCacheSpecs):
                 ps = spec.kv_cache_specs[layer_name].page_size_bytes
             else:
+                # 如果是正常hybrid，每层的page size完全一致
                 ps = spec.page_size_bytes
             slot_idx = slot_count[ps]
             slot_count[ps] += 1
+            # ⚠️ ！！
             if slot_idx == len(buckets[ps]):
                 buckets[ps].append([])
+            #
             buckets[ps][slot_idx].append(layer_name)
     return buckets
 
@@ -1286,22 +1353,85 @@ def _get_kv_cache_config_packed(
     tables so block-id namespaces never collide). Each emitted tensor aliases
     one physical backing allocation, with per-block data laid out contiguously.
     """
+    """
+        1️⃣假设有 2 个 group，layer 的 page_size 如下：
+            Group 0:  L0(大=100)  L1(小=20)  L2(大=100)
+                       ↑           ↑         ↑
+            Group 1:  L3(大=100)  L4(小=20)  L5(大=100)  L6(小=20)
+        2️⃣buckets = {
+                    100: [ [L0, L3],     # slot 0：两个 group 的"第1个大页 layer"
+                           [L2, L5] ],   # slot 1：两个 group 的"第2个大页 layer"
+                    20: [ [L1, L4],     # slot 0：两个 group 的"第1个小页 layer"
+                          [L6]     ],   # slot 1：只有 Group1 有第2个小页 layer
+                  }
+        3️⃣一个物理 block 的内存布局（block_stride = 各桶尺寸之和）：
+         ┌─────────100x2────────┬─────────100x2────────┬───20x2──┬────20───┐
+         │  buckets[100][0]     │  buckets[100][1]     │ [20][0] │ [20][1] │
+         │  L0/L3 共享           │  L2/L5 共享           │ L1/L4   │  L6     │
+         └──────────────────────┴──────────────────────┴─────────┴─────────┘
+         offset=0
+
+        [L0, L3] 为什么能挤进同一段内存而不冲突？
+        因为它们来自不同 group，各自有独立的 block table（独立的 block-id 命名空间）。
+        同一时刻，Group0 用 block-id=5、Group1 也用 block-id=5，但它们指向的是不同物理 block——block table 映射不同，永不撞车。
+        反过来，同一个 group 内的两个大页 layer（L0、L2）不能共享，因为它们共用一张 block table，block-id=5 对两者是同一块，会互相覆盖
+        所以它们被分到 slot 0 和 slot 1 两个不同的桶。
+
+        ============================================================
+        ⚠️ DeepSeek-V4 真实示例（这才是 packed 布局的主力场景）
+        ============================================================
+        区别: DeepSeek-V4 只有 2 个 group, 但每个 group 是
+        UniformTypeKVCacheSpecs —— 同一个 group 内部各 layer 的 page_size 不同
+        取 n_c4=2, n_c128=1, n_swa=3 (n_swa = n_c4 + n_c128,
+        SWA 组层数与 MLA 组的 c4+c128 层数一一对应; page_size 单位: 字节):
+            Group 0 (mla_group):
+                c4_mla.0 (37440)  c4_idx.0 (8640)
+                c4_mla.1 (37440)  c4_idx.1 (8640)
+                c128_mla.0 (1728)
+            Group 1 (swa_group):
+                swa.0 (37440)     swa.1 (37440)     swa.2 (37440)
+
+        最终 buckets:
+            37440: [ [c4_mla.0, swa.0],    # slot0: 跨 group 共享
+                     [c4_mla.1, swa.1],    # slot1: 跨 group 共享
+                     [swa.2] ]             # slot2: 只有 Group1 (第3个大页)
+             8640: [ [c4_idx.0],           # slot0: 只有 Group0
+                     [c4_idx.1] ]          # slot1: 只有 Group0
+             1728: [ [c128_mla.0] ]        # slot0: 只有 Group0
+
+        ⚠️ 一个物理 block 的内存布局 ==> 放了所有layer同个block的kv cache
+        (block_stride = 37440*3 + 8640*2 + 1728 = 131328):
+         ┌────37440─────┬────37440─────┬───37440─────┬──8640───┬──8640───┬─1728─┐
+         │ [37440][0]   │ [37440][1]   │[37440][2]   │[8640][0]│[8640][1]│[1728]│
+         │c4_mla.0/swa.0│c4_mla.1/swa.1│ swa.2       │c4_idx.0 │c4_idx.1 │c128.0│
+         └──────────────┴──────────────┴─────────────┴─────────┴─────────┴──────┘
+         off=0          off=37440       off=74880    off=112320 off=120960 off=129600
+        
+         ⚠️ 这里是 c4_mla.0/swa.0 是 或 的关系，不是 和 的关系！！！！！！
+    """
     # buckets = {page_size: [[layer_names], [layer_names], ...]}
     buckets = _bucket_layers_by_page_size(kv_cache_groups)
     total_num_bytes_per_block = sum(ps * len(slots) for ps, slots in buckets.items())
-
+    # ⚠️ 一个物理 block 的内存布局 ==> 放了所有layer同个block的kv cache
+    # ⚠️⚠️⚠️ 这种设计就是： 同样的block，可以通用，不同group的kv可以拿去存储！！！！
+    # ⚠️⚠️⚠️ 例如dsv4，两种kv group( Uniform(CSA+CIA+HCA), Uniform(SWA) ) 都可以直接拿这种 block 进行存储
+    # ⚠️⚠️⚠️ 缺点就是：可能每个block都存在显存浪费！！！！
     num_blocks = available_memory // total_num_bytes_per_block
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
 
     total_size = total_num_bytes_per_block * num_blocks
 
+    # ⚠️ 整个kv cache放在一个大Tensor里，但是要告诉每个group的每个layer各自怎么访问
     kv_cache_tensors: list[KVCacheTensor] = []
     byte_offset = 0
     for ps, slots in buckets.items():
         for slot in slots:
             kv_cache_tensors.append(
                 KVCacheTensor(
+                    # ⚠️ size都是一样的！
+                    # ⚠️ 通过 block_id * total_num_bytes_per_block + offset来访问自己的部分
                     size=total_size,
+                    # ⚠️ slot0 = [c4_mla.0, swa.0]、slot1 = [c4_mla.1, swa.1], slot2 = [swa.2]
                     shared_by=slot,
                     offset=byte_offset,
                     block_stride=total_num_bytes_per_block,
@@ -1340,7 +1470,7 @@ def get_kv_cache_config_from_groups(
             kv_cache_groups=kv_cache_groups,
         )
 
-    # 从 groups 构建 KVCacheConfig(num_blocks, kv_cache_tensors)。
+    # ⚠️ 从 groups 构建 KVCacheConfig(num_blocks, kv_cache_tensors)。
     # 三种布局分支: A) 单 uniform group  B) packed(DSv4)  C) general 混合。
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
@@ -1348,6 +1478,8 @@ def get_kv_cache_config_from_groups(
         # Special case: all layers have the same type of KV cache but with
         # different hidden sizes. Allocate different amount of memory for each
         # layer based on its hidden size.
+        # 1️⃣ 单 uniform group：不同layer的page_size_bytes可能不同。
+        #   因此将单个block的所有layer的page融合在一个block里，page_size_bytes = sum(layer's page_size_bytes)
         num_blocks = (
             available_memory // kv_cache_groups[0].kv_cache_spec.page_size_bytes
         )
@@ -1363,9 +1495,11 @@ def get_kv_cache_config_from_groups(
     elif _use_packed_kv_cache_config(vllm_config, kv_cache_groups):
         # DeepSeek V4 uses the packed layout by default. Other multi-group
         # layouts can opt in with --enable-cross-layers.
+        # 2️⃣ DSv4 or 开启packed( enable_cross_layers_blocks )
         num_blocks, kv_cache_tensors = _get_kv_cache_config_packed(
             vllm_config, kv_cache_groups, available_memory
         )
+
     else:
         # General case:
         # We will have group_size memory pools, each is shared by one layer from
@@ -1375,8 +1509,10 @@ def get_kv_cache_config_from_groups(
         # (sw.1, padding) will be: (group_size = 2)
         # full.0, sw.0, sw.1: share a Tensor with size=available_memory//2
         # full.1, sw.2: share another Tensor with size=available_memory//2
-        group_size = max(len(group.layer_names) for group in kv_cache_groups)
 
+        # 3️⃣ general 混合。
+        group_size = max(len(group.layer_names) for group in kv_cache_groups)
+        # ⚠️ 强制所有group的page size完全一致！
         page_size = get_uniform_page_size(
             [group.kv_cache_spec for group in kv_cache_groups]
         )
@@ -1501,37 +1637,116 @@ def group_and_unify_kv_cache_specs(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[UniformTypeKVCacheSpecs] | None:
     """
-    Group the KV cache specs and unify each group into one UniformTypeKVCacheSpecs.
-    Currently, this is only used for DeepseekV4.
+    将 KV cache spec 按注意力类型分组，每组合并为一个 UniformTypeKVCacheSpecs。
+    目前仅用于 DeepSeekV4。
+
+    DeepSeekV4 一个 transformer block 内同时注册了多类 KV cache 层（compress_ratio
+    不同，key 的数量也不同），因此输入字典并非"每层 2 个 key"，而是按层类型变化：
+
+      - compress_ratio > 1（C4A / C128A，主压缩注意力层）：
+          主 KV   `model.layers.{i}.self_attn`              → MLAAttentionSpec
+          SWA     `model.layers.{i}.self_attn.swa_cache`    → SlidingWindowMLASpec(block_size=64)
+          state   `model.layers.{i}.self_attn.compressor.state_cache`
+                                                            → SlidingWindowMLASpec(block_size=4 或 8)
+          （仅 C4A，compress_ratio==4 才有 indexer）
+          indexer `model.layers.{i}.self_attn.indexer.k_cache` → MLAAttentionSpec(compress_ratio=1)
+      - compress_ratio <= 1（SWA-only 层）：主 KV 的 get_kv_cache_spec() 返回 None，
+          只贡献 1 个 key：swa_cache（SlidingWindowMLASpec）。
+
+    输入示例（一个 C4A 层 + 一个 SWA-only 层；C4A 层共 5 个 key）：
+      kv_cache_spec = {
+          "model.layers.0.self_attn":            MLAAttentionSpec(block_size=BS,
+                                                  compress_ratio=4, model_version="deepseek_v4", ...),
+          "model.layers.0.self_attn.swa_cache":  SlidingWindowMLASpec(block_size=64,
+                                                  sliding_window=WS, ...),
+          "model.layers.0.self_attn.compressor.state_cache":
+                                                SlidingWindowMLASpec(block_size=4,
+                                                  sliding_window=8, ...),
+          "model.layers.0.self_attn.indexer.k_cache":
+                                                MLAAttentionSpec(block_size=BS,
+                                                  compress_ratio=1, ...),
+          # ⚠️ 第 5 类：indexer 内部也持有自己的 CompressorStateCache，仅 C4A 层存在。
+          # 其 (block_size=4, sliding_window=8) 与主 compressor state 完全相同，故在
+          # 下方按 (block_size, sliding_window) 分桶时被归入同一组（输出示例 ③）。
+          "model.layers.0.self_attn.indexer.compressor.state_cache":
+                                                SlidingWindowMLASpec(block_size=4,
+                                                  sliding_window=8, ...),
+          "model.layers.1.self_attn.swa_cache": SlidingWindowMLASpec(block_size=64,
+                                                  sliding_window=WS, ...),
+          ...
+      }
+
+    输出示例（真实返回 4 个 UniformTypeKVCacheSpecs，顺序固定）：
+      [
+          UniformTypeKVCacheSpecs(kv_cache_specs={  # ① 全 MLA 组：主压缩 KV + indexer KV
+              "model.layers.0.self_attn":            MLAAttentionSpec(...),
+              "model.layers.0.self_attn.indexer.k_cache": MLAAttentionSpec(...),
+              ...
+          }),
+          UniformTypeKVCacheSpecs(kv_cache_specs={  # ② SWA 组 (block_size=64, 同窗口)
+              "model.layers.0.self_attn.swa_cache":  SlidingWindowMLASpec(...),
+              "model.layers.1.self_attn.swa_cache":  SlidingWindowMLASpec(...),
+              ...
+          }),
+          UniformTypeKVCacheSpecs(kv_cache_specs={  # ③ C4 压缩状态组 (block_size=4, sliding_window=8)
+              # 注意：同一 C4A 层里有两份 CompressorStateCache，且 (block_size=4, sliding_window=8) 完全相同，故被分桶到同一组（head_dim 不同但允许）：
+              #   - 主 compressor 的（head_dim=512 路径）
+              #   - indexer 内 compressor 的（head_dim=128 路径，key 含 .indexer.）
+              "model.layers.0.self_attn.compressor.state_cache": SlidingWindowMLASpec(...),
+              "model.layers.0.self_attn.indexer.compressor.state_cache": SlidingWindowMLASpec(...),
+              ...
+          }),
+          UniformTypeKVCacheSpecs(kv_cache_specs={  # ④ C128 压缩状态组 (block_size=8)
+              "model.layers.{j}.self_attn.compressor.state_cache": SlidingWindowMLASpec(...),
+              ...
+          }),
+      ]
+    注：②/③/④ 是否都存在取决于模型实际含哪些 compress_ratio；它们都由下方
+    按 (block_size, sliding_window) 的 SWA 分桶逻辑自动产生。
     """
+    # 仅 DeepSeekV4 会同时包含 SlidingWindowMLASpec + MLAAttentionSpec。
+    # 其他模型直接返回 None，走 get_kv_cache_groups 的下一条分支。
     if not any(
         isinstance(spec, SlidingWindowMLASpec) for spec in kv_cache_spec.values()
     ):
         return None
 
+    # 收集全部 MLA 全注意力层（主压缩 KV + indexer KV，两者都是 MLAAttentionSpec）。
+    # 它们 token 数需求相同，被合并到同一个组（返回值第 ① 组）。
     mla_specs: dict[str, KVCacheSpec] = {}
+    # 按 (block_size, sliding_window) 对 SWA MLA 层分组。
+    # 不同 window size 或不同 block_size 的 SWA 层各自成组。
+    # 例如 SWA 层 [swa_cache(64,WS)] 与 [C4-state(4,16)] 与 [C128-state(8,1024)]
+    # 因 (block_size, sliding_window) 不同，被分到不同的组（返回值 ②/③/④）。
     grouped_swa_mla_specs: dict[tuple[int, int], dict[str, KVCacheSpec]] = defaultdict(
         dict
     )
-    # NOTE: Here we group SWA layers by (block_size, sliding_window), which separates
-    # SWA layers, C4I+C4A layers, and C128A layers into three different groups. It can
-    # be fragile with only block_size and sliding_window as keys, but fine for now.
+    # NOTE: 这里按 (block_size, sliding_window) 对 SWA 层分组，能够把 swa_cache 层、
+    # C4-state 层、C128-state 层分别分到不同组。仅用 block_size 和 sliding_window
+    # 作为 key 比较脆弱，但目前够用。
     for name, spec in kv_cache_spec.items():
         if isinstance(spec, SlidingWindowMLASpec):
+            # SWA 层按 (block_size, sliding_window) 分桶。
+            # 例如 (64, WS) → SWA 组, (4, 16) → C4-state 组, (8, 1024) → C128-state 组。
             grouped_swa_mla_specs[(spec.block_size, spec.sliding_window)][name] = spec
         elif isinstance(spec, MLAAttentionSpec):
+            # 全 MLA 层（含 indexer KV）放入同一个 dict，最终合并为一个 UniformTypeKVCacheSpecs。
             mla_specs[name] = spec
 
     assert len(mla_specs) > 0
+    # 所有 MLA 全注意力层统一为一个 UniformTypeKVCacheSpecs。
     mla_uniform_spec = UniformTypeKVCacheSpecs.from_specs(mla_specs)
     assert mla_uniform_spec is not None
 
+    # 每组 SWA MLA 层各自统一为一个 UniformTypeKVCacheSpecs。
     swa_uniform_specs: list[UniformTypeKVCacheSpecs] = []
     for spec_dict in grouped_swa_mla_specs.values():
+        # 同一 (block_size, sliding_window) 的层合并为一个 UniformType。
         uniform_spec = UniformTypeKVCacheSpecs.from_specs(spec_dict)
         assert uniform_spec is not None
         swa_uniform_specs.append(uniform_spec)
 
+    # 返回值顺序固定：第一个是全 MLA 组，后面依次为各组 SWA MLA（按分桶顺序）。
     return [mla_uniform_spec, *swa_uniform_specs]
 
 
@@ -1581,6 +1796,7 @@ def _get_kv_cache_groups_uniform_groups(
     )
     # For now, we restrict the first grouped_spec to be UniformTypeKVCacheSpecs
     # containing only MLAAttentionSpec.
+    # ⚠️ DeepSeek V4强制MLA
     full_mla_spec = grouped_specs[0]
     assert all(
         isinstance(spec, MLAAttentionSpec)
@@ -1591,25 +1807,30 @@ def _get_kv_cache_groups_uniform_groups(
         kv_cache_spec=full_mla_spec,
     )
 
-    # We define a layer tuple as a group of layers with different page sizes, and
-    # one UniformTypeKVCacheSpecs contains a list of layer tuples.
-    # For example, if we have 11 C4 layers and 10 C128 layers, we can define a layer
-    # tuple as [C4I, C4A, C128], and the full_mla_group will contain "11" layer tuples.
-    # The other uniform KV cache specs will be similarly partitioned into layer tuples.
-    # Say we have 21 SWA layers, all with the same page size, then we will have "21"
-    # layer tuples.
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Step 1: 对齐各 group 的 layer tuple 数量。
+    # 一个 layer tuple = 每种 page_size 的层各取一个，例如：
+    #   full MLA group: 11个 C4 层 + 10个 C128 层 → 11个 layer tuple
+    #                   (每个 tuple = [C4I, C4A, C128]，C128 不足 11 的用 padding 补)
+    #   SWA group:      21层全部相同 page_size → 21个 layer tuple
+    # ═══════════════════════════════════════════════════════════════════════════
     num_layer_tuples_per_group: list[int] = [
         g_spec.get_num_layer_tuples() for g_spec in grouped_specs
     ]
-    # Choose `num_layer_tuples` to minimize total padding across groups.
+    # 用近似 GCD 找一个统一的 num_layer_tuples，使得各 group 向上取整后的
+    # 总 padding 最小。full MLA group 的 tuple 数作为下界（不能少于此值）。
     num_layer_tuples = _approximate_gcd(
         num_layer_tuples_per_group, lower_bound=num_layer_tuples_per_group[0]
     )
-    # Round up to the nearest multiple of `num_layer_tuples` (i.e., padding)
+    # 各组 tuple 数向上对齐到 num_layer_tuples 的整数倍（不足的用 padding 补）。
     num_layer_tuples_per_group = [
         round_up(x, num_layer_tuples) for x in num_layer_tuples_per_group
     ]
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Step 2: 对每个 SWA group，先将各层的 page_size 对齐到全 MLA group 的
+    # 对应 page_size，再将层按 num_layer_tuples 切分为多个子 group。
+    # ═══════════════════════════════════════════════════════════════════════════
     swa_mla_specs = grouped_specs[1:]
     assert all(
         isinstance(spec, SlidingWindowMLASpec)
@@ -1617,48 +1838,53 @@ def _get_kv_cache_groups_uniform_groups(
         for spec in group.kv_cache_specs.values()
     )
 
-    # Split each SWA UniformKV group into smaller groups to align their #(layer tuples)
-    # Possibly padding layer tuples for this.
-    # Additionally, we also pad KV blocks in each SWA layer, to align the page size
-    # with the corresponding layer in the full-MLA group.
+    # 全 MLA group 的所有不重复 page_size（如 [C4, C128]），
+    # 后续 SWA 层的 page 会被填充到这些值之一。
     all_page_sizes = full_mla_spec.get_page_sizes()
     swa_mla_groups = []
     for sm_spec in swa_mla_specs:
         sm_page_sizes = sm_spec.get_page_sizes()
         layers_per_size: dict[int, list[str]] = defaultdict(list)
+        # SWA page 不能超过 MLA page，否则 packed layout 交错时无法对齐。
         assert max(sm_page_sizes) <= max(all_page_sizes)
 
-        # Unify page size by padding layers' page_size to the nearest larger page_size.
-        # Compute candidate (nearest larger page_size) for each unique page size.
+        # ── Step 2a: 为每个 SWA page_size 找到最近的、不小于它的 MLA page_size ──
         size_to_candidate: dict[int, int] = {}
         for ps in sm_page_sizes:
             size_to_candidate[ps] = min(x for x in all_page_sizes if x >= ps)
-        # Pad and collect layer names per page size.
+        # ── Step 2b: 将 SWA 各层的 page_size 填充到目标值，并按目标大小分组 ──
         for layer_name, layer_spec in sm_spec.kv_cache_specs.items():
             current_size = layer_spec.page_size_bytes
             candidate = size_to_candidate[current_size]
             if current_size < candidate:
+                # 填充：page 实际字节不够，用 page_size_padded 补齐到 candidate。
                 object.__setattr__(layer_spec, "page_size_padded", candidate)
             layers_per_size[candidate].append(layer_name)
-        # NOTE(yifan): for now, inside a UniformKV group, each page_size should
-        # have the same number of layers. This also means we don't need to pad layers
-        # inside a partial-full layer tuple.
+        # NOTE(yifan): 当前约束：同一 SWA group 内，每种 page_size 对应的层数
+        # 必须相同。这样不需要在部分 layer tuple 中做 layer 级别的 padding。
         assert len(set(len(layers) for layers in layers_per_size.values())) == 1
         num_layers_per_size = len(next(iter(layers_per_size.values())))
 
-        # Split layers inside each UniformKV group for aligned #(layers).
-        # See `_get_kv_cache_groups_uniform_page_size` for more details.
+        # ── Step 2c: 将层按 num_layer_tuples 切分为多个子 group ──
+        # 例如 num_layers_per_size=30, num_layer_tuples=10 → num_tuple_groups=3
+        # 把 30 层等分到 3 个 group，每个 group 含 10 个 layer tuple。
         num_tuple_groups = cdiv(num_layers_per_size, num_layer_tuples)
+        # zip: 将每种 page_size 的层一一配对，形成 layer tuple 列表。
+        # layers_per_size = {1000: [L0,L1,L2], 2000: [L3,L4,L5]}
+        # → layer_tuples = [(L0,L3), (L1,L4), (L2,L5)]  每个元组是一个 layer tuple
         layer_tuples = list(zip(*layers_per_size.values()))
         for i in range(num_tuple_groups):
+            # 步长交错取 tuple：group 0 取 index 0,3,6..., group 1 取 index 1,4,7...
+            # 这样每个子 group 的层分布均匀，便于后续 parallel dispatch。
             group_layer_tuples = layer_tuples[i::num_tuple_groups]
-            # Flatten tuples and build dict for from_specs
+            # 把嵌套的 tuple 展平为一维 layer name 列表。
             group_layer_names = [
                 name for layer_tuple in group_layer_tuples for name in layer_tuple
             ]
             group_layer_specs = {
                 name: sm_spec.kv_cache_specs[name] for name in group_layer_names
             }
+            # 子 group 内部所有层同类型（SlidingWindowMLASpec），可合并为 UniformType。
             sub_sm_spec = UniformTypeKVCacheSpecs.from_specs(group_layer_specs)
             assert sub_sm_spec is not None
             swa_mla_groups.append(
@@ -1708,54 +1934,87 @@ def get_kv_cache_groups(
     Returns:
         The generated KVCacheGroups
     """
-    # 本函数是一个"分流器"：根据各层 KV cache spec 的混合程度，把模型所有层
-    # 归并成若干个 KVCacheGroupSpec。输入 kv_cache_spec 是 {层名: 该层KVCacheSpec}
-    # 的字典。下面依次判断：关闭hybrid / 无注意力 / 全uniform / 同类型异hidden /
-    # DeepSeekV4 / 通用混合(如 Full+SWA)，逐级收窄到合适的分组策略。
+    # 输入 kv_cache_spec 是每一层对应的KVCacheSpec {层名: 该层KVCacheSpec}的字典。
+    # 老路径（扁平化）：把所有 SlidingWindowSpec 强制转成 FullAttentionSpec，
+    # 使所有层共用同一张 block table（窗口限制由 attention metadata 兜底）。
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
-        # 老路径（扁平化）：把所有 SlidingWindowSpec 强制转成 FullAttentionSpec，
-        # 使所有层共用同一张 block table（窗口限制由 attention metadata 兜底）。
         unify_hybrid_kv_cache_specs(kv_cache_spec)
 
+    # 无注意力模型（kv_cache_spec 为空字典）：返回空列表，交由 KVCacheManager 特殊处理。
     if is_kv_cache_type_attention_free(kv_cache_spec):
-        # 无注意力模型（kv_cache_spec 为空字典）：返回空列表，
-        # 交由 KVCacheManager 特殊处理。
         # This returns an empty list to allow for the KVCacheManager to handle
         # attention free models.
         return []
 
+    # ⚠️ 所有层 spec 完全相同（注意：带/不带 sliding window 的 FullAttentionSpec被视为同一类型）。
+    # 绝大多数模型走这里：所有层放进 1 个 group。返回一个 [ KVCacheGroupSpec(一个KVCacheSpec) ]
     if is_kv_cache_spec_uniform(kv_cache_spec):
-        # 所有层 spec 完全相同（注意：带/不带 sliding window 的 FullAttentionSpec
-        # 被视为同一类型）。绝大多数模型走这里：所有层放进 1 个 group。
         # KV cache of all layers are the same, which is true for
         # most models. Allocate the same amount of memory for
         # each layer.
         return _get_kv_cache_groups_uniform_spec(kv_cache_spec)
+
+    # ⚠️ 所以KVCacheSpec的父基类相同 且 block_size一致。
+    # 所有层 attention 类型相同（如全是 Full，或全是窗口一致的 SWAs算Full，或者MLA也算Full），只是 hidden size 可能不同。
+    #  仍合并成 1 个 group，但 group spec 保留逐层差异。 返回一个 [ KVCacheGroupSpec( 一个UniformTypeKVCacheSpecs ) ]
     elif uniform_spec := UniformTypeKVCacheSpecs.from_specs(kv_cache_spec):
-        # 所有层 attention 类型相同（如全是 Full，或全是窗口一致的 SWA），
-        # 只是 hidden size 可能不同。from_specs 仅在类型一致时返回非 None。
-        # 仍合并成 1 个 group，但 group spec 保留逐层差异。
         # All layers need the same number of token slots (e.g., all layers are
         # full attention, or all layers are sliding window attention with the
         # same window size). Put all layers into one group.
         return _get_kv_cache_groups_uniform_type(uniform_spec)
+
+    # ⚠️ DeepSeekV4 特例：所有层 token 数需求相同，但类型/窗口尺寸各异（MLA + 多种 SWA）。
+    # ❗️❗️❗️❗️group_and_unify_kv_cache_specs很重要！❗️❗️❗️❗️
+    #     输出示例（真实返回 4 个 UniformTypeKVCacheSpecs，顺序固定）：
+    #       [
+    #           UniformTypeKVCacheSpecs(kv_cache_specs={  # ① 全 MLA 组：主压缩 KV + indexer KV
+    #               "model.layers.0.self_attn":            MLAAttentionSpec(...),
+    #               "model.layers.0.self_attn.indexer.k_cache": MLAAttentionSpec(...),
+    #               ...
+    #           }),
+    #           UniformTypeKVCacheSpecs(kv_cache_specs={  # ② SWA 组 (block_size=64, 同窗口)
+    #               "model.layers.0.self_attn.swa_cache":  SlidingWindowMLASpec(...),
+    #               "model.layers.1.self_attn.swa_cache":  SlidingWindowMLASpec(...),
+    #               ...
+    #           }),
+    #           UniformTypeKVCacheSpecs(kv_cache_specs={  # ③ C4 压缩状态组 (block_size=4, sliding_window=8)
+    #               # 注意：同一 C4A 层里有两份 CompressorStateCache，且 (block_size=4, sliding_window=8) 完全相同，故被分桶到同一组（head_dim 不同但允许）：
+    #               #   - 主 compressor 的（head_dim=512 路径）
+    #               #   - indexer 内 compressor 的（head_dim=128 路径，key 含 .indexer.）
+    #               "model.layers.0.self_attn.compressor.state_cache": SlidingWindowMLASpec(...),
+    #               "model.layers.0.self_attn.indexer.compressor.state_cache": SlidingWindowMLASpec(...),
+    #               ...
+    #           }),
+    #           UniformTypeKVCacheSpecs(kv_cache_specs={  # ④ C128 压缩状态组 (block_size=8)
+    #               "model.layers.{j}.self_attn.compressor.state_cache": SlidingWindowMLASpec(...),
+    #               ...
+    #           }),
+    #       ]
     elif grouped_specs := group_and_unify_kv_cache_specs(kv_cache_spec):
-        # DeepSeekV4 特例：所有层 token 数需求相同，但类型/窗口尺寸各异
-        # （MLA + 多种 SWA）。按 layer-tuple 切分成多个 UniformTypeKVCacheSpecs。
         # DeepseekV4 case: All layers need the same number of token slots,
         # yet some layers are full attention while others are sliding window
         # attention in different sizes. Need to group layers into multiple
         # UniformTypeKVCacheSpecs.
+        #  ⚠️ DeepSeekV4 特例：所有layer所需的token slots数完全一致
+        # 最终 KVCacheGroupSpec 列表（共 1 + 3×2 = 7 个）：
+        #   ├─ [0] full_mla_group           # ① 整体 = 所有 MLA 类层（C4主KV+C128主KV+indexer KV），
+        #   │                               #   作为一个 UniformTypeKVCacheSpecs，含 11 个 tuple
+        #   ├─ [1] swa_64_subgroup_0        # ② 的一部分（前 11 个 tuple 的 swa_cache 层）
+        #   ├─ [2] swa_64_subgroup_1        # ② 的一部分（后 11 个 tuple 的 swa_cache 层，padding 补）
+        #   ├─ [3] c4state_subgroup_0       # ③ 的一部分（前 11 个 tuple 的 C4-state 层）
+        #   ├─ [4] c4state_subgroup_1       # ③ 的一部分（后 11 个 tuple 的 C4-state 层）
+        #   ├─ [5] c128state_subgroup_0     # ④ 的一部分
+        #   └─ [6] c128state_subgroup_1     # ④ 的一部分
         kv_cache_groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
+
         # 为 eagle speculative decoding 标记/对齐 group（DSv4 专用）。
         _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, kv_cache_groups)
         return kv_cache_groups
 
-    # ===== 通用混合注意力分支（如 Full + SWA 类型不同，且非 DSv4）=====
-    # HiddenStateCacheSpec 是投机解码（EAGLE 类 extract_hidden_states）里"借 KV
-    # cache 机制缓存模型 hidden states"的特殊标记层：它不算注意力、没有 K/V 双份
-    # 维度，维度被偷换成 (num_hidden_states, hidden_size)，且 page 语义与普通注意
-    # 力层不同。因此把它先抽出来，避免干扰后续物理 page 大小统一与分组逻辑。
+    # ===== ⚠️ 通用混合注意力分支（如 Full + SWA 类型不同，且非 DSv4）=====
+    # HiddenStateCacheSpec 是投机解码（EAGLE 类 extract_hidden_states）里
+    # "借 KV cache 机制缓存模型 hidden states"的特殊标记层：它不算注意力、没有 K/V 双份维度，维度被偷换成 (num_hidden_states, hidden_size)，
+    # 且 page 语义与普通注意力层不同。因此把它先抽出来，避免干扰后续物理 page 大小统一与分组逻辑。
     # （注册表见 single_type_kv_cache_manager.py：它不参与分组，base_spec 仅是占位）
     # Pull HiddenStateCacheSpec layers out before the general multi-group
     # path so they don't affect page-size unification or grouping.
@@ -1768,22 +2027,18 @@ def get_kv_cache_groups(
         if not isinstance(v, HiddenStateCacheSpec)
     }
 
-    # KVCacheManager 只能分配"单一大小"的 block，因此必须把所有层的物理 page
-    # 字节数统一。若无法统一（如不能整除且 backend 不支持 padded page）会直接报错。
+    # ⚠️ KVCacheManager 只能分配"单一大小"的 block，
+    # ⚠️因此必须把所有层的物理 page字节数统一，值得一看~~
+    # 若无法统一（如不能整除且 backend 不支持 padded page）会直接报错。
     # As KVCacheManager can only allocate memory of one size, we need to unify
     # the page size of the layers. For cases cannot be unified, this function
     # will raise an error.
     filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
-    # 按 attention 类型把层切成多个 group（每组独立 block_table，但 page 字节数相同）。
+
+    # ⚠️ 按 attention 类型把层切成多个 group（每组独立 block_table，但 page 字节数相同）。
     groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
 
-    # 把前面抽出的 hidden-state 层加回来，并把它们的 block 对齐到公共 page 大小：
-    # 用 common_page / 每层每 token 字节数 反推新的 block_size，使其 page 与
-    # 注意力层保持一致，避免 KVCacheManager 分配出不同大小的 block。
-    # Add hidden-state layers back with page aligned to the common page.
-    # 把前面抽出的 hidden-state 层加回来：用公共 page / 该层每 token 字节数反推
-    # block_size，使其 page 与注意力层保持一致（避免 KVCacheManager 分配出不同
-    # 大小的 block），并以 replace 写入 page_size_padded，最后自成一个 group。
+
     if hidden_specs:
         common_page = get_uniform_page_size([g.kv_cache_spec for g in groups])
         for name, spec in hidden_specs.items():
@@ -2072,6 +2327,11 @@ def get_kv_cache_configs(
     # Merge the KV cache specs of all workers. Different PP stages may have
     # different layer names, and different TP ranks of the same PP stage should
     # have the same KV cache spec.
+    # ⚠️
+    # 把所有 worker（不同 PP stage / 不同 TP rank）的 spec 字典合并成"整模型"的一张表。
+    # 同一层的 spec 必须在各 worker 完全一致，否则断言失败（KV cache 分配需全局一致）。
+    # 注意：即便后面走 DeepSeekV4 多 group 支线，这一步也是必须的——它先把分散在
+    # 各 worker 的 layer_name→spec 聚合成全局视图，后续分组才看得见完整模型结构。
     merged_kv_cache_specs: dict[str, KVCacheSpec] = {}
     for kv_cache_spec_one_worker in kv_cache_specs:
         for layer_name, layer_spec in kv_cache_spec_one_worker.items():
@@ -2085,15 +2345,31 @@ def get_kv_cache_configs(
 
     # Check if the KV cache specs are registered correctly.
     # This is to prevent that some layers are initialized with unregistered specs.
+    # 防呆：确保所有 spec 都在注册表里登记过（例如 MLAAttentionSpec / SlidingWindowMLASpec）。
+    # 没登记的层说明 __init__ 时忘记调用 register，会导致后续裸奔。
     KVCacheSpecRegistry.check_kv_cache_spec_registry(merged_kv_cache_specs)
+
     # Get global KV cache groups. This also handles spec unification for
     # hybrid models when disable_hybrid_kv_cache_manager is enabled.
     # After this call, merged_kv_cache_specs may be modified in-place.
+    # ⚠️ 这是 DeepSeekV4 支线的总入口！
+    # get_kv_cache_groups 内部按 spec 差异分派：
+    #   - 全部层 spec 相同 → 1 个 group（绝大多数模型）
+    #   - 父类相同且 block_size 一致（仅 hidden 不同）→ 1 个 group(UniformTypeKVCacheSpecs)
+    #   - ★ DeepSeekV4：类型/窗口各异但 token 数需求相同 →
+    #       group_and_unify_kv_cache_specs() 把层切成多个 UniformTypeKVCacheSpecs
+    #       （[ 多个MLA Spec, 多个SWA MLA Spec, 多个SWA MLA Spec ]），并 _annotate_eagle_groups_deepseek_v4
+    #   返回的 global_kv_cache_groups 顺序固定，是后面"多 group 共享一张大 tensor"布局的前提。
     global_kv_cache_groups = get_kv_cache_groups(vllm_config, merged_kv_cache_specs)
 
     # If original_max_model_len was -1, automatically
     # determine the maximum model length that fits in available GPU memory.
     # We use per-worker projected groups to account for PP sharding.
+    # 把全局 group 投影到每个 worker 自己拥有的层（PP 场景：各 stage 只持部分层）。
+    # _project_kv_cache_groups_to_worker 会按 worker_spec 过滤 layer_names，并对
+    # UniformTypeKVCacheSpecs 重建只含本 worker 层的子集。
+    # 对 DeepSeekV4 而言：DSv4 通常不开 PP（或 PP stage 内仍含完整 multi-group 结构），
+    # 这一投影通常不裁剪任何 group，但保障了 PP 下的正确性。
     projected_groups_per_worker = [
         _project_kv_cache_groups_to_worker(global_kv_cache_groups, worker_spec)
         for worker_spec in kv_cache_specs
@@ -2105,6 +2381,8 @@ def get_kv_cache_configs(
     # `num_blocks` to the override. Reflect that in `available_memory` here so
     # auto-fit, the admission check, and the per-worker config builder all
     # plan against the same effective capacity.
+    # 手动覆盖 block 数时，把"可用显存"换算成 override 对应的字节数，使后续
+    # auto-fit / 内存检查 / 配置构建三处都基于同一有效容量，避免口径不一致。
     override = vllm_config.cache_config.num_gpu_blocks_override
     if override is not None:
         adjusted_memory: list[int] = []
@@ -2122,11 +2400,18 @@ def get_kv_cache_configs(
         available_memory = adjusted_memory
 
     if vllm_config.model_config.original_max_model_len == -1:
+        # max_model_len=-1 时自动二分搜索能塞进显存的最大上下文长度。
+        # 用 per-worker 投影 group（考虑 PP 分片后每 stage 的真实 group 集合）做预算。
+        # DSv4 多 group 情况下：_max_memory_usage_bytes_from_groups 走
+        # "all groups are UniformTypeKVCacheSpecs" 特例（kv_cache_utils.py:2037），
+        # 按 layer_tuple 共享布局 + 全局最大 layer_tuple 数算字节，正确反映 packed 浪费。
         _auto_fit_max_model_len(
             vllm_config, projected_groups_per_worker, available_memory
         )
 
     # Check if the available memory is enough per worker.
+    # 逐 worker 校验显存是否够装下 max_model_len 所需的 KV cache。
+    # DSv4 多 group 的字节上限同样走上面 2037 的特例分支。
     for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
         if not groups:
             continue
@@ -2137,6 +2422,7 @@ def get_kv_cache_configs(
             partial(_estimate_max_model_len_from_groups, vllm_config, groups),
         )
 
+    # ⚠️ 重要！
     kv_cache_configs: list[KVCacheConfig] = []
     for projected_groups, kv_cache_spec_one_worker, available_memory_one_worker in zip(
         projected_groups_per_worker, kv_cache_specs, available_memory
@@ -2144,6 +2430,12 @@ def get_kv_cache_configs(
         assert sum(len(group.layer_names) for group in projected_groups) == len(
             kv_cache_spec_one_worker
         ), "Some layers are not assigned to any group."
+        # 每个 worker 用自己的投影 group + 自己的可用显存，生成一份 KVCacheConfig。
+        # 对 DeepSeekV4：get_kv_cache_config_from_groups 内部会调到
+        # _get_kv_cache_config_packed（别名 _get_kv_cache_config_deepseek_v4，kv_cache_utils.py:1443），
+        # 即"一块大 tensor + 每 block 内各层 page 紧挨"的 packed 布局。
+        # 多个 group（MLA/SWA/state）共享同一张 block table、同一块大 tensor，
+        # 通过 offset + block_stride 寻址——这正是 DSv4 多 cache 能统一管理的关键。
         kv_cache_configs.append(
             get_kv_cache_config_from_groups(
                 vllm_config, projected_groups, available_memory_one_worker
@@ -2153,6 +2445,10 @@ def get_kv_cache_configs(
     # Change the num_blocks of each rank to the smallest among all ranks.
     # We also need to shrink the tensor size proportionally to avoid
     # allocating unused memory.
+    # 木桶效应：所有 worker 必须用相同的 num_blocks（block table 要一致才能跨 rank 对齐）。
+    # 取全局最小 block 数，并按比例收缩每个 tensor 的物理大小，避免给显存多的 worker 分配用不到的内存。
+    # DSv4 多 group 下：kv_cache_tensors 是 packed 布局里那一块大 tensor（可能多个 KVCacheTensor 共享），
+    # 收缩时按 num_blocks_old→min_num_blocks 线性缩放 size，保持 page 偏移关系不变。
     min_num_blocks = min(
         kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
     )
@@ -2171,6 +2467,8 @@ def get_kv_cache_configs(
             # the total tokens of context the pool can hold at peak
             # utilization. Sourcing this from the concurrency calculation
             # handles hybrid layouts correctly.
+            # DSv4 多 group 混合布局下，get_kv_cache_capacity 用 group-aware 并发度计算，
+            # 正确反映"packed 一块大 tensor 撑起的并发上限"。
             num_tokens, max_concurrency = get_kv_cache_capacity(
                 vllm_config, kv_cache_config
             )

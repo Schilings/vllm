@@ -83,7 +83,10 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         # fp8_ds_mla's UE8M0 paged layout needs 576B alignment; contiguous
         # bf16/fp8 cache uses the natural element-size page.
         uses_fp8_ds_mla_layout = self.cache_config.cache_dtype == "fp8_ds_mla"
+        # SWA 传了 cache_dtype_str=self.cache_config.cache_dtype（fp8_ds_mla 时走
+        # 584B/token 分支 → 37440）与 model_version="deepseek_v4"。
         return SlidingWindowMLASpec(
+            # ⚠️ 64 × 584 = 37376 → 37440
             block_size=self.block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
